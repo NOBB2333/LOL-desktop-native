@@ -1,0 +1,24 @@
+CREATE TABLE IF NOT EXISTS app_config (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS match_cache (
+  cache_key TEXT PRIMARY KEY,
+  json TEXT NOT NULL,
+  fetched_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS encounters (
+  id INTEGER PRIMARY KEY,
+  puuid TEXT NOT NULL,
+  json TEXT NOT NULL,
+  encountered_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS bp_history (
+  id TEXT PRIMARY KEY,
+  json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+) STRICT;

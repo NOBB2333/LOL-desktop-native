@@ -1,0 +1,303 @@
+{
+  "$schema": "https://schema.native-sdk.dev/app/v1.json",
+  "id": "com.nobb2333.lol-desktop-native",
+  "name": "lol-desktop-native",
+  "display_name": "桌上英雄联盟",
+  "description": "League Client LCU desktop companion",
+  "version": "2.0.0",
+  "icons": [
+    "assets/icon.png",
+    "assets/icon.ico",
+    "assets/lol-mark.png"
+  ],
+  "platforms": [
+    "windows",
+    "macos",
+    "linux"
+  ],
+  "permissions": [
+    "filesystem",
+    "credentials",
+    "clipboard"
+  ],
+  "capabilities": [
+    "webview",
+    "js_bridge",
+    "credentials",
+    "shortcuts",
+    "filesystem",
+    "sqlite",
+    "tray"
+  ],
+  "bridge": {
+    "commands": [
+      {
+        "name": "native.ping",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_bootstrap",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_config",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.save_config",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.set_shortcut_capture",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.set_data_mode",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.refresh_connection",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_live_lobby",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_live_roster",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_match_history",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_champions",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_asset",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_encounters",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_friends",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_friend_last_game",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.delete_friend",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_bp_history",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.save_match_export",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.send_shortcut",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.preview_shortcut",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.run_automation",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.validate_shortcut_template",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.check_update",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.open_game_view",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_lcu_events",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_shortcut_events",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      }
+    ]
+  },
+  "frontend": {
+    "dist": "frontend/dist",
+    "entry": "index.html",
+    "spa_fallback": true,
+    "dev": {
+      "url": "http://127.0.0.1:49173/",
+      "command": [
+        "npm",
+        "--prefix",
+        "frontend",
+        "run",
+        "dev",
+        "--",
+        "--host",
+        "127.0.0.1"
+      ],
+      "ready_path": "/",
+      "timeout_ms": 30000
+    }
+  },
+  "security": {
+    "navigation": {
+      "allowed_origins": [
+        "zero://app",
+        "zero://inline",
+        "http://127.0.0.1:49173"
+      ],
+      "external_links": {
+        "action": "deny"
+      }
+    }
+  },
+  "shortcuts": [
+    {
+      "id": "premade",
+      "key": "F9",
+      "modifiers": [
+        "primary"
+      ]
+    },
+    {
+      "id": "jungle-preference",
+      "key": "F10",
+      "modifiers": [
+        "primary"
+      ]
+    },
+    {
+      "id": "enemy",
+      "key": "F11",
+      "modifiers": [
+        "primary"
+      ]
+    },
+    {
+      "id": "ally",
+      "key": "F12",
+      "modifiers": [
+        "primary"
+      ]
+    },
+    {
+      "id": "open-game",
+      "key": "F1",
+      "modifiers": [
+        "primary"
+      ]
+    }
+  ],
+  "web_engine": "system",
+  "cef": {
+    "dir": "third_party/cef/windows",
+    "auto_install": false
+  },
+  "windows": [
+    {
+      "label": "main",
+      "title": "桌上英雄联盟",
+      "width": 1440,
+      "height": 900,
+      "min_width": 1180,
+      "min_height": 720,
+      "restore_state": false
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+# Dependencies
+frontend/node_modules/
+
+# Frontend build output
+frontend/dist/
+
+# Zig build output and caches
+.zig-cache/
+zig-out/
+
+# macOS metadata
+.DS_Store
+
+# Native SDK local artifacts
+.native/

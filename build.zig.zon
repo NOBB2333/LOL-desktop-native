@@ -1,0 +1,8 @@
+.{
+    .name = .lol_desktop_native,
+    .fingerprint = 0xbf4f9766ae7fb38e,
+    .version = "2.0.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "assets", "frontend", "config", "scripts", "app.json", "README.md", "MIGRATION.md" },
+}

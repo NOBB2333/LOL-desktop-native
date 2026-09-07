@@ -1,0 +1,26 @@
+{
+  "devServer": {
+    "host": "127.0.0.1",
+    "port": 49173
+  },
+  "nativeSdkPath": "node_modules/@native-sdk/cli",
+  "dataDirName": "lol-desktop-native",
+  "lcu": {
+    "lockfilePaths": [],
+    "requestTimeoutMs": 6000,
+    "liveProbeTimeoutMs": 900,
+    "verifyTls": false,
+    "liveClientDataUrl": "https://127.0.0.1:2999/liveclientdata/allgamedata"
+  },
+  "windows": {
+    "requireAdministrator": true
+  },
+  "updates": {
+    "checkUrl": "https://github.com/NOBB2333/lol-desktop/releases/latest/download/latest.json"
+  },
+  "package": {
+    "target": "windows",
+    "archive": true,
+    "singleFile": true
+  }
+}

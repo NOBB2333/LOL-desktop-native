@@ -1,0 +1,182 @@
+import type { LiveLobby, PlayerProfile } from "../types/domain";
+
+function numericGameId(value: string) {
+  return /^\d+$/.test(value.trim()) ? value.trim() : "";
+}
+
+export function playerIdentity(player: PlayerProfile) {
+  if (player.puuid && !player.puuid.includes("-slot-")) return `puuid:${player.puuid}`;
+  const name = player.gameName.trim().toLocaleLowerCase();
+  if (name && name !== "未知玩家") {
+    return `name:${name}#${player.tagLine.trim().toLocaleLowerCase()}`;
+  }
+  return "";
+}
+
+function playerIdQuality(value: string) {
+  const id = value.trim();
+  if (!id || id.includes("-slot-")) return 0;
+  return /^\d+$/.test(id) ? 1 : 2;
+}
+
+function hasKnownName(player: PlayerProfile) {
+  const name = player.gameName.trim();
+  return Boolean(name && name !== "未知玩家" && !name.startsWith("蓝方玩家") && !name.startsWith("红方玩家"));
+}
+
+function isUnresolvedPlayer(player: PlayerProfile) {
+  return !hasKnownName(player) || playerIdQuality(player.puuid) === 0;
+}
+
+function knownPosition(value: string) {
+  const position = value.trim().toUpperCase();
+  return ["TOP", "JUNGLE", "MIDDLE", "MID", "BOTTOM", "BOT", "ADC", "UTILITY", "SUPPORT"].includes(position);
+}
+
+export function isDifferentRosterContext(base: LiveLobby, fast: LiveLobby) {
+  const baseId = numericGameId(base.id);
+  const fastId = numericGameId(fast.id);
+  if (baseId && fastId && baseId !== fastId) return true;
+  return fast.phase === "ChampSelect" && base.phase !== "ChampSelect";
+}
+
+export function mergeRosterPlayers(base: PlayerProfile[], fast: PlayerProfile[]) {
+  if (!base.length) return fast;
+  const mergePlayer = (original: PlayerProfile, dynamic: PlayerProfile) => {
+    const hasChampion = dynamic.championId > 0;
+    const puuid = playerIdQuality(dynamic.puuid) >= playerIdQuality(original.puuid) ? dynamic.puuid : original.puuid;
+    const premadeWith = [...original.premadeWith];
+    for (const teammate of dynamic.premadeWith) {
+      if (!premadeWith.some((name) => name.toLocaleLowerCase() === teammate.toLocaleLowerCase())) premadeWith.push(teammate);
+    }
+    const isPremade = original.isPremade === true || dynamic.isPremade === true
+      ? true
+      : dynamic.isPremade ?? original.isPremade;
+    return {
+      ...original,
+      puuid,
+      gameName: hasKnownName(dynamic) ? dynamic.gameName : original.gameName,
+      tagLine: dynamic.tagLine || original.tagLine,
+      isBot: original.isBot || dynamic.isBot,
+      championId: hasChampion ? dynamic.championId : original.championId,
+      championName: hasChampion ? dynamic.championName : original.championName,
+      profileIconId: dynamic.profileIconId || original.profileIconId,
+      assignedPosition: knownPosition(dynamic.assignedPosition) ? dynamic.assignedPosition : original.assignedPosition,
+      isPremade,
+      premadeWith,
+    };
+  };
+  if (fast.length >= base.length) {
+    const used = new Set<number>();
+    return fast.map((dynamic, index) => {
+      const identity = playerIdentity(dynamic);
+      let baseIndex = identity
+        ? base.findIndex((candidate, candidateIndex) => !used.has(candidateIndex) && playerIdentity(candidate) === identity)
+        : -1;
+      const indexed = base[index];
+      if (baseIndex < 0 && indexed && !used.has(index) && (isUnresolvedPlayer(dynamic) || !playerIdentity(indexed))) baseIndex = index;
+      if (baseIndex < 0) return dynamic;
+      used.add(baseIndex);
+      return mergePlayer(base[baseIndex], dynamic);
+    });
+  }
+  const used = new Set<number>();
+  const merged = base.map((original, index) => {
+    const identity = playerIdentity(original);
+    let fastIndex = identity
+      ? fast.findIndex((candidate, candidateIndex) => !used.has(candidateIndex) && playerIdentity(candidate) === identity)
+      : -1;
+    const indexed = fast[index];
+    if (fastIndex < 0 && indexed && !used.has(index)) {
+      const indexedIdentity = playerIdentity(indexed);
+      if (!identity || !indexedIdentity || isUnresolvedPlayer(indexed)) fastIndex = index;
+    }
+    if (fastIndex < 0) return original;
+    used.add(fastIndex);
+    return mergePlayer(original, fast[fastIndex]);
+  });
+  for (let index = 0; index < fast.length; index += 1) {
+    if (!used.has(index)) merged.push(fast[index]);
+  }
+  return merged;
+}
+
+function rosterTopology(players: PlayerProfile[]) {
+  return players.map((player) => playerIdentity(player) || `slot:${player.championId}:${player.assignedPosition}`).join("|");
+}
+
+export function mergeRosterSnapshot(base: LiveLobby | undefined, fast: LiveLobby) {
+  if (!base || isDifferentRosterContext(base, fast)) return fast;
+  const ally = mergeRosterPlayers(base.ally, fast.ally);
+  const enemy = mergeRosterPlayers(base.enemy, fast.enemy);
+  const topologyChanged = rosterTopology(base.ally) !== rosterTopology(fast.ally)
+    || rosterTopology(base.enemy) !== rosterTopology(fast.enemy);
+  const allySummary = topologyChanged ? fast.allySummary : base.allySummary;
+  const enemySummary = topologyChanged ? fast.enemySummary : base.enemySummary;
+  const fastTeams = fast.teams?.length ? fast.teams : [
+    { id: "ally", label: "我方阵容", side: "ally", players: fast.ally, summary: fast.allySummary },
+    { id: "enemy", label: "敌方阵容", side: "enemy", players: fast.enemy, summary: fast.enemySummary },
+  ];
+  const baseTeams = base.teams?.length ? base.teams : [
+    { id: "ally", label: "我方阵容", side: "ally", players: base.ally, summary: base.allySummary },
+    { id: "enemy", label: "敌方阵容", side: "enemy", players: base.enemy, summary: base.enemySummary },
+  ];
+  const teams = fastTeams.map((team) => {
+    const original = baseTeams.find((candidate) => candidate.side === team.side || candidate.id === team.id);
+    const players = team.side === "ally"
+      ? ally
+      : team.side === "enemy"
+        ? enemy
+        : mergeRosterPlayers(original?.players ?? [], team.players);
+    const summary = team.side === "ally" ? allySummary : team.side === "enemy" ? enemySummary : team.summary;
+    return { ...(original ?? team), ...team, players, summary };
+  });
+  return {
+    ...base,
+    id: fast.id || base.id,
+    queueId: fast.queueId || base.queueId,
+    gameMode: fast.gameMode || base.gameMode,
+    phase: fast.phase || base.phase,
+    ally,
+    enemy,
+    teams,
+    allySummary,
+    enemySummary,
+    layoutKind: fast.layoutKind || base.layoutKind,
+    generatedAt: fast.generatedAt || base.generatedAt,
+  };
+}
+
+export function enrichedRosterCoversOverlay(enriched: LiveLobby | undefined, overlay: LiveLobby) {
+  if (!enriched) return false;
+  if (isDifferentRosterContext(enriched, overlay) || enriched.phase !== overlay.phase) return false;
+
+  const coversTeam = (complete: PlayerProfile[], dynamic: PlayerProfile[]) => {
+    if (complete.length < dynamic.length) return false;
+    const used = new Set<number>();
+    return dynamic.every((player, index) => {
+      const identity = playerIdentity(player);
+      let completeIndex = identity
+        ? complete.findIndex((candidate, candidateIndex) => !used.has(candidateIndex) && playerIdentity(candidate) === identity)
+        : -1;
+      if (completeIndex < 0 && complete[index] && !used.has(index) && (isUnresolvedPlayer(player) || isUnresolvedPlayer(complete[index]))) {
+        completeIndex = index;
+      }
+      if (completeIndex < 0) return false;
+      // Player coverage alone is insufficient here: an EndOfGame response can
+      // contain the same ten players in the old champion-select order. Keep
+      // the fast in-game topology until enrichment agrees on every slot.
+      if (completeIndex !== index) return false;
+      used.add(completeIndex);
+      const candidate = complete[completeIndex];
+      if (player.championId > 0 && candidate.championId !== player.championId) return false;
+      if (hasKnownName(player) && (!hasKnownName(candidate) || candidate.gameName.toLocaleLowerCase() !== player.gameName.toLocaleLowerCase())) return false;
+      if (knownPosition(player.assignedPosition) && candidate.assignedPosition.toUpperCase() !== player.assignedPosition.toUpperCase()) return false;
+      if (player.isPremade === true && candidate.isPremade !== true) return false;
+      if (player.premadeWith.some((teammate) => !candidate.premadeWith.some((name) => name.toLocaleLowerCase() === teammate.toLocaleLowerCase()))) return false;
+      return true;
+    });
+  };
+
+  return coversTeam(enriched.ally, overlay.ally) && coversTeam(enriched.enemy, overlay.enemy);
+}

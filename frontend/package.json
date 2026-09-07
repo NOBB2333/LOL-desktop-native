@@ -1,0 +1,37 @@
+{
+  "name": "lol-desktop-native",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "vitest run",
+    "lint": "oxlint src",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@lucide/vue": "^1.31.0",
+    "@tanstack/vue-query": "^5.101.4",
+    "naive-ui": "^2.44.1",
+    "pinia": "^4.0.3",
+    "vue": "^3.5.34",
+    "vue-router": "^5.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.6",
+    "@vitest/coverage-v8": "^4.1.10",
+    "@vue/test-utils": "^2.4.11",
+    "jsdom": "^30.0.1",
+    "oxfmt": "^0.63.0",
+    "oxlint": "^1.78.0",
+    "playwright": "^1.62.1",
+    "tailwindcss": "^4.3.3",
+    "@tailwindcss/vite": "^4.3.3",
+    "typescript": "~5.6.2",
+    "vite": "^8.0.11",
+    "vitest": "^4.1.10",
+    "vue-tsc": "^2.1.10"
+  }
+}
