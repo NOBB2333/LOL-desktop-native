@@ -21,10 +21,12 @@ import {
   fixtureEncounters,
   fixtureFriends,
   fixtureLobby,
+  createFixtureLobby,
   fixtureMatches,
 } from "../fixtures/data";
 import { visibleMatches } from "../utils/matchFilters";
 import { roleName } from "../utils/format";
+import { createShortcutSendQueue } from "../utils/shortcutSendQueue";
 
 let browserMode: DataMode = "fixture";
 let browserConfig = structuredClone(fixtureConfig);
@@ -35,11 +37,31 @@ if (storedBrowserConfig) {
   try { browserConfig = JSON.parse(storedBrowserConfig) as AppConfig; } catch { localStorage.removeItem("lol-desktop-config"); }
 }
 
-/** Compatibility name retained while callers migrate from the Tauri adapter. */
+/** 兼容原有调用点，底层已经使用原生桥接。 */
 export const isTauri = isNative;
+const queueShortcutSend = createShortcutSendQueue();
+let sendConnection = "";
+let sendLobby = "";
+
+function sendContext() {
+  return JSON.stringify([browserMode, sendConnection, sendLobby]);
+}
+
+function rememberLobby(lobby: LiveLobby) {
+  const phase = ["ChampSelect", "ReadyCheck"].includes(lobby.phase) ? "选人" : ["GameStart", "InProgress"].includes(lobby.phase) ? "游戏中" : lobby.phase;
+  sendLobby = JSON.stringify([lobby.id, phase]);
+  return lobby;
+}
 
 async function command<T>(name: string, args?: Record<string, unknown>): Promise<T> {
-  if (!isNative()) throw new Error("browser-preview");
+  if (!isNative()) throw new Error("浏览器预览不支持此操作");
+  if (name === "send_shortcut") {
+    const context = sendContext();
+    return queueShortcutSend(JSON.stringify([context, args]), () => {
+      if (context !== sendContext()) throw new Error("会话已变化，已取消排队消息");
+      return invokeNative<T>(`lol.${name}`, args);
+    });
+  }
   return invokeNative<T>(`lol.${name}`, args);
 }
 
@@ -48,12 +70,8 @@ function usesFixtureData() {
 }
 
 function lobbyFixture(): LiveLobby {
-  const lobby = structuredClone(fixtureLobby);
+  const lobby = createFixtureLobby(browserConfig.providers.rankedOnly);
   lobby.isFixture = true;
-  if (browserMode === "replay") {
-    lobby.phase = "Replay";
-    lobby.id = "replay-latest";
-  }
   return lobby;
 }
 
@@ -80,13 +98,16 @@ export const backend = {
     return structuredClone(browserConfig);
   },
   async setMode(mode: DataMode): Promise<DataMode> {
-    browserMode = mode;
-    if (!isTauri()) return mode;
-    return command("set_data_mode", { mode });
+    if (mode === "replay") throw new Error("回看功能尚未开放");
+    const selected = isTauri() ? await command<DataMode>("set_data_mode", { mode }) : mode;
+    browserMode = selected;
+    return selected;
   },
   async refreshConnection() {
     if (usesFixtureData()) return structuredClone(fixtureBootstrap.dashboard.connection);
-    return command<AppBootstrap["dashboard"]["connection"]>("refresh_connection");
+    const connection = await command<AppBootstrap["dashboard"]["connection"]>("refresh_connection");
+    sendConnection = JSON.stringify([connection.status, connection.platformId, connection.gameName, connection.tagLine, connection.phase]);
+    return connection;
   },
   async lcuEvents(): Promise<{ uri: string; phase?: string }[]> {
     if (!isTauri()) return [];
@@ -96,17 +117,17 @@ export const backend = {
     if (!isTauri()) return [];
     return command("get_shortcut_events");
   },
-  async lobby(): Promise<LiveLobby> {
+  async lobby(force = false): Promise<LiveLobby> {
     if (usesFixtureData()) return lobbyFixture();
-    return command("get_live_lobby");
+    return rememberLobby(await command<LiveLobby>("get_live_lobby", { force }));
   },
   async lobbyRoster(): Promise<LiveLobby> {
     if (usesFixtureData()) return lobbyFixture();
-    return command("get_live_roster");
+    return rememberLobby(await command<LiveLobby>("get_live_roster"));
   },
   async matches(summonerName?: string, page = 0, pageSize = 10): Promise<MatchSummary[]> {
     if (usesFixtureData()) {
-      const source = visibleMatches(fixtureMatches, browserConfig.providers.hideUnfinishedMatches);
+      const source = visibleMatches(fixtureMatches, browserConfig.providers.hideUnfinishedMatches, browserConfig.providers.rankedOnly);
       const start = page * pageSize;
       return structuredClone(source.slice(start, start + pageSize));
     }
@@ -115,6 +136,14 @@ export const backend = {
   async champions(): Promise<ChampionOverview[]> {
     if (usesFixtureData()) return structuredClone(fixtureChampions);
     return command("get_champions");
+  },
+  async matchDetail(gameId: number, platformId: string, selfPuuid: string, targetPuuid: string): Promise<MatchSummary> {
+    if (usesFixtureData()) {
+      const match = fixtureMatches.find((item) => item.gameId === gameId);
+      if (!match) throw new Error("该对局的完整详情不可用");
+      return structuredClone(match);
+    }
+    return command("get_match_detail", { gameId, platformId, selfPuuid, targetPuuid });
   },
   async asset(kind: "champion" | "item" | "spell" | "perk" | "profile", id: number): Promise<AssetPayload> {
     if (usesFixtureData()) throw new Error("Fixture 使用静态资源");
@@ -128,20 +157,20 @@ export const backend = {
     assetRequests.set(key, request);
     return request;
   },
-  async encounters(puuid?: string, limitGames = 100): Promise<EncounterRecord[]> {
+  async encounters(puuid?: string, limitGames = 40, excludeGameId = 0): Promise<EncounterRecord[]> {
     const target = puuid?.trim() || "";
-    const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limitGames) || 100));
+    const boundedLimit = Math.max(1, Math.min(40, Math.trunc(limitGames) || 40));
     if (usesFixtureData()) {
       const targetGames = [...new Map(
         fixtureEncounters
-          .filter((record) => !target || record.puuid === target)
+          .filter((record) => record.gameId !== excludeGameId && (!target || record.puuid === target))
           .sort((left, right) => right.encounteredAt.localeCompare(left.encounteredAt))
           .map((record) => [record.gameId, record.encounteredAt] as const),
       ).keys()].slice(0, boundedLimit);
       const selected = new Set(targetGames);
       return structuredClone(fixtureEncounters.filter((record) => selected.has(record.gameId)));
     }
-    return command("get_encounters", { puuid: target || null, limitGames: boundedLimit });
+    return command("get_encounters", { puuid: target || null, limitGames: boundedLimit, excludeGameId });
   },
   async friends(): Promise<FriendToolsSnapshot> {
     if (usesFixtureData()) return structuredClone(browserFriends);
@@ -171,6 +200,7 @@ export const backend = {
   },
   async sendShortcut(shortcutId: string): Promise<string[]> {
     if (usesFixtureData()) {
+      const fixtureLobby = lobbyFixture();
       const shortcut = browserConfig.automation.shortcuts.find((item) => item.id === shortcutId);
       if (!shortcut) throw new Error("快捷消息不存在");
       const allPlayers = [...fixtureLobby.ally, ...fixtureLobby.enemy];

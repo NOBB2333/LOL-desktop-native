@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Database, History, Radio } from "@lucide/vue";
+import { Database, Radio } from "@lucide/vue";
 import { useQueryClient } from "@tanstack/vue-query";
 import { computed } from "vue";
 import { useAppStore } from "../stores/app";
@@ -8,8 +8,7 @@ import type { DataMode } from "../types/domain";
 const app = useAppStore();
 const queryClient = useQueryClient();
 const modes = [
-  { value: "fixture" as const, label: "测试", icon: Database },
-  { value: "replay" as const, label: "回看", icon: History },
+  { value: "fixture" as const, label: "演示", icon: Database },
   { value: "live" as const, label: "实时", icon: Radio },
 ];
 const active = computed(() => app.mode);

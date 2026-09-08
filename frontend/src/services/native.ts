@@ -17,7 +17,7 @@ export const NATIVE_INVOCATION_CONCURRENCY = 4;
 
 export function createInvocationScheduler(maxConcurrency = NATIVE_INVOCATION_CONCURRENCY) {
   if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1) {
-    throw new RangeError("Native invocation concurrency must be a positive integer");
+    throw new RangeError("原生调用并发数必须是正整数");
   }
 
   let active = 0;
@@ -48,14 +48,27 @@ export function createInvocationScheduler(maxConcurrency = NATIVE_INVOCATION_CON
   };
 }
 
-const scheduleNativeInvocation = createInvocationScheduler();
+export function createCommandScheduler() {
+  const state = createInvocationScheduler(2);
+  const roster = createInvocationScheduler(1);
+  const query = createInvocationScheduler(2);
+  const action = createInvocationScheduler(1);
+  return function schedule<T>(name: string, task: () => Promise<T>): Promise<T> {
+    if (["lol.get_live_roster", "lol.refresh_connection", "lol.get_lcu_events"].includes(name)) return roster(task);
+    if (["lol.send_shortcut", "lol.delete_friend", "lol.run_automation"].includes(name)) return action(task);
+    if (["lol.get_config", "lol.save_config", "lol.set_shortcut_capture", "lol.set_data_mode", "lol.get_live_lobby", "lol.get_shortcut_events", "lol.open_game_view", "lol.validate_shortcut_template"].includes(name)) return state(task);
+    return query(task);
+  };
+}
+
+const scheduleNativeInvocation = createCommandScheduler();
 
 export const isNative = () => typeof window !== "undefined" && Boolean(window.zero);
 
 export async function invokeNative<T>(name: string, payload?: unknown): Promise<T> {
   const bridge = window.zero;
-  if (!bridge) throw new Error("Native bridge is not available");
-  return scheduleNativeInvocation(() => bridge.invoke<T>(name, payload));
+  if (!bridge) throw new Error("原生桥接尚不可用");
+  return scheduleNativeInvocation(name, () => bridge.invoke<T>(name, payload));
 }
 
 export function listenNative<T>(name: string, callback: (detail: T) => void): () => void {

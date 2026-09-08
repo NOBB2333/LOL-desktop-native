@@ -20,7 +20,7 @@ function scrollToSection(id: string) {
 
 <template>
   <div class="page-shell settings-page">
-    <PageHeader title="设置" eyebrow="WORKSPACE SETTINGS" meta="所有修改立即自动保存；失败时保留当前编辑内容并允许重试">
+    <PageHeader title="设置" eyebrow="应用设置" meta="所有修改立即自动保存；失败时保留当前编辑内容并允许重试">
       <div class="save-indicator" :data-state="app.configSaveState">
         <i class="save-dot" />
         <span>{{ saveLabel }}</span>
@@ -47,7 +47,7 @@ function scrollToSection(id: string) {
       </a>
       <a href="#settings-ai" class="settings-nav__item" @click.prevent="scrollToSection('settings-ai')">
         <MonitorCog :size="15" />
-        <span>AI 与应用</span>
+        <span>应用信息</span>
         <i class="settings-nav__arrow">›</i>
       </a>
     </nav>
@@ -60,7 +60,7 @@ function scrollToSection(id: string) {
             <Database :size="17" />
           </div>
           <div>
-            <span class="eyebrow">DATA SOURCE</span>
+            <span class="eyebrow">数据来源</span>
             <h2>数据源与缓存</h2>
             <p>实时模式优先连接当前 League Client；本地缓存只在请求失败或过期时作为回退。</p>
           </div>
@@ -70,7 +70,7 @@ function scrollToSection(id: string) {
           <div class="settings-row">
             <div class="settings-row__label">
               <strong>当前数据模式</strong>
-              <small>测试 / 回看用于开发和诊断；实时模式连接当前客户端</small>
+              <small>演示模式使用示例数据；实时模式连接当前客户端</small>
             </div>
             <div class="settings-row__control"><ModeSwitch /></div>
           </div>
@@ -110,6 +110,15 @@ function scrollToSection(id: string) {
             </div>
             <div class="settings-row__control">
               <NSwitch :value="!app.config.providers.hideUnfinishedMatches" @update:value="app.config.providers.hideUnfinishedMatches = !$event" />
+            </div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <strong>仅显示排位数据</strong>
+              <small>单双排与灵活组排</small>
+            </div>
+            <div class="settings-row__control">
+              <NSwitch v-model:value="app.config.providers.rankedOnly" aria-label="仅显示排位数据" />
             </div>
           </div>
           <div class="settings-row">
@@ -163,7 +172,7 @@ function scrollToSection(id: string) {
             <Palette :size="17" />
           </div>
           <div>
-            <span class="eyebrow">APPEARANCE &amp; WINDOW</span>
+            <span class="eyebrow">外观与窗口</span>
             <h2>外观与窗口</h2>
             <p>薄荷是默认主题；对局页可以收起导航，把空间留给十人数据。</p>
           </div>
@@ -231,7 +240,7 @@ function scrollToSection(id: string) {
             <Server :size="17" />
           </div>
           <div>
-            <span class="eyebrow">ACCOUNT &amp; CLIENT</span>
+            <span class="eyebrow">账号与客户端</span>
             <h2>账号与客户端连接</h2>
             <p>Mac 开发时由 Windows 端持有 LCU 凭据，SSH 只负责发现端口并转发。</p>
           </div>
@@ -277,71 +286,20 @@ function scrollToSection(id: string) {
         </div>
       </section>
 
-      <!-- AI 与应用 -->
+      <!-- 应用信息 -->
       <section id="settings-ai" class="settings-section">
         <header class="settings-section__header">
           <div class="settings-section__icon-wrap">
             <MonitorCog :size="17" />
           </div>
           <div>
-            <span class="eyebrow">AI &amp; APPLICATION</span>
-            <h2>AI 与应用</h2>
-            <p>默认模型为 DeepSeek V4 Flash；请求协议可选择 OpenAI 或 Anthropic，AI 只负责事实层之后的摘要。</p>
+            <span class="eyebrow">应用信息</span>
+            <h2>应用信息</h2>
+            <p>查看当前本地安装版本。</p>
           </div>
         </header>
 
         <div class="settings-rows">
-          <div class="settings-row">
-            <div class="settings-row__label">
-              <strong>赛前 AI 总结</strong>
-              <small>开启后才调用配置的模型服务</small>
-            </div>
-            <div class="settings-row__control">
-              <NSwitch v-model:value="app.config.ai.enabled" />
-            </div>
-          </div>
-          <div class="settings-row">
-            <div class="settings-row__label">
-              <strong>模型服务</strong>
-              <small>DeepSeek 默认使用 deepseek-v4-flash</small>
-            </div>
-            <div class="settings-row__control">
-              <NSelect v-model:value="app.config.ai.provider" :options="[{ label: 'DeepSeek V4 Flash', value: 'deepseek' }, { label: '自定义兼容服务', value: 'openai' }]" />
-            </div>
-          </div>
-          <label class="settings-row">
-            <div class="settings-row__label">
-              <strong>接口协议</strong>
-              <small>OpenAI Chat Completions 或 Anthropic Messages</small>
-            </div>
-            <div class="settings-row__control">
-              <NSelect v-model:value="app.config.ai.protocol" :options="[{ label: 'OpenAI 协议', value: 'openai' }, { label: 'Anthropic 协议', value: 'anthropic' }]" />
-            </div>
-          </label>
-          <label class="settings-row">
-            <div class="settings-row__label"><strong>Base URL</strong></div>
-            <div class="settings-row__control">
-              <NInput v-model:value="app.config.ai.baseUrl" placeholder="https://api.deepseek.com" />
-            </div>
-          </label>
-          <label class="settings-row">
-            <div class="settings-row__label">
-              <strong>模型</strong>
-              <small>默认：deepseek-v4-flash</small>
-            </div>
-            <div class="settings-row__control">
-              <NInput v-model:value="app.config.ai.model" placeholder="deepseek-v4-flash" />
-            </div>
-          </label>
-          <label class="settings-row">
-            <div class="settings-row__label">
-              <strong>API Key</strong>
-              <small>仅保存在本机配置文件</small>
-            </div>
-            <div class="settings-row__control">
-              <NInput v-model:value="app.config.ai.apiKey" type="password" show-password-on="click" placeholder="sk-..." />
-            </div>
-          </label>
           <div class="settings-row">
             <div class="settings-row__label">
               <strong>应用版本</strong>
@@ -358,7 +316,7 @@ function scrollToSection(id: string) {
     <!-- 保存状态底栏 -->
     <footer class="settings-foot">
       <RefreshCw :size="14" />
-      <span>保存管线：300ms 防抖、串行写入、失败可重试</span>
+      <span>{{ saveLabel }}</span>
       <span v-if="app.configSaveError" class="settings-foot__error">{{ app.configSaveError }}</span>
       <NButton v-if="app.configSaveState === 'error'" size="small" type="primary" @click="retrySave">重试保存</NButton>
     </footer>

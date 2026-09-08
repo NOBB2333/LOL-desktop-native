@@ -28,10 +28,7 @@ pub fn mergeArchive(existing_json: []const u8, newest_json: []const u8, owner_pu
             const puuid = jsonField(record, "puuid");
             const record_owner = jsonField(record, "selfPuuid");
             if (game_id <= 0 or puuid.len == 0) continue;
-            // Once an account owner is known, legacy rows without selfPuuid
-            // are ambiguous: older builds also archived histories belonging
-            // to inspected players. Dropping those rows is the only way to
-            // prevent another player's encounters from appearing as ours.
+            // 旧版本也归档过被查询玩家的历史，缺少本人身份的旧行无法确认归属。
             if (owner_puuid.len > 0 and !sameIdentity(record_owner, owner_puuid)) continue;
             const key = EncounterKey{
                 .game_id = game_id,
@@ -54,13 +51,15 @@ pub fn filterArchive(json: []const u8, owner_puuid: []const u8, cutoff_iso: []co
     return mergeArchive(json, "[]", owner_puuid, cutoff_iso, output);
 }
 
-/// Return complete matches involving one encountered player. The archive keeps
-/// one row per non-self participant, so selecting only the target rows would
-/// make it impossible for the UI to reconstruct the ten-player match.
+/// 返回目标参与的完整对局，保留其他参与者，供界面还原整局摘要。
 pub fn queryArchive(json: []const u8, owner_puuid: []const u8, target_puuid: []const u8, cutoff_iso: []const u8, max_games: usize, output: []u8) ![]const u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch return error.InvalidEncounterArchive;
+    return queryRecords(root, owner_puuid, target_puuid, cutoff_iso, max_games, 0, output);
+}
+
+fn queryRecords(root: std.json.Value, owner_puuid: []const u8, target_puuid: []const u8, cutoff_iso: []const u8, max_games: usize, excluded_game_id: i64, output: []u8) ![]const u8 {
     if (root != .array) return std.fmt.bufPrint(output, "[]", .{});
 
     const SelectedGame = struct {
@@ -75,6 +74,7 @@ pub fn queryArchive(json: []const u8, owner_puuid: []const u8, target_puuid: []c
         if (!recordInScope(record, owner_puuid, cutoff_iso)) continue;
         if (target_puuid.len > 0 and !sameIdentity(jsonField(record, "puuid"), target_puuid)) continue;
         const game_id = jsonInt(record, "gameId");
+        if (game_id == excluded_game_id) continue;
         var duplicate = false;
         for (selected[0..selected_len]) |game| if (game.id == game_id) {
             duplicate = true;
@@ -94,25 +94,54 @@ pub fn queryArchive(json: []const u8, owner_puuid: []const u8, target_puuid: []c
         if (std.mem.order(u8, candidate.encountered_at, selected[oldest].encountered_at) == .gt) selected[oldest] = candidate;
     }
 
+    std.mem.sort(SelectedGame, selected[0..selected_len], {}, struct {
+        fn lessThan(_: void, a: SelectedGame, b: SelectedGame) bool {
+            return std.mem.order(u8, a.encountered_at, b.encountered_at) == .gt;
+        }
+    }.lessThan);
     var writer = std.Io.Writer.fixed(output);
     try writer.writeByte('[');
     var emitted = false;
-    for (root.array.items) |record| {
-        if (!recordInScope(record, owner_puuid, cutoff_iso)) continue;
-        const game_id = jsonInt(record, "gameId");
-        var included = false;
-        for (selected[0..selected_len]) |game| if (game.id == game_id) {
-            included = true;
-            break;
-        };
-        if (!included) continue;
+    for (selected[0..selected_len]) |game| for (root.array.items) |record| {
+        if (!recordInScope(record, owner_puuid, cutoff_iso) or jsonInt(record, "gameId") != game.id) continue;
         if (emitted) try writer.writeByte(',');
         emitted = true;
         var stringify = std.json.Stringify{ .writer = &writer, .options = .{} };
         try stringify.write(record);
-    }
+    };
     try writer.writeByte(']');
     return writer.buffered();
+}
+
+/// 仅使用已加载的战绩派生共同对局，不建立长期相遇档案。
+pub fn fromHistories(histories: []const []const u8, self_puuid: []const u8, target_puuid: []const u8, catalog_json: []const u8, max_games: usize, excluded_game_id: i64, output: []u8) ![]const u8 {
+    if (self_puuid.len == 0) return std.fmt.bufPrint(output, "[]", .{});
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const buffer = try std.heap.page_allocator.alloc(u8, 4 * 1024 * 1024);
+    defer std.heap.page_allocator.free(buffer);
+    var records: std.array_list.Managed(std.json.Value) = .init(allocator);
+    var seen = std.AutoHashMap(EncounterKey, usize).init(allocator);
+    for (histories) |history| {
+        const json = fromHistory(history, self_puuid, catalog_json, buffer) catch continue;
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{ .allocate = .alloc_always });
+        for (parsed.array.items) |record| {
+            const game_id = jsonInt(record, "gameId");
+            if (game_id == excluded_game_id) continue;
+            var hash = std.hash.Wyhash.init(0);
+            for (std.mem.trim(u8, jsonField(record, "puuid"), " \t\r\n")) |byte| hash.update(&.{std.ascii.toLower(byte)});
+            const key = EncounterKey{ .game_id = game_id, .owner_hash = 0, .player_hash = hash.final() };
+            const entry = try seen.getOrPut(key);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = records.items.len;
+                try records.append(record);
+            } else if (record.object.contains("win") and !records.items[entry.value_ptr.*].object.contains("win")) {
+                records.items[entry.value_ptr.*] = record;
+            }
+        }
+    }
+    return queryRecords(.{ .array = records }, self_puuid, target_puuid, "", @min(max_games, 40), excluded_game_id, output);
 }
 
 fn recordInScope(record: std.json.Value, owner_puuid: []const u8, cutoff_iso: []const u8) bool {
@@ -145,6 +174,7 @@ pub fn fromHistory(history_json: []const u8, self_puuid: []const u8, catalog_jso
         const self_name = participantName(self_participant, self_identity, "未知玩家");
         const self_tag = participantTag(self_participant, self_identity);
         const self_team_id = jsonInt(self_participant, "teamId");
+        const self_subteam_id = statInt(self_participant, "playerSubteamId");
         const self_side = jsonField(self_participant, "side");
         const self_win = statBool(self_participant, "win");
         const self_champion_id = jsonInt(self_participant, "championId");
@@ -166,12 +196,14 @@ pub fn fromHistory(history_json: []const u8, self_puuid: []const u8, catalog_jso
             if (!first) try writer.writeByte(',');
             first = false;
             const participant_side = jsonField(participant, "side");
-            const side = if (participant_side.len > 0)
-                if (self_side.len == 0 or std.ascii.eqlIgnoreCase(participant_side, self_side)) "ally" else "enemy"
-            else if (jsonInt(participant, "teamId") == self_team_id)
-                "ally"
+            const side = if (self_subteam_id > 0 and statInt(participant, "playerSubteamId") > 0)
+                if (self_subteam_id == statInt(participant, "playerSubteamId")) "ally" else "enemy"
+            else if (participant_side.len > 0 and self_side.len > 0)
+                if (std.ascii.eqlIgnoreCase(participant_side, self_side)) "ally" else "enemy"
+            else if (jsonInt(participant, "teamId") > 0 and self_team_id > 0)
+                if (jsonInt(participant, "teamId") == self_team_id) "ally" else "enemy"
             else
-                "enemy";
+                "unknown";
             const target_champion_id = jsonInt(participant, "championId");
             const target_champion_name = championName(catalog, target_champion_id, jsonField(participant, "championName"));
 
@@ -187,7 +219,7 @@ pub fn fromHistory(history_json: []const u8, self_puuid: []const u8, catalog_jso
             try jsonString(&writer, self_champion_name);
             try writer.writeAll(",\"selfPosition\":");
             try jsonString(&writer, self_position);
-            try writer.print(",\"selfKills\":{d},\"selfDeaths\":{d},\"selfAssists\":{d},\"selfWin\":{}", .{ statInt(self_participant, "kills"), statInt(self_participant, "deaths"), statInt(self_participant, "assists"), self_win });
+            try writeStats(&writer, self_participant, true);
             try writer.writeAll(",\"puuid\":");
             try jsonString(&writer, puuid);
             try writer.writeAll(",\"gameName\":");
@@ -200,10 +232,12 @@ pub fn fromHistory(history_json: []const u8, self_puuid: []const u8, catalog_jso
             try jsonString(&writer, side);
             try writer.writeAll(",\"position\":");
             try jsonString(&writer, participantPosition(participant));
-            try writer.print(",\"kills\":{d},\"deaths\":{d},\"assists\":{d},\"win\":{}", .{ statInt(participant, "kills"), statInt(participant, "deaths"), statInt(participant, "assists"), statBool(participant, "win") });
+            try writeStats(&writer, participant, false);
             try writer.writeAll(",\"result\":");
             const recorded_result = jsonField(game, "result");
-            try jsonString(&writer, if (recorded_result.len > 0) recorded_result else if (self_win) "胜利" else "失败");
+            if (recorded_result.len > 0) try jsonString(&writer, recorded_result) else if (hasStat(self_participant, "win")) {
+                try jsonString(&writer, if (self_win) "胜利" else "失败");
+            } else try writer.writeAll("null");
             try writer.writeAll(",\"encounteredAt\":");
             const played_at = jsonField(game, "playedAt");
             if (played_at.len > 0) {
@@ -248,11 +282,6 @@ fn participantForPuuid(game: std.json.Value, participants: std.json.Value, puuid
         const identity = participantIdentity(game, participant);
         if (sameIdentity(participantPuuid(participant, identity), puuid)) return participant;
     }
-    const requested_id = jsonInt(game, "participantId");
-    if (requested_id > 0) for (participants.array.items) |participant| {
-        if (participant == .object and jsonInt(participant, "participantId") == requested_id) return participant;
-    };
-    if (participants.array.items.len == 1) return participants.array.items[0];
     return .{ .null = {} };
 }
 
@@ -381,6 +410,22 @@ fn statInt(value: std.json.Value, name: []const u8) i64 {
     return jsonInt(value, name);
 }
 
+fn hasStat(value: std.json.Value, name: []const u8) bool {
+    const stats = nestedObject(value, "stats") orelse value;
+    if (stats != .object) return false;
+    const item = stats.object.get(name) orelse return false;
+    return item != .null;
+}
+
+fn writeStats(writer: *std.Io.Writer, value: std.json.Value, self: bool) !void {
+    inline for (.{ "kills", "deaths", "assists", "win" }, .{ "selfKills", "selfDeaths", "selfAssists", "selfWin" }) |key, self_key| {
+        if (hasStat(value, key)) {
+            try writer.print(",\"{s}\":", .{if (self) self_key else key});
+            if (comptime std.mem.eql(u8, key, "win")) try writer.print("{}", .{statBool(value, key)}) else try writer.print("{d}", .{statInt(value, key)});
+        }
+    }
+}
+
 fn statBool(value: std.json.Value, name: []const u8) bool {
     if (nestedObject(value, "stats")) |stats| if (stats.object.get(name) != null) return jsonBool(stats, name);
     return jsonBool(value, name);
@@ -413,7 +458,7 @@ fn writeIsoTimestamp(writer: *std.Io.Writer, epoch_millis: i64) !void {
     });
 }
 
-test "history records both identities and full match participants" {
+test "战绩派生记录保留双方身份和整局参与者" {
     const input = "{\"games\":{\"games\":[{\"gameId\":9,\"gameCreation\":1625159473123,\"participantIdentities\":[{\"participantId\":1,\"player\":{\"puuid\":\"self\",\"gameName\":\"本人\",\"tagLine\":\"ME\"}},{\"participantId\":2,\"player\":{\"puuid\":\"enemy\",\"gameName\":\"对手\",\"gameTag\":\"CN1\"}}],\"participants\":[{\"participantId\":1,\"teamId\":100,\"championId\":103,\"teamPosition\":\"MIDDLE\",\"stats\":{\"kills\":8,\"deaths\":2,\"assists\":7,\"win\":true}},{\"participantId\":2,\"teamId\":200,\"championId\":64,\"teamPosition\":\"JUNGLE\",\"stats\":{\"kills\":3,\"deaths\":5,\"assists\":6,\"win\":false}}]}]}}";
     const catalog = "[{\"id\":103,\"name\":\"九尾妖狐\"},{\"id\":64,\"name\":\"盲僧\"}]";
     var output: [8192]u8 = undefined;
@@ -430,7 +475,7 @@ test "history records both identities and full match participants" {
     try std.testing.expectEqualStrings("盲僧", jsonField(record, "championName"));
 }
 
-test "owned merge rejects ambiguous legacy records" {
+test "按本人归属合并时排除身份不明的旧记录" {
     const existing = "[{\"gameId\":1,\"puuid\":\"legacy\",\"encounteredAt\":\"2026-01-01T00:00:00.000Z\"},{\"gameId\":2,\"selfPuuid\":\"other-owner\",\"puuid\":\"wrong\",\"encounteredAt\":\"2026-01-01T00:00:00.000Z\"}]";
     const newest = "[{\"gameId\":3,\"selfPuuid\":\"self\",\"puuid\":\"kept\",\"encounteredAt\":\"2026-01-01T00:00:00.000Z\"}]";
     var output: [4096]u8 = undefined;
@@ -440,7 +485,7 @@ test "owned merge rejects ambiguous legacy records" {
     try std.testing.expect(std.mem.indexOf(u8, result, "wrong") == null);
 }
 
-test "query returns complete newest matches involving target" {
+test "查询返回目标参与的最近完整对局" {
     const archive =
         "[{\"gameId\":1,\"selfPuuid\":\"self\",\"puuid\":\"target\",\"gameName\":\"旧目标\",\"encounteredAt\":\"2026-01-01T00:00:00.000Z\"}," ++
         "{\"gameId\":2,\"selfPuuid\":\"self\",\"puuid\":\"target\",\"gameName\":\"新目标\",\"encounteredAt\":\"2026-02-01T00:00:00.000Z\"}," ++
@@ -456,7 +501,64 @@ test "query returns complete newest matches involving target" {
     try std.testing.expect(std.mem.indexOf(u8, result, "其他账号") == null);
 }
 
-test "invalid nested history games value is ignored" {
+test "忽略格式无效的嵌套战绩" {
     var output: [128]u8 = undefined;
     try std.testing.expectEqualStrings("[]", try fromHistory("{\"games\":{\"games\":{}}}", "self", "[]", &output));
+}
+
+test "共同对局要求双方真实身份且不按年份截断" {
+    const shared =
+        \\[{"gameId":1,"gameCreation":1625159473123,"participants":[{"puuid":"self","teamId":100,"kills":4,"deaths":1,"assists":2,"win":true},{"puuid":"target","teamId":200,"kills":1,"deaths":4,"assists":3,"win":false}]}]
+    ;
+    const unrelated =
+        \\[{"gameId":2,"participantId":1,"participants":[{"participantId":1,"puuid":"target"}]}]
+    ;
+    var output: [8192]u8 = undefined;
+    const json = try fromHistories(&.{ unrelated, shared, shared }, "self", "target", "[]", 40, 0, &output);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    try std.testing.expectEqual(@as(i64, 1), jsonInt(parsed.value.array.items[0], "gameId"));
+    try std.testing.expect(std.mem.startsWith(u8, jsonField(parsed.value.array.items[0], "encounteredAt"), "2021-"));
+    try std.testing.expectEqualStrings("[]", try fromHistories(&.{shared}, "self", "target", "[]", 40, 1, &output));
+    try std.testing.expectEqualStrings("[]", try fromHistories(&.{shared}, "another-account", "target", "[]", 40, 0, &output));
+}
+
+test "派生对局倒序排列且最多四十局并保留全部参与者" {
+    var history_buffer: [32 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&history_buffer);
+    try writer.writeByte('[');
+    for (0..45) |index| {
+        if (index > 0) try writer.writeByte(',');
+        try writer.print("{{\"gameId\":{d},\"gameCreation\":{d},\"participants\":[{{\"puuid\":\"self\"}},{{\"puuid\":\"target\"}},{{\"puuid\":\"third\"}}]}}", .{ index + 1, 1_625_159_473_123 + index * 60_000 });
+    }
+    try writer.writeByte(']');
+    const output = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(output);
+    const json = try fromHistories(&.{writer.buffered()}, "self", "target", "[]", 100, 0, output);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 80), parsed.value.array.items.len);
+    try std.testing.expectEqual(@as(i64, 45), jsonInt(parsed.value.array.items[0], "gameId"));
+    try std.testing.expectEqual(@as(i64, 6), jsonInt(parsed.value.array.items[79], "gameId"));
+    try std.testing.expect(!parsed.value.array.items[0].object.contains("kills"));
+    try std.testing.expect(!parsed.value.array.items[0].object.contains("selfWin"));
+}
+
+test "竞技场比较小队且完整结算替换重复的缺失记录" {
+    const pending =
+        \\[{"gameId":1,"participants":[{"puuid":"self","teamId":100,"playerSubteamId":1},{"puuid":"TARGET","teamId":100,"playerSubteamId":2}]}]
+    ;
+    const settled =
+        \\[{"gameId":1,"participants":[{"puuid":"self","teamId":100,"playerSubteamId":1,"win":true},{"puuid":"target","teamId":100,"playerSubteamId":2,"kills":3,"win":false}]}]
+    ;
+    var output: [8192]u8 = undefined;
+    const json = try fromHistories(&.{ pending, settled }, "self", "target", "[]", 40, 0, &output);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    const record = parsed.value.array.items[0];
+    try std.testing.expectEqualStrings("enemy", jsonField(record, "side"));
+    try std.testing.expectEqual(@as(i64, 3), jsonInt(record, "kills"));
+    try std.testing.expect(record.object.contains("win"));
 }

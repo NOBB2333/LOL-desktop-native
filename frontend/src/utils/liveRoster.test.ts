@@ -1,7 +1,24 @@
 import { describe, expect, it } from "vitest";
 import { fixtureLobby } from "../fixtures/data";
 import type { LiveLobby, PlayerProfile } from "../types/domain";
-import { enrichedRosterCoversOverlay, mergeRosterSnapshot } from "./liveRoster";
+import { enrichedRosterCoversOverlay, mergeRosterSnapshot, playerCardKey, playerIdentity } from "./liveRoster";
+
+it("五名敌方从空身份乱序补全后保留各自战绩和稳定卡片键", () => {
+  const fast = structuredClone(fixtureLobby);
+  fast.id = "789";
+  fast.phase = "InProgress";
+  fast.enemy = fast.enemy.map((player, index) => ({ ...player, puuid: "00000000-0000-0000-0000-000000000000", rosterKey: `enemy-slot-${index}`, gameName: `敌方${index}`, recentMatches: [], dataComplete: false }));
+  const base = structuredClone(fast);
+  for (const index of [3, 1, 4, 0, 2]) {
+    base.enemy[index] = { ...base.enemy[index], puuid: `已解析-${index}`, recentMatches: [{ ...fixtureLobby.enemy[index].recentMatches[0], gameId: 1000 + index }], dataComplete: true };
+    const merged = mergeRosterSnapshot(base, fast);
+    expect(merged.enemy.map((player) => player.recentMatches.map((match) => match.gameId))).toEqual(base.enemy.map((player) => player.recentMatches.map((match) => match.gameId)));
+    expect(merged.enemy.map(playerCardKey)).toEqual(fast.enemy.map(playerCardKey));
+    expect(merged.teams?.find((team) => team.side === "enemy")?.players).toEqual(merged.enemy);
+  }
+  expect(playerIdentity({ ...fast.enemy[0], gameName: "未知玩家" })).toBe("");
+  expect(new Set(fast.enemy.map((player, index) => playerCardKey({ ...player, rosterKey: undefined, gameName: "未知玩家" }, index))).size).toBe(5);
+});
 
 function lobby(id: string, player: Partial<PlayerProfile>): LiveLobby {
   const value = structuredClone(fixtureLobby);

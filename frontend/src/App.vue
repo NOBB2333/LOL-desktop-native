@@ -2,6 +2,7 @@
 import { darkTheme, dateZhCN, NConfigProvider, NMessageProvider, zhCN } from "naive-ui";
 import { BarChart3, BookOpen, Bot, ChevronRight, CircleHelp, Clock3, History, Home, Moon, PanelLeftClose, PanelLeftOpen, Settings, Swords, Sun, UserRound, Wifi, WifiOff, X } from "@lucide/vue";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { useQueryClient } from "@tanstack/vue-query";
 import { RouterLink, RouterView, useRoute, useRouter } from "vue-router";
 import AssetIcon from "./components/AssetIcon.vue";
 import logoUrl from "./assets/lol-mark.png";
@@ -9,11 +10,13 @@ import { backend, isTauri } from "./services/backend";
 import { listenNative } from "./services/native";
 import { useAppStore } from "./stores/app";
 import type { AccountPresence } from "./types/domain";
+import { MATCH_HISTORY_QUERY_ROOT } from "./utils/matchHistoryQuery";
 
 const PROJECT_URL = "https://github.com/NOBB2333/lol-desktop";
 const app = useAppStore();
 const route = useRoute();
 const router = useRouter();
+const queryClient = useQueryClient();
 const lastAutoPhase = ref<string | null>(null);
 const dark = computed(() => app.config.appearance.colorMode === "dark");
 const immersive = computed(() => route.path === "/game" || route.path === "/live");
@@ -46,7 +49,7 @@ const accountTag = computed(() => account.value.tagLine ? `#${account.value.tagL
 const presenceLabels: Record<AccountPresence, string> = {
   offline: "离线", online: "在线", away: "离开", inQueue: "正在排队", customLobby: "自定义房间", readyCheck: "准备确认", champSelect: "英雄选择", inGame: "游戏中", spectating: "观战中", endOfGame: "结算中", unknown: "状态未知",
 };
-const presenceLabel = computed(() => app.mode === "fixture" ? "Fixture 预览" : presenceLabels[account.value.presence] ?? "状态未知");
+const presenceLabel = computed(() => app.mode === "fixture" ? "演示预览" : presenceLabels[account.value.presence] ?? "状态未知");
 const presenceClass = computed(() => account.value.presence === "offline" ? "offline" : account.value.presence === "unknown" ? "unknown" : account.value.presence);
 let stopOpenGameListener: (() => void) | null = null;
 let stopLcuEventListener: (() => void) | null = null;
@@ -60,6 +63,7 @@ let lastConnectionRefreshAt = 0;
 let automationRunning = false;
 let lastLcuEventPollAt = 0;
 let lastAutomationProbeAt = 0;
+const matchHistoryRefreshTimers: ReturnType<typeof setTimeout>[] = [];
 const normalEventPollIntervalMs = 1000;
 const automationEventPollIntervalMs = 750;
 const automationProbeIntervalMs = 500;
@@ -73,7 +77,31 @@ function toggleTheme() {
   app.config.appearance.colorMode = dark.value ? "light" : "dark";
 }
 
-watch(() => app.connection.phase, (phase) => {
+function invalidateMatchHistory() {
+  void queryClient.invalidateQueries({ queryKey: [MATCH_HISTORY_QUERY_ROOT], refetchType: "active" });
+}
+
+let savedHistoryFilters = "";
+watch(() => app.lastSavedAt, () => {
+  const filters = JSON.stringify([app.config.providers.hideUnfinishedMatches, app.config.providers.rankedOnly]);
+  if (filters === savedHistoryFilters) return;
+  savedHistoryFilters = filters;
+  // 自动保存完成后再刷新，避免读取到后端尚未更新的过滤口径。
+  void queryClient.resetQueries({ queryKey: [MATCH_HISTORY_QUERY_ROOT] });
+  void queryClient.resetQueries({ queryKey: ["lobby"] });
+});
+
+function scheduleMatchHistoryRefresh() {
+  invalidateMatchHistory();
+  matchHistoryRefreshTimers.push(setTimeout(invalidateMatchHistory, 3000));
+  matchHistoryRefreshTimers.push(setTimeout(invalidateMatchHistory, 10_000));
+}
+
+watch(() => app.connection.phase, (phase, previous) => {
+  const settlement = phase === "WaitingForStats" || phase === "PreEndOfGame" || phase === "EndOfGame";
+  const previousSettlement = previous === "WaitingForStats" || previous === "PreEndOfGame" || previous === "EndOfGame";
+  const leftVisibleGame = Boolean(previous && validGamePhases.includes(previous) && (!phase || !validGamePhases.includes(phase)));
+  if ((settlement && !previousSettlement) || leftVisibleGame) scheduleMatchHistoryRefresh();
   if (app.mode !== "live" || !phase || !validGamePhases.includes(phase)) {
     lastAutoPhase.value = null;
     return;
@@ -153,11 +181,11 @@ async function pollShortcutEvents() {
   shortcutPollRunning = true;
   try {
     const events = await backend.shortcutEvents();
-    for (const shortcutId of events) {
+    for (const shortcutId of new Set(events)) {
       if (shortcutId === "open-game") {
         openGameView();
       } else {
-        await app.dispatchShortcut(shortcutId);
+        void app.dispatchShortcut(shortcutId);
       }
     }
   } catch {
@@ -211,6 +239,7 @@ onBeforeUnmount(() => {
   if (lcuEventPollTimer) clearInterval(lcuEventPollTimer);
   if (connectionPollTimer) clearInterval(connectionPollTimer);
   if (shortcutPollTimer) clearInterval(shortcutPollTimer);
+  matchHistoryRefreshTimers.forEach(clearTimeout);
   stopOpenGameListener?.();
   stopLcuEventListener?.();
 });

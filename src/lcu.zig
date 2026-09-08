@@ -1,6 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const windows_http = @import("lcu/http_windows.zig");
+pub const transport = windows_http;
+pub const RequestControl = @import("lcu/request_control.zig").Control;
+pub const RequestLane = enum(u8) { state, roster, query, action };
+
+test {
+    std.testing.refAllDecls(windows_http);
+    std.testing.refAllDecls(RequestControl);
+}
 
 pub const websocket = @import("lcu/websocket.zig");
 
@@ -10,6 +18,12 @@ pub const Credentials = struct {
     port: u16,
     token: []const u8,
     protocol: []const u8,
+    platform: [32]u8 = .{0} ** 32,
+    platform_len: usize = 0,
+
+    pub fn platformId(self: *const Credentials) []const u8 {
+        return self.platform[0..self.platform_len];
+    }
 
     pub fn endpoint(self: Credentials, buffer: []u8) ![]const u8 {
         return std.fmt.bufPrint(buffer, "{s}://127.0.0.1:{d}", .{ self.protocol, self.port });
@@ -45,6 +59,8 @@ pub const Client = struct {
     credentials: Credentials,
     timeout_ms: u32 = 6000,
     verify_tls: bool = false,
+    control: RequestControl = .{},
+    lane: RequestLane = .query,
 
     pub fn discover(allocator: std.mem.Allocator, io: std.Io, configured: []const []const u8, env_map: ?*const std.process.Environ.Map) !Client {
         if (builtin.os.tag == .windows) {
@@ -179,6 +195,14 @@ pub const Client = struct {
         self.allocator.free(self.credentials.protocol);
     }
 
+    fn localBudget(self: Client) windows_http.Budget {
+        return switch (self.lane) {
+            .roster => .roster,
+            .action => .action,
+            else => .lcu,
+        };
+    }
+
     pub fn get(self: Client, path: []const u8) ![]u8 {
         return self.request("GET", path, null);
     }
@@ -217,6 +241,7 @@ pub const Client = struct {
     /// The URL and token remain inside the native layer and never cross the
     /// WebView bridge.
     pub fn getBearerUrl(self: Client, url: []const u8, token: []const u8, user_agent: []const u8) ![]u8 {
+        try self.control.check();
         if (!std.mem.startsWith(u8, url, "https://") or token.len == 0) return error.InvalidPath;
         var authorization_buffer: [16 * 1024]u8 = undefined;
         const authorization = try std.fmt.bufPrint(&authorization_buffer, "Authorization: Bearer {s}", .{token});
@@ -227,6 +252,9 @@ pub const Client = struct {
             .timeout_ms = self.timeout_ms,
             .verify_tls = true,
             .max_response_bytes = 16 * 1024 * 1024,
+            .io = self.io,
+            .control = self.control,
+            .budget = .remote,
         });
         var timeout_buffer: [16]u8 = undefined;
         const timeout = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{(@as(u32, self.timeout_ms) + 999) / 1000});
@@ -260,6 +288,7 @@ pub const Client = struct {
     /// for provider snapshots such as OP.GG; callers still control the fixed
     /// URL and the response never crosses the bridge as raw credentials.
     pub fn getPublicUrl(self: Client, url: []const u8, user_agent: []const u8) ![]u8 {
+        try self.control.check();
         if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidPath;
         if (builtin.os.tag == .windows) return windows_http.request(self.allocator, .{
             .url = url,
@@ -267,6 +296,9 @@ pub const Client = struct {
             .timeout_ms = self.timeout_ms,
             .verify_tls = true,
             .max_response_bytes = 8 * 1024 * 1024,
+            .io = self.io,
+            .control = self.control,
+            .budget = .remote,
         });
         var timeout_buffer: [16]u8 = undefined;
         const timeout = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{(@as(u32, self.timeout_ms) + 999) / 1000});
@@ -288,6 +320,7 @@ pub const Client = struct {
     /// This deliberately accepts only loopback URLs so arbitrary web access
     /// cannot be smuggled through the native bridge.
     pub fn getLocalUrl(self: Client, url: []const u8) ![]u8 {
+        try self.control.check();
         if (!std.mem.startsWith(u8, url, "https://127.0.0.1:") and
             !std.mem.startsWith(u8, url, "https://localhost:")) return error.InvalidPath;
         if (builtin.os.tag == .windows) return windows_http.request(self.allocator, .{
@@ -295,6 +328,9 @@ pub const Client = struct {
             .timeout_ms = self.timeout_ms,
             .verify_tls = false,
             .max_response_bytes = 8 * 1024 * 1024,
+            .io = self.io,
+            .control = self.control,
+            .budget = self.localBudget(),
         });
         var timeout_buffer: [16]u8 = undefined;
         const timeout = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{(@as(u32, self.timeout_ms) + 999) / 1000});
@@ -322,6 +358,7 @@ pub const Client = struct {
     }
 
     fn request(self: Client, method: []const u8, path: []const u8, body: ?[]const u8) ![]u8 {
+        try self.control.check();
         if (!std.mem.startsWith(u8, path, "/")) return error.InvalidPath;
         var url_buf: [2048]u8 = undefined;
         const url = try std.fmt.bufPrint(&url_buf, "{s}://127.0.0.1:{d}{s}", .{ self.credentials.protocol, self.credentials.port, path });
@@ -345,6 +382,9 @@ pub const Client = struct {
                 .timeout_ms = self.timeout_ms,
                 .verify_tls = self.verify_tls,
                 .max_response_bytes = 8 * 1024 * 1024,
+                .io = self.io,
+                .control = self.control,
+                .budget = self.localBudget(),
             });
         }
         var argv: [16][]const u8 = undefined;
@@ -561,14 +601,21 @@ pub fn fromCommandLine(command_line: []const u8) ParseError!Credentials {
         argumentValue(command_line, "--riotclient-auth-token") orelse return error.MissingToken;
     const port = std.fmt.parseInt(u16, port_text, 10) catch return error.InvalidPort;
     if (token.len == 0) return error.MissingToken;
-    return .{ .port = port, .token = token, .protocol = "https" };
+    var credentials = Credentials{ .port = port, .token = token, .protocol = "https" };
+    // 与参考项目一致，从客户端进程参数读取大区，兼容两种命名。
+    const platform = argumentValue(command_line, "--rso_platform_id") orelse argumentValue(command_line, "--rso-platform-id") orelse "";
+    if (platform.len <= credentials.platform.len) {
+        @memcpy(credentials.platform[0..platform.len], platform);
+        credentials.platform_len = platform.len;
+    }
+    return credentials;
 }
 
 fn ownCredentials(allocator: std.mem.Allocator, borrowed: Credentials) !Credentials {
     const token = try allocator.dupe(u8, borrowed.token);
     errdefer allocator.free(token);
     const protocol = try allocator.dupe(u8, borrowed.protocol);
-    return .{ .port = borrowed.port, .token = token, .protocol = protocol };
+    return .{ .port = borrowed.port, .token = token, .protocol = protocol, .platform = borrowed.platform, .platform_len = borrowed.platform_len };
 }
 
 fn argumentValue(command_line: []const u8, key: []const u8) ?[]const u8 {
@@ -610,13 +657,22 @@ test "parses LCU lockfile credentials" {
     try std.testing.expectEqualStrings("https", credentials.protocol);
 }
 
-test "parses equals and separated command line arguments" {
+test "解析两种参数格式并保留独立大区信息" {
     const equals = try fromCommandLine("LeagueClientUx.exe --app-port=1234 --remoting-auth-token=abc");
     try std.testing.expectEqual(@as(u16, 1234), equals.port);
     try std.testing.expectEqualStrings("abc", equals.token);
     const separated = try fromCommandLine("LeagueClientUx.exe --riotclient-app-port 4321 --riotclient-auth-token \"secret value\"");
     try std.testing.expectEqual(@as(u16, 4321), separated.port);
     try std.testing.expectEqualStrings("secret value", separated.token);
+    for ([_][]const u8{ "--rso_platform_id=HN1", "--rso-platform-id HN1" }) |flag| {
+        const command = try std.fmt.allocPrint(std.testing.allocator, "LeagueClientUx.exe --app-port=1234 --remoting-auth-token=abc {s}", .{flag});
+        defer std.testing.allocator.free(command);
+        const borrowed = try fromCommandLine(command);
+        const owned = try ownCredentials(std.testing.allocator, borrowed);
+        defer std.testing.allocator.free(owned.token);
+        defer std.testing.allocator.free(owned.protocol);
+        try std.testing.expectEqualStrings("HN1", owned.platformId());
+    }
 }
 
 test "rejects malformed credentials" {

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { createInvocationScheduler } from "./native";
+import { createCommandScheduler, createInvocationScheduler } from "./native";
 
-describe("native invocation scheduler", () => {
-  it("does not exceed the configured bridge concurrency", async () => {
+describe("原生调用调度", () => {
+  it("不超过配置的并发上限", async () => {
     const schedule = createInvocationScheduler(4);
     const requestCount = 128;
     const releases: Array<() => void> = [];
@@ -30,12 +30,28 @@ describe("native invocation scheduler", () => {
     expect(maximumActive).toBe(4);
   });
 
-  it("continues queued work after a rejected invocation", async () => {
+  it("请求失败后继续处理队列", async () => {
     const schedule = createInvocationScheduler(1);
-    const first = schedule(async () => { throw new Error("request failed"); });
-    const second = schedule(async () => "completed");
+    const first = schedule(async () => { throw new Error("请求失败"); });
+    const second = schedule(async () => "已完成");
 
-    await expect(first).rejects.toThrow("request failed");
-    await expect(second).resolves.toBe("completed");
+    await expect(first).rejects.toThrow("请求失败");
+    await expect(second).resolves.toBe("已完成");
+  });
+
+  it("战绩通道占满时状态、阵容和发送仍可完成", async () => {
+    const schedule = createCommandScheduler();
+    const releases: Array<() => void> = [];
+    const slow = Array.from({ length: 2 }, () => schedule("lol.get_match_history", () => new Promise<void>((resolve) => releases.push(resolve))));
+    await Promise.resolve();
+    expect(releases).toHaveLength(2);
+    const completed = await Promise.all([
+      schedule("lol.get_live_lobby", async () => "状态"),
+      schedule("lol.get_live_roster", async () => "阵容"),
+      schedule("lol.send_shortcut", async () => "发送"),
+    ]);
+    expect(completed).toEqual(["状态", "阵容", "发送"]);
+    releases.forEach((release) => release());
+    await Promise.all(slow);
   });
 });

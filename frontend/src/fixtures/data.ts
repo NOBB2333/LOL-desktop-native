@@ -79,6 +79,7 @@ function recentMatches(index: number, ally: boolean, championId: number, champio
     const performance = damageShare >= 0.23 && (kills + assists) / Math.max(1, deaths) >= 3.5 ? "carry" : win && damageShare < 0.19 ? "carried" : deaths >= 7 ? "struggling" : "solid";
     return {
       gameId: 760000 + index * 100 + matchIndex,
+      queueId: matchIndex === 8 ? 450 : 420,
       championId,
       championName,
       queueName: matchIndex === 8 ? "极地大乱斗" : "单双排",
@@ -114,12 +115,12 @@ function recentMatches(index: number, ally: boolean, championId: number, champio
   });
 }
 
-function makePlayer(index: number, ally: boolean): PlayerProfile {
+function makePlayer(index: number, ally: boolean, rankedOnly = false): PlayerProfile {
   const champion = champions[index + (ally ? 0 : 5)];
   const [id, championName, , role] = champion;
   const [gameName, tagLine] = (ally ? allyNames : enemyNames)[index];
   const [rankTier, rankDivision, leaguePoints] = ranks[ally ? index : (index + 2) % 5];
-  const matches = recentMatches(index, ally, id, championName, role);
+  const matches = recentMatches(index, ally, id, championName, role).filter((match) => !rankedOnly || match.queueId === 420 || match.queueId === 440);
   const wins = matches.filter((match) => match.win).length;
   const kda = matches.reduce((sum, match) => sum + (match.kills + match.assists) / Math.max(1, match.deaths), 0) / matches.length;
   const score = Math.round((58 + wins * 2.8 + Math.min(kda, 5) * 2.2 + (rankTier === "MASTER" ? 10 : 0)) * 10) / 10;
@@ -135,7 +136,7 @@ function makePlayer(index: number, ally: boolean): PlayerProfile {
   if (wins <= 3) tags.push({ key: "slump", label: "近期低迷", tone: "danger", evidence: `近10场仅 ${wins} 胜` });
   if (index === 1) tags.push({ key: "autofill", label: "位置样本少", tone: "warning", evidence: "近10场同位置 4 场" });
   if (index === 2) tags.push({ key: "signature", label: "当前英雄熟练", tone: "success", evidence: "当前英雄 5 场" });
-  if (index === 2) tags.unshift({ key: "met", label: "遇到过", tone: "info", evidence: "最近一年本地记录中遇到过 3 次，点击查看对局详情" });
+  if (index === 2) tags.unshift({ key: "met", label: "遇到过", tone: "info", evidence: "近期战绩中遇到过 3 次" });
   if (!tags.length) tags.push({ key: "stable", label: "状态稳定", tone: "info", evidence: "近期表现无明显波动" });
   const topChampions = [
     { championId: id, championName, games: 63 - index * 5, wins: 39 - index * 2, winRate: 0.62 - index * 0.01 },
@@ -242,6 +243,17 @@ export const fixtureLobby: LiveLobby = {
   recentMatch: null,
   isFixture: true,
 };
+
+export function createFixtureLobby(rankedOnly: boolean): LiveLobby {
+  const value = structuredClone(fixtureLobby);
+  if (!rankedOnly) return value;
+  value.ally = Array.from({ length: 5 }, (_, index) => makePlayer(index, true, true));
+  value.enemy = Array.from({ length: 5 }, (_, index) => makePlayer(index, false, true));
+  value.allySummary = summary("ally", value.ally);
+  value.enemySummary = summary("enemy", value.enemy);
+  value.teams = value.teams?.map((team) => ({ ...team, players: team.side === "ally" ? value.ally : value.enemy, summary: team.side === "ally" ? value.allySummary : value.enemySummary }));
+  return value;
+}
 
 function matchParticipants(index: number, win: boolean): MatchParticipant[] {
   return champions.map(([championId, championName, , role], slot) => ({
@@ -394,7 +406,7 @@ export const fixtureFriends: FriendToolsSnapshot = {
 };
 
 export const fixtureConfig: AppConfig = {
-  version: 17,
+  version: 18,
   appearance: { theme: "mint", colorMode: "light", compact: false },
   connection: { kind: "local", sshTarget: "", identityFile: "", forwardedPort: 0 },
   automation: {
@@ -409,6 +421,7 @@ export const fixtureConfig: AppConfig = {
     pickChampionIds: [103, 222, 64],
     banChampionIds: [164, 7, 145],
     shortcutSendIntervalMs: 250,
+    protectChatInput: true,
     shortcutRecentGameCount: 5,
     shortcuts: [
       { id: "encounter", label: "发送遇到记录", key: "Ctrl+F8", target: "encounter", template: "{encounter}", enabled: true },
@@ -419,7 +432,7 @@ export const fixtureConfig: AppConfig = {
       { id: "open-game", label: "打开对局速看", key: "Ctrl+F1", target: "lobby", template: "对局速看：{team} {name}，近10场 {recent_wins}胜{recent_losses}负，KDA {kda}", enabled: true },
     ],
   },
-  providers: { statsProvider: "auto", requestTimeoutSeconds: 6, cacheTtlMinutes: 120, hideUnfinishedMatches: false, clearLobbyAfterGame: true },
+  providers: { statsProvider: "auto", requestTimeoutSeconds: 6, cacheTtlMinutes: 120, hideUnfinishedMatches: false, rankedOnly: false, clearLobbyAfterGame: true },
   ai: { enabled: false, provider: "deepseek", protocol: "openai", baseUrl: "https://api.deepseek.com", model: "deepseek-v4-flash", apiKey: "", automaticPregameAnalysis: false },
 };
 

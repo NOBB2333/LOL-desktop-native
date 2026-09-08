@@ -1,4 +1,6 @@
 import { flushPromises, mount } from "@vue/test-utils";
+import { QueryClient, VueQueryPlugin } from "@tanstack/vue-query";
+import type { Plugin } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fixtureEncounters, fixtureLobby, fixtureMatches } from "../fixtures/data";
 import PlayerDetailDrawer from "./PlayerDetailDrawer.vue";
@@ -14,6 +16,14 @@ vi.mock("../services/backend", () => ({
   isTauri: () => false,
 }));
 
+vi.mock("../stores/app", () => ({
+  useAppStore: () => ({
+    mode: "fixture",
+    connection: { platformId: "HN1", gameName: "测试账号", tagLine: "TEST" },
+    config: { providers: { hideUnfinishedMatches: false } },
+  }),
+}));
+
 const DrawerStub = {
   template: "<div><slot /></div>",
 };
@@ -22,11 +32,41 @@ const DrawerContentStub = {
   template: "<div><slot name='header' /><slot /></div>",
 };
 
+function testPlugins(): (Plugin | [Plugin, ...unknown[]])[] {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return [[VueQueryPlugin, { queryClient }]];
+}
+
 describe("PlayerDetailDrawer", () => {
   beforeEach(() => {
     push.mockReset();
+    encounters.mockReset();
+    matches.mockReset();
     encounters.mockResolvedValue(structuredClone(fixtureEncounters));
     matches.mockResolvedValue(structuredClone(fixtureMatches));
+  });
+
+  it("先前玩家的慢请求不会覆盖当前玩家相遇记录", async () => {
+    let finishFirst!: (records: typeof fixtureEncounters) => void;
+    encounters.mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve; }));
+    const first = fixtureLobby.ally[2];
+    const second = fixtureLobby.enemy[1];
+    const secondRecord = { ...fixtureEncounters[0], gameId: 7654321, puuid: second.puuid, gameName: second.gameName, championName: "新玩家英雄" };
+    encounters.mockResolvedValueOnce([secondRecord]);
+    const wrapper = mount(PlayerDetailDrawer, {
+      props: { show: true, player: first },
+      global: { plugins: testPlugins(), stubs: { Drawer: DrawerStub, DrawerContent: DrawerContentStub, AssetIcon: true, MatchDetailCard: true, EncounterMatchModal: true } },
+    });
+    await flushPromises();
+    await wrapper.setProps({ player: second });
+    await flushPromises();
+    finishFirst(structuredClone(fixtureEncounters));
+    await flushPromises();
+    const rows = wrapper.findAll('[data-testid="encounter-match-open"]');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].text()).toContain("新玩家英雄");
+    expect(wrapper.text()).not.toContain("最近一年");
+    wrapper.unmount();
   });
 
   it("opens the selected player's match history from the drawer identity", async () => {
@@ -34,6 +74,7 @@ describe("PlayerDetailDrawer", () => {
     const wrapper = mount(PlayerDetailDrawer, {
       props: { show: true, player },
       global: {
+        plugins: testPlugins(),
         stubs: {
           Drawer: DrawerStub,
           DrawerContent: DrawerContentStub,
@@ -61,6 +102,7 @@ describe("PlayerDetailDrawer", () => {
     const wrapper = mount(PlayerDetailDrawer, {
       props: { show: true, player, lobby: fixtureLobby },
       global: {
+        plugins: testPlugins(),
         stubs: {
           Drawer: DrawerStub,
           DrawerContent: DrawerContentStub,
@@ -73,11 +115,13 @@ describe("PlayerDetailDrawer", () => {
     });
     await flushPromises();
 
-    expect(encounters).toHaveBeenCalledWith(player.puuid, 100);
+    expect(encounters).toHaveBeenCalledWith(player.puuid, 40, Number(fixtureLobby.id) || 0);
     expect(wrapper.text()).toContain(`${fixtureLobby.ally[0].gameName}#${fixtureLobby.ally[0].tagLine}`);
     expect(wrapper.text()).toContain(`${player.gameName}#${player.tagLine}`);
     expect(wrapper.get("[data-testid='encounter-tag']").text()).toContain(player.championName);
     expect(wrapper.get("[data-testid='encounter-tag']").text()).toMatch(/\d+\/\d+\/\d+/);
+    expect(wrapper.findAll("[data-testid='encounter-tag-match']")).toHaveLength(3);
+    expect(wrapper.findAll("[data-testid='encounter-match-open']")).toHaveLength(3);
     await wrapper.get("[data-testid='encounter-match-open']").trigger("click");
     expect(wrapper.get("[data-testid='encounter-modal']").text()).toBe("9");
   });
@@ -87,6 +131,7 @@ describe("PlayerDetailDrawer", () => {
     const wrapper = mount(PlayerDetailDrawer, {
       props: { show: true, player },
       global: {
+        plugins: testPlugins(),
         stubs: {
           Drawer: DrawerStub,
           DrawerContent: DrawerContentStub,
@@ -110,5 +155,59 @@ describe("PlayerDetailDrawer", () => {
 
     await wrapper.get("[data-testid='detailed-match']").trigger("click");
     expect(wrapper.get("[data-testid='detailed-match']").attributes("data-expanded")).toBe("true");
+  });
+
+  it("loads the selected match page and expands that match immediately", async () => {
+    const selected = { ...structuredClone(fixtureMatches[0]), gameId: 999_999 };
+    const player = {
+      ...structuredClone(fixtureLobby.ally[2]),
+      recentMatches: [...structuredClone(fixtureLobby.ally[2].recentMatches), { ...selected, win: true }],
+    };
+    matches.mockResolvedValueOnce([selected]);
+    const wrapper = mount(PlayerDetailDrawer, {
+      props: { show: true, player, initialMatchId: selected.gameId },
+      global: {
+        plugins: testPlugins(),
+        stubs: {
+          Drawer: DrawerStub,
+          DrawerContent: DrawerContentStub,
+          Button: { template: "<button><slot name='icon' /><slot /></button>" },
+          AssetIcon: true,
+          EncounterMatchModal: true,
+          MatchDetailCard: {
+            props: ["match", "expanded", "clickable"],
+            template: "<div data-testid='selected-detailed-match' :data-game-id='match.gameId' :data-expanded='String(expanded)' />",
+          },
+        },
+      },
+    });
+    await flushPromises();
+
+    expect(matches).toHaveBeenCalledWith(`${player.gameName}#${player.tagLine}`, 1, 10);
+    expect(wrapper.get("[data-testid='selected-detailed-match']").attributes("data-game-id")).toBe(String(selected.gameId));
+    expect(wrapper.get("[data-testid='selected-detailed-match']").attributes("data-expanded")).toBe("true");
+  });
+
+  it("does not load or show encounter history for a member of the local party", async () => {
+    const player = fixtureLobby.ally[2];
+    const wrapper = mount(PlayerDetailDrawer, {
+      props: { show: true, player, suppressEncounters: true },
+      global: {
+        plugins: testPlugins(),
+        stubs: {
+          Drawer: DrawerStub,
+          DrawerContent: DrawerContentStub,
+          Button: { template: "<button><slot name='icon' /><slot /></button>" },
+          AssetIcon: true,
+          MatchDetailCard: true,
+          EncounterMatchModal: true,
+        },
+      },
+    });
+    await flushPromises();
+
+    expect(encounters).not.toHaveBeenCalled();
+    expect(wrapper.text()).not.toContain("遇到过的对局");
+    expect(wrapper.find("[data-testid='encounter-tag']").exists()).toBe(false);
   });
 });

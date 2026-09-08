@@ -12,7 +12,8 @@ import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { MatchSummary } from "../types/domain";
 import { championImage, roleName, shortDate } from "../utils/format";
-import { isHiddenMatch } from "../utils/matchFilters";
+import { visibleMatches } from "../utils/matchFilters";
+import { matchHistoryQueryKey } from "../utils/matchHistoryQuery";
 import { useRoute, useRouter } from "vue-router";
 
 const app = useAppStore();
@@ -30,9 +31,14 @@ const viewMode = ref<"detail" | "index">(typeof localStorage === "undefined" ? "
 const selectedId = ref<number | null>(null);
 const detailOpen = ref(true);
 const expandedId = ref<number | null>(null);
-const matches = useQuery({ queryKey: computed(() => ["matches-page", app.mode, app.connection.platformId, app.connection.gameName, app.connection.tagLine, activeSummoner.value, page.value, app.config.providers.hideUnfinishedMatches]), queryFn: () => backend.matches(activeSummoner.value, page.value, pageSize), enabled: computed(() => app.initialized), staleTime: 0, refetchOnMount: "always" });
+const matches = useQuery({ queryKey: computed(() => matchHistoryQueryKey({ mode: app.mode, platformId: app.connection.platformId, gameName: app.connection.gameName, tagLine: app.connection.tagLine, summonerName: activeSummoner.value, page: page.value, pageSize, hideUnfinishedMatches: app.config.providers.hideUnfinishedMatches, rankedOnly: app.config.providers.rankedOnly })), queryFn: () => backend.matches(activeSummoner.value, page.value, pageSize), enabled: computed(() => app.initialized), staleTime: 60_000, refetchOnMount: true });
 const rawRows = computed(() => matches.data.value ?? []);
-const rows = computed(() => app.config.providers.hideUnfinishedMatches ? rawRows.value.filter((match) => !isHiddenMatch(match)) : rawRows.value);
+const rows = computed(() => visibleMatches(rawRows.value, app.config.providers.hideUnfinishedMatches, app.config.providers.rankedOnly));
+watch(() => [app.config.providers.hideUnfinishedMatches, app.config.providers.rankedOnly], () => {
+  page.value = 0;
+  queue.value = "all";
+  selectedId.value = null;
+});
 const filtered = computed(() => rows.value.filter((match) => {
   const query = search.value.trim().toLowerCase();
   const matchesSearch = !query || match.championName.toLowerCase().includes(query) || match.queueName.toLowerCase().includes(query) || match.participants.some((participant) => participant.gameName.toLowerCase().includes(query));

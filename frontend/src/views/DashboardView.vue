@@ -10,11 +10,12 @@ import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { RankQueueSummary } from "../types/domain";
 import { championImage, percent, platformRegionGuide, platformRegionName, platformRegionOverview, rankName, relativeTime } from "../utils/format";
-import { isHiddenMatch } from "../utils/matchFilters";
+import { visibleMatches } from "../utils/matchFilters";
+import { matchHistoryQueryKey } from "../utils/matchHistoryQuery";
 
 const app = useAppStore();
 const message = useMessage();
-const matches = useQuery({ queryKey: computed(() => ["dashboard-matches", app.mode, app.connection.platformId, app.connection.gameName, app.connection.tagLine, app.config.providers.hideUnfinishedMatches]), queryFn: () => backend.matches(), enabled: computed(() => app.initialized), staleTime: 20_000, refetchInterval: computed(() => app.initialized && app.mode === "live" ? 15_000 : false) });
+const matches = useQuery({ queryKey: computed(() => matchHistoryQueryKey({ mode: app.mode, platformId: app.connection.platformId, gameName: app.connection.gameName, tagLine: app.connection.tagLine, page: 0, pageSize: 10, hideUnfinishedMatches: app.config.providers.hideUnfinishedMatches, rankedOnly: app.config.providers.rankedOnly })), queryFn: () => backend.matches(), enabled: computed(() => app.initialized), staleTime: 60_000, refetchInterval: computed(() => app.initialized && app.mode === "live" ? 15_000 : false) });
 const encounters = useQuery({ queryKey: computed(() => ["dashboard-encounters", app.mode, app.connection.platformId, app.connection.gameName, app.connection.tagLine]), queryFn: () => backend.encounters(undefined, 20), enabled: computed(() => app.initialized), staleTime: 20_000, refetchInterval: computed(() => app.initialized && app.mode === "live" ? 15_000 : false) });
 const rawRows = computed(() => {
   // The native bridge can legitimately return an empty page while LCU is
@@ -24,7 +25,7 @@ const rawRows = computed(() => {
   return fetched?.length ? fetched : app.bootstrap.dashboard.recentMatches;
 });
 const rows = computed(() => {
-  const visible = app.config.providers.hideUnfinishedMatches ? rawRows.value.filter((match) => !isHiddenMatch(match)) : rawRows.value;
+  const visible = visibleMatches(rawRows.value, app.config.providers.hideUnfinishedMatches, app.config.providers.rankedOnly);
   return visible.slice(0, 10);
 });
 const relationRows = computed(() => {

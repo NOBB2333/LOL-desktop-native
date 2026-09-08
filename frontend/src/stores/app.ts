@@ -83,12 +83,7 @@ export const useAppStore = defineStore("app", () => {
       return;
     }
     try {
-      const shortcut = config.value.automation.shortcuts.find((item) => item.id === shortcutId);
-      if (shortcut?.target === "ally" || shortcut?.target === "enemy" || shortcut?.target === "premade") {
-        await backend.sendAssessments(shortcut.target);
-      } else {
-        await backend.sendShortcut(shortcutId);
-      }
+      await backend.sendShortcut(shortcutId);
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : String(cause);
     }

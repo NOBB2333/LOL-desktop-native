@@ -50,10 +50,12 @@ describe("config migration", () => {
   it("moves only the legacy open-game default to Ctrl+F1", () => {
     const legacy = structuredClone(fixtureConfig);
     legacy.version = 16;
+    legacy.automation.shortcuts.find((item) => item.id === "ally")!.template = "我的自定义评估";
     legacy.automation.shortcuts.find((item) => item.id === "open-game")!.key = "CommandOrControl+Shift+G";
 
     expect(migrateAppConfig(legacy)).toBe(true);
     expect(legacy.automation.shortcuts.find((item) => item.id === "open-game")?.key).toBe(defaultOpenGameShortcutKey);
+    expect(legacy.automation.shortcuts.find((item) => item.id === "ally")?.template).toBe("我的自定义评估");
 
     const customized = structuredClone(fixtureConfig);
     customized.automation.shortcuts.find((item) => item.id === "open-game")!.key = "Ctrl+F2";

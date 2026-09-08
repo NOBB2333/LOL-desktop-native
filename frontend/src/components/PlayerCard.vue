@@ -1,7 +1,11 @@
 <script setup lang="ts">
 import { Link2, MapPinned } from "@lucide/vue";
-import type { PlayerProfile, RankQueueSummary } from "../types/domain";
+import { NPopover } from "naive-ui";
+import { computed, onBeforeUnmount, ref } from "vue";
+import type { EncounterRecord, PlayerProfile, RankQueueSummary } from "../types/domain";
 import AssetIcon from "./AssetIcon.vue";
+import EncounterList from "./EncounterList.vue";
+import { encounterGames, encounterLabel as sharedEncounterLabel } from "../utils/encounters";
 import { championImage, rankName, roleName, shortDate, shortDay } from "../utils/format";
 
 type RecentColumns = 1 | 2;
@@ -13,10 +17,21 @@ const props = withDefaults(
     recentLimit?: number;
     recentColumns?: RecentColumns;
     premadeTone?: number;
+    suppressEncounters?: boolean;
+    encounterRecords?: EncounterRecord[];
+    encounterLoading?: boolean;
+    encounterError?: boolean;
+    currentGameId?: number;
+    localPlayer?: PlayerProfile | null;
   }>(),
   { recentLimit: 10, recentColumns: 1 },
 );
-defineEmits<{ select: [player: PlayerProfile] }>();
+const emit = defineEmits<{
+  select: [player: PlayerProfile];
+  "select-match": [player: PlayerProfile, gameId: number];
+  "select-encounter": [player: PlayerProfile, records: EncounterRecord[]];
+  "retry-encounters": [];
+}>();
 
 const visibleMatches = (player: PlayerProfile) => player.recentMatches.slice(0, props.recentLimit);
 const completed = (player: PlayerProfile) => visibleMatches(player).filter((match) => match.durationMinutes > 0);
@@ -37,7 +52,7 @@ const kdaValue = (player: PlayerProfile) => {
 
 const kda = (player: PlayerProfile) => {
   const val = kdaValue(player);
-  return completed(player).length ? val.toFixed(1) : "0.0";
+  return completed(player).length ? val.toFixed(1) : "--";
 };
 
 const kdaLevelClass = (player: PlayerProfile) => {
@@ -88,6 +103,7 @@ const soloRank = (player: PlayerProfile): RankQueueSummary | null =>
     : null);
 
 const queueRank = (rank?: RankQueueSummary | null) => {
+  if (props.player.unavailableSources?.includes("rank")) return props.player.dataStatus?.source === "unavailable" ? "读取中" : "暂不可用";
   const tier = rank?.tier?.trim();
   if (!tier || ["UNRANKED", "NA"].includes(tier.toUpperCase())) return "未定级";
   return `${rankName(tier)} ${rank?.division ?? ""}`.trim();
@@ -111,15 +127,34 @@ const encounterLabel = (player: PlayerProfile) => {
   const latest = player.lastEncounteredAt ? ` · 最近 ${shortDate(player.lastEncounteredAt)}` : "";
   return `遇到过 ${player.encounterCount} 次${latest}`;
 };
-const tagLabel = (player: PlayerProfile, key: string, label: string) => key === "met" ? encounterLabel(player) : label;
+const games = computed(() => encounterGames(props.encounterRecords ?? [], props.player.puuid, props.currentGameId));
+const metLabel = computed(() => games.value.length ? sharedEncounterLabel(games.value, props.player, props.localPlayer) : encounterLabel(props.player));
+const visibleTags = (player: PlayerProfile) => player.tags.filter((tag) => tag.key !== "met").slice(0, 3);
+const encounterOpen = ref(false);
+const encounterPinned = ref(false);
+let closeTimer: ReturnType<typeof setTimeout> | undefined;
+function openEncounters() { clearTimeout(closeTimer); encounterOpen.value = true; }
+function closeEncounters() {
+  clearTimeout(closeTimer);
+  closeTimer = setTimeout(() => { if (!encounterPinned.value) encounterOpen.value = false; }, 180);
+}
+function dismissEncounters() { encounterPinned.value = false; encounterOpen.value = false; }
+onBeforeUnmount(() => clearTimeout(closeTimer));
+function selectFromKeyboard(event: KeyboardEvent) {
+  if (event.target !== event.currentTarget) return;
+  emit("select", props.player);
+}
 </script>
 
 <template>
-  <button
+  <article
     class="bp-player-card"
     :class="[premadeClass(), { 'bp-player-card--selected': selected, 'bp-player-card--recent': showRecent }]"
-    type="button"
-    @click="$emit('select', player)"
+    role="button"
+    tabindex="0"
+    @click="emit('select', player)"
+    @keydown.enter="selectFromKeyboard"
+    @keydown.space.prevent="selectFromKeyboard"
   >
     <!-- 卡片头部：位置徽章、头像、玩家名、Tagline、开黑组队标识 -->
     <header class="bp-player-card__header">
@@ -154,12 +189,12 @@ const tagLabel = (player: PlayerProfile, key: string, label: string) => key === 
     <div class="bp-player-card__rank">
       <div class="bp-player-card__rank-left">
         <span class="bp-player-card__tier" :class="tierClass(player.rankTier)">
-          {{ rankName(player.rankTier) }} {{ player.rankDivision }}
+          {{ player.unavailableSources?.includes('rank') ? (player.dataStatus?.source === 'unavailable' ? '段位读取中' : '段位暂不可用') : `${rankName(player.rankTier)} ${player.rankDivision}` }}
         </span>
-        <b class="bp-player-card__lp">{{ player.leaguePoints }} LP</b>
+        <b v-if="!player.unavailableSources?.includes('rank')" class="bp-player-card__lp">{{ player.leaguePoints }} LP</b>
       </div>
       <em class="bp-player-card__score" title="综合对局评分">
-        <span class="score-num">{{ player.score.total.toFixed(0) }}</span>
+        <span class="score-num">{{ player.recentMatches.length ? player.score.total.toFixed(0) : '--' }}</span>
         <span class="score-unit">分</span>
       </em>
     </div>
@@ -226,12 +261,15 @@ const tagLabel = (player: PlayerProfile, key: string, label: string) => key === 
       <span class="bp-player-card__section-label">最近对局 <b>{{ visibleMatches(player).length }}场</b></span>
 
       <template v-if="visibleMatches(player).length">
-        <div
+        <button
           v-for="match in visibleMatches(player)"
           :key="`recent-${match.gameId}`"
+          type="button"
           class="recent-match-row"
+          data-testid="player-recent-match"
           :data-result="match.durationMinutes === 0 ? 'unfinished' : match.win ? 'win' : 'loss'"
           :title="`${match.win ? '胜利' : '失败'} · ${match.championName || ''} · ${match.kills}/${match.deaths}/${match.assists} · ${match.queueName || ''} · ${match.durationMinutes}分钟`"
+          @click.stop="emit('select-match', player, match.gameId)"
         >
           <!-- 胜负标识条与英雄头像 -->
           <div class="match-left">
@@ -267,7 +305,7 @@ const tagLabel = (player: PlayerProfile, key: string, label: string) => key === 
             <span>{{ shortDay(match.playedAt) }}</span>
             <em>{{ match.durationMinutes }}m</em>
           </time>
-        </div>
+        </button>
       </template>
       <span v-else class="bp-player-card__empty">暂无最近对局</span>
     </div>
@@ -310,12 +348,13 @@ const tagLabel = (player: PlayerProfile, key: string, label: string) => key === 
     <!-- 特色标签区 -->
     <footer class="bp-player-card__tags">
       <small>标签</small>
-      <span v-for="tag in player.tags.slice(0, 3)" :key="tag.key" :data-tone="tag.tone" :title="tag.evidence">
-        {{ tagLabel(player, tag.key, tag.label) }}
-      </span>
-      <span v-if="player.encounterCount > 0 && !player.tags.some((tag) => tag.key === 'met')" data-tone="info" :title="player.lastEncounteredAt ? `最近于 ${shortDate(player.lastEncounteredAt)} 遇到，点击查看具体对局` : '点击查看具体对局'">
-        {{ encounterLabel(player) }}
-      </span>
+      <NPopover v-if="!suppressEncounters && (games.length || player.encounterCount > 0)" :show="encounterOpen" trigger="manual" placement="top" :show-arrow="false" @clickoutside="dismissEncounters">
+        <template #trigger><button type="button" class="bp-player-card__encounter" data-testid="encounter-trigger" :aria-expanded="encounterOpen" @mouseenter="openEncounters" @mouseleave="closeEncounters" @focus="openEncounters" @blur="closeEncounters" @click.stop="encounterPinned = !encounterPinned; encounterOpen = encounterPinned" @keydown.escape.stop="dismissEncounters">{{ metLabel }}</button></template>
+        <div @mouseenter="openEncounters" @mouseleave="closeEncounters" @focusin="openEncounters" @focusout="closeEncounters" @keydown.escape.stop="dismissEncounters" @click.stop>
+          <EncounterList :games="games" :loading="encounterLoading" :error="encounterError" compact @retry="emit('retry-encounters')" @select="emit('select-encounter', player, $event); dismissEncounters()" />
+        </div>
+      </NPopover>
+      <span v-for="tag in visibleTags(player)" :key="tag.key" :data-tone="tag.tone" :title="tag.evidence">{{ tag.label }}</span>
       <span v-if="player.championPoolConcentration >= 0.7" data-tone="warning" title="近期该玩家过度集中使用单一英雄">
         英雄池集中
       </span>
@@ -327,16 +366,18 @@ const tagLabel = (player: PlayerProfile, key: string, label: string) => key === 
         {{ player.premadeWith.length ? `与 ${player.premadeWith.join('、')} 开黑` : "已知组队" }}
       </span>
       <span
-        v-if="!player.tags.length && player.encounterCount === 0 && player.championPoolConcentration < 0.7 && !player.isPremade && premadeTone === undefined"
+        v-if="!visibleTags(player).length && (suppressEncounters || player.encounterCount === 0) && player.championPoolConcentration < 0.7 && !player.isPremade && premadeTone === undefined"
         class="bp-player-card__empty"
       >
         暂无标签
       </span>
     </footer>
-  </button>
+  </article>
 </template>
 
 <style scoped>
+.bp-player-card__encounter { max-width: 100%; padding: 3px 6px; border: 1px solid transparent; border-radius: 3px; color: var(--blue); background: var(--blue-soft); font: inherit; font-size: 10px; cursor: pointer; text-align: left; }
+.bp-player-card__encounter:hover, .bp-player-card__encounter:focus-visible { border-color: var(--blue); outline: none; }
 /* 玩家卡片基础容器 */
 .bp-player-card {
   position: relative;
@@ -750,6 +791,11 @@ const tagLabel = (player: PlayerProfile, key: string, label: string) => key === 
   font-size: 10px;
   font-variant-numeric: tabular-nums;
   transition: background 0.12s, border-color 0.12s;
+  width: 100%;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
 }
 
 .recent-match-row:hover {

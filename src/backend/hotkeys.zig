@@ -46,6 +46,7 @@ var binding_count: usize = 0;
 var queue_mutex: std.atomic.Mutex = .unlocked;
 var event_queue: [max_events]QueuedId = undefined;
 var event_count: usize = 0;
+var sending_id: QueuedId = .{};
 var capture_active: std.atomic.Value(bool) = .init(false);
 var listener_started: std.atomic.Value(bool) = .init(false);
 
@@ -88,6 +89,25 @@ pub fn drainJson(output: []u8) ![]const u8 {
     event_count = 0;
     try writer.writeByte(']');
     return writer.buffered();
+}
+
+pub fn beginSend(id: []const u8) void {
+    lock(&queue_mutex);
+    defer queue_mutex.unlock();
+    sending_id.set(id);
+    var remaining: usize = 0;
+    for (event_queue[0..event_count]) |entry| {
+        if (std.mem.eql(u8, entry.slice(), id)) continue;
+        event_queue[remaining] = entry;
+        remaining += 1;
+    }
+    event_count = remaining;
+}
+
+pub fn endSend() void {
+    lock(&queue_mutex);
+    defer queue_mutex.unlock();
+    sending_id.len = 0;
 }
 
 fn lock(mutex: *std.atomic.Mutex) void {
@@ -186,6 +206,9 @@ fn appendPending(id: []const u8) void {
 fn enqueue(id: []const u8) void {
     lock(&queue_mutex);
     defer queue_mutex.unlock();
+    // 当前发送及尚未读取的同一快捷键只保留一次，避免发送结束后重放。
+    if (std.mem.eql(u8, sending_id.slice(), id)) return;
+    for (event_queue[0..event_count]) |*entry| if (std.mem.eql(u8, entry.slice(), id)) return;
     if (event_count == event_queue.len) {
         for (event_queue[1..], 0..) |entry, index| event_queue[index] = entry;
         event_count -= 1;
@@ -340,7 +363,21 @@ test "matches exact modifiers and command-or-control" {
     try std.testing.expect(bindingMatches(open_game, .{ .control = true, .shift = false, .alt = false, .win = false }));
 }
 
-test "queued shortcut IDs drain once as JSON" {
+test "发送中的重复快捷键不会积压重放" {
+    event_count = 0;
+    enqueue("我方");
+    beginSend("我方");
+    enqueue("我方");
+    enqueue("敌方");
+    enqueue("敌方");
+    endSend();
+    var buffer: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings("[\"敌方\"]", try drainJson(&buffer));
+    enqueue("我方");
+    try std.testing.expectEqualStrings("[\"我方\"]", try drainJson(&buffer));
+}
+
+test "快捷键事件只读取一次并返回规范数据" {
     event_count = 0;
     enqueue("enemy");
     enqueue("open-game");

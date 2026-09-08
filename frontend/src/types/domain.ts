@@ -1,6 +1,6 @@
 export type DataMode = "live" | "fixture" | "replay";
 export type ConnectionStatus = "connected" | "disconnected" | "connecting" | "error";
-export type DataSource = "lcu" | "opgg" | "sqlite-fresh" | "sqlite-stale" | "fixture" | "unavailable";
+export type DataSource = "lcu" | "sgp" | "opgg" | "sqlite-fresh" | "sqlite-stale" | "fixture" | "unavailable";
 export type AccountPresence = "offline" | "online" | "away" | "inQueue" | "customLobby" | "readyCheck" | "champSelect" | "inGame" | "spectating" | "endOfGame" | "unknown";
 
 export interface DataStatus {
@@ -40,6 +40,7 @@ export interface RankQueueSummary {
 
 export interface RecentMatch {
   gameId: number;
+  queueId?: number;
   championId: number;
   championName: string;
   queueName: string;
@@ -180,6 +181,7 @@ export interface PlayerTag {
 }
 
 export interface PlayerProfile {
+  rosterKey?: string;
   puuid: string;
   gameName: string;
   tagLine: string;
@@ -232,10 +234,11 @@ export interface TeamSummary {
   focusPlayerPuuid: string | null;
   strengths: string[];
   risks: string[];
-  composition: CompositionScore;
+  composition: CompositionScore | null;
 }
 
 export interface LiveLobby {
+  loading?: { active: boolean; completed: number; total: number; failed: number; elapsedMs: number; firstPlayerMs: number | null };
   id: string;
   queueId: number;
   gameMode: string;
@@ -414,10 +417,11 @@ export interface AppConfig {
     pickChampionIds: number[];
     banChampionIds: number[];
     shortcutSendIntervalMs: number;
+    protectChatInput?: boolean;
     shortcutRecentGameCount: number;
     shortcuts: ShortcutDefinition[];
   };
-  providers: { statsProvider: string; requestTimeoutSeconds: number; cacheTtlMinutes: number; hideUnfinishedMatches: boolean; clearLobbyAfterGame: boolean };
+  providers: { statsProvider: string; requestTimeoutSeconds: number; cacheTtlMinutes: number; hideUnfinishedMatches: boolean; rankedOnly: boolean; clearLobbyAfterGame: boolean };
   ai: {
     enabled: boolean;
     provider: string;

@@ -70,6 +70,8 @@ const AsyncBridgeJob = struct {
     origin: []u8,
     webview_label: []u8,
     window_id: u64,
+    queued_at_ms: i64 = 0,
+    action_ticket: ?backend.ActionTicket = null,
     result: ?[]u8 = null,
     failure_code: native_sdk.bridge.ErrorCode = .handler_failed,
     failure_message: ?[]const u8 = null,
@@ -97,10 +99,11 @@ const App = struct {
     accepting_async_jobs: std.atomic.Value(bool) = .init(false),
     active_async_jobs: std.atomic.Value(usize) = .init(0),
     pending_mutex: std.atomic.Mutex = .unlocked,
-    pending_head: ?*AsyncBridgeJob = null,
-    pending_tail: ?*AsyncBridgeJob = null,
-    worker_signal: std.Io.Semaphore = .{},
-    worker_thread: ?std.Thread = null,
+    pending_heads: [4]?*AsyncBridgeJob = .{null} ** 4,
+    pending_tails: [4]?*AsyncBridgeJob = .{null} ** 4,
+    pending_counts: [4]usize = .{0} ** 4,
+    worker_signals: [4]std.Io.Semaphore = .{std.Io.Semaphore{}} ** 4,
+    worker_threads: [4]?std.Thread = .{null} ** 4,
     automation_stop: std.atomic.Value(bool) = .init(false),
     automation_thread: ?std.Thread = null,
     completion_mutex: std.atomic.Mutex = .unlocked,
@@ -150,16 +153,16 @@ const App = struct {
         const bridge_context: *AsyncBridgeContext = @ptrCast(@alignCast(context));
         const self = bridge_context.app;
         const io = self.runtime.io orelse {
-            responder.fail(invocation.request.id, .internal_error, "Bridge worker is not initialized") catch {};
+            responder.fail(invocation.request.id, .internal_error, "后台请求通道尚未初始化") catch {};
             return;
         };
         if (!self.accepting_async_jobs.load(.acquire)) {
-            responder.fail(invocation.request.id, .internal_error, "Application is stopping") catch {};
+            responder.fail(invocation.request.id, .internal_error, "应用正在退出") catch {};
             return;
         }
         const allocator = std.heap.page_allocator;
         const job = allocator.create(AsyncBridgeJob) catch {
-            responder.fail(invocation.request.id, .internal_error, "Bridge worker allocation failed") catch {};
+            responder.fail(invocation.request.id, .internal_error, "无法分配后台请求任务") catch {};
             return;
         };
         job.* = .{
@@ -167,25 +170,27 @@ const App = struct {
             .responder = responder,
             .id = allocator.dupe(u8, invocation.request.id) catch {
                 allocator.destroy(job);
-                responder.fail(invocation.request.id, .internal_error, "Bridge request allocation failed") catch {};
+                responder.fail(invocation.request.id, .internal_error, "无法分配请求数据") catch {};
                 return;
             },
             .payload = undefined,
             .origin = undefined,
             .webview_label = undefined,
             .window_id = invocation.source.window_id,
+            .action_ticket = if (backend.commandLane(bridge_context.handler.name) == .action) backend.actionTicket(&self.runtime) else null,
+            .queued_at_ms = @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms)),
         };
         job.payload = allocator.dupe(u8, invocation.request.payload) catch {
             allocator.free(job.id);
             allocator.destroy(job);
-            responder.fail(invocation.request.id, .internal_error, "Bridge request allocation failed") catch {};
+            responder.fail(invocation.request.id, .internal_error, "无法分配请求数据") catch {};
             return;
         };
         job.origin = allocator.dupe(u8, invocation.source.origin) catch {
             allocator.free(job.payload);
             allocator.free(job.id);
             allocator.destroy(job);
-            responder.fail(invocation.request.id, .internal_error, "Bridge request allocation failed") catch {};
+            responder.fail(invocation.request.id, .internal_error, "无法分配请求数据") catch {};
             return;
         };
         job.webview_label = allocator.dupe(u8, invocation.source.webview_label) catch {
@@ -193,32 +198,40 @@ const App = struct {
             allocator.free(job.payload);
             allocator.free(job.id);
             allocator.destroy(job);
-            responder.fail(invocation.request.id, .internal_error, "Bridge request allocation failed") catch {};
+            responder.fail(invocation.request.id, .internal_error, "无法分配请求数据") catch {};
             return;
         };
         lockAtomic(&self.pending_mutex);
         if (!self.accepting_async_jobs.load(.acquire)) {
             self.pending_mutex.unlock();
             job.deinit();
-            responder.fail(invocation.request.id, .internal_error, "Application is stopping") catch {};
+            responder.fail(invocation.request.id, .internal_error, "应用正在退出") catch {};
+            return;
+        }
+        const lane = @intFromEnum(backend.commandLane(bridge_context.handler.name));
+        if (self.pending_counts[lane] >= 64) {
+            self.pending_mutex.unlock();
+            job.deinit();
+            responder.fail(invocation.request.id, .internal_error, "请求队列已满，请稍后重试") catch {};
             return;
         }
         _ = self.active_async_jobs.fetchAdd(1, .acq_rel);
-        if (self.pending_tail) |tail| {
+        self.pending_counts[lane] += 1;
+        if (self.pending_tails[lane]) |tail| {
             tail.next = job;
         } else {
-            self.pending_head = job;
+            self.pending_heads[lane] = job;
         }
-        self.pending_tail = job;
+        self.pending_tails[lane] = job;
         self.pending_mutex.unlock();
-        self.worker_signal.post(io);
+        self.worker_signals[lane].post(io);
     }
 
-    fn asyncBridgeWorker(self: *App) void {
+    fn asyncBridgeWorker(self: *App, lane: usize) void {
         const io = self.runtime.io orelse return;
         while (true) {
-            self.worker_signal.waitUncancelable(io);
-            if (self.dequeuePending()) |job| {
+            self.worker_signals[lane].waitUncancelable(io);
+            if (self.dequeuePending(lane)) |job| {
                 processAsyncBridgeJob(job);
                 continue;
             }
@@ -226,12 +239,13 @@ const App = struct {
         }
     }
 
-    fn dequeuePending(self: *App) ?*AsyncBridgeJob {
+    fn dequeuePending(self: *App, lane: usize) ?*AsyncBridgeJob {
         lockAtomic(&self.pending_mutex);
         defer self.pending_mutex.unlock();
-        const job = self.pending_head orelse return null;
-        self.pending_head = job.next;
-        if (self.pending_head == null) self.pending_tail = null;
+        const job = self.pending_heads[lane] orelse return null;
+        self.pending_heads[lane] = job.next;
+        self.pending_counts[lane] -= 1;
+        if (self.pending_heads[lane] == null) self.pending_tails[lane] = null;
         job.next = null;
         return job;
     }
@@ -239,31 +253,29 @@ const App = struct {
     fn processAsyncBridgeJob(job: *AsyncBridgeJob) void {
         const self = job.context.app;
         defer _ = self.active_async_jobs.fetchSub(1, .acq_rel);
+        if (!self.accepting_async_jobs.load(.acquire)) {
+            job.failure_message = "应用正在退出，已取消排队请求";
+            enqueueCompleted(job);
+            return;
+        }
         const result_buffer = std.heap.page_allocator.alloc(u8, native_sdk.bridge.max_result_bytes) catch {
             job.failure_code = .internal_error;
-            job.failure_message = "Bridge result allocation failed";
+            job.failure_message = "无法分配结果缓冲区";
             enqueueCompleted(job);
             return;
         };
         defer std.heap.page_allocator.free(result_buffer);
 
-        // Most handlers touch Runtime-owned buffers and remain serialized.
-        // Automation is the exception: it snapshots its config itself and
-        // then performs potentially slow LCU I/O under automation_mutex. Do
-        // not keep the global command lock across that network request or a
-        // delayed ready-check can make unrelated UI commands wait seconds.
-        const is_automation = std.mem.eql(u8, job.context.handler.name, "lol.run_automation");
-        if (!is_automation) {
-            while (!self.runtime.command_mutex.tryLock()) {
-                if (self.runtime.io) |io| {
-                    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
-                } else {
-                    std.atomic.spinLoopHint();
-                }
+        // 发送等待过久就取消，避免在对局阶段改变后重放旧操作。
+        if (std.mem.eql(u8, job.context.handler.name, "lol.send_shortcut")) if (self.runtime.io) |io| {
+            const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms));
+            if (now_ms - job.queued_at_ms > 10_000) {
+                job.failure_message = "消息等待过久，已取消发送";
+                enqueueCompleted(job);
+                return;
             }
-        }
-        defer if (!is_automation) self.runtime.command_mutex.unlock();
-        const result = job.context.handler.invoke_fn(job.context.handler.context, .{
+        };
+        const result = backend.invokeQueued(&self.runtime, job.context.handler, .{
             .request = .{
                 .id = job.id,
                 .command = job.context.handler.name,
@@ -274,14 +286,14 @@ const App = struct {
                 .window_id = job.window_id,
                 .webview_label = job.webview_label,
             },
-        }, result_buffer) catch |err| {
-            job.failure_message = @errorName(err);
+        }, result_buffer, job.action_ticket) catch |err| {
+            job.failure_message = backend.errorMessage(err);
             enqueueCompleted(job);
             return;
         };
         job.result = std.heap.page_allocator.dupe(u8, if (result.len == 0) "null" else result) catch {
             job.failure_code = .internal_error;
-            job.failure_message = "Bridge response allocation failed";
+            job.failure_message = "无法分配返回数据";
             enqueueCompleted(job);
             return;
         };
@@ -299,8 +311,7 @@ const App = struct {
         self.completion_tail = job;
         self.completion_mutex.unlock();
 
-        // Async bridge handlers may do blocking LCU/SQLite work off-thread,
-        // but WebView2 completion itself belongs to the window thread.
+        // 网络和数据库工作在后台完成，桥接响应仍交回窗口线程。
         if (self.runtime.native_runtime) |runtime| runtime.options.platform.services.wake() catch {};
     }
 
@@ -316,7 +327,7 @@ const App = struct {
             if (job.result) |result| {
                 job.responder.success(job.id, result) catch {};
             } else {
-                job.responder.fail(job.id, job.failure_code, job.failure_message orelse "Bridge handler failed") catch {};
+                job.responder.fail(job.id, job.failure_code, job.failure_message orelse "请求处理失败") catch {};
             }
             job.deinit();
             current = next;
@@ -324,14 +335,17 @@ const App = struct {
     }
 
     fn stopAsyncBridge(self: *App) void {
+        self.runtime.cancelRequests();
         lockAtomic(&self.pending_mutex);
         self.accepting_async_jobs.store(false, .release);
         self.pending_mutex.unlock();
-        if (self.worker_thread) |thread| {
-            if (self.runtime.io) |io| self.worker_signal.post(io);
-            thread.join();
-            self.worker_thread = null;
-        }
+        for (self.worker_threads, 0..) |thread, lane| if (thread != null) {
+            if (self.runtime.io) |io| self.worker_signals[lane].post(io);
+        };
+        for (&self.worker_threads) |*thread| if (thread.*) |value| {
+            value.join();
+            thread.* = null;
+        };
         self.drainCompleted();
     }
 
@@ -354,13 +368,11 @@ const App = struct {
     }
 
     fn startAsyncBridge(self: *App) !void {
-        if (self.worker_thread != null) return;
+        if (self.worker_threads[0] != null) return;
         if (self.runtime.io == null) return error.BridgeWorkerIoUnavailable;
         self.accepting_async_jobs.store(true, .release);
-        self.worker_thread = std.Thread.spawn(.{}, asyncBridgeWorker, .{self}) catch |err| {
-            self.accepting_async_jobs.store(false, .release);
-            return err;
-        };
+        errdefer self.stopAsyncBridge();
+        for (&self.worker_threads, 0..) |*thread, lane| thread.* = try std.Thread.spawn(.{}, asyncBridgeWorker, .{ self, lane });
     }
 
     fn source(context: *anyopaque) anyerror!native_sdk.WebViewSource {
@@ -560,6 +572,7 @@ fn startApp(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
 fn stopApp(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
     _ = runtime;
     const self: *App = @ptrCast(@alignCast(context));
+    self.runtime.cancelRequests();
     self.stopAutomationWatchdog();
     self.stopAsyncBridge();
 }
@@ -799,12 +812,13 @@ test "frontend bridge commands are registered and origin restricted" {
     try std.testing.expect(std.mem.indexOf(u8, bootstrap, "Native 预览") == null);
 }
 
-test "native config and data mode handlers round trip" {
+test "配置读写与数据模式切换并拒绝未实现的回看" {
     var app = App{ .env_map = undefined, .dist_path = "frontend/dist", .runtime = backend.Runtime.init() };
     var output: [native_sdk.bridge.max_result_bytes]u8 = undefined;
 
-    const mode = try invokeBackendForTest(&app, "lol.set_data_mode", "{\"mode\":\"replay\"}", &output);
-    try std.testing.expect(std.mem.indexOf(u8, mode, "\"replay\"") != null);
+    try std.testing.expectError(error.ReplayUnavailable, invokeBackendForTest(&app, "lol.set_data_mode", "{\"mode\":\"replay\"}", &output));
+    const mode = try invokeBackendForTest(&app, "lol.set_data_mode", "{\"mode\":\"fixture\"}", &output);
+    try std.testing.expect(std.mem.indexOf(u8, mode, "\"fixture\"") != null);
 
     const saved = try invokeBackendForTest(&app, "lol.save_config", "{\"value\":{\"version\":99,\"automation\":{\"enabled\":true}}}", &output);
     try std.testing.expect(std.mem.indexOf(u8, saved, "\"version\":99") != null);

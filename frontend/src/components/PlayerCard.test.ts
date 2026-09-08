@@ -1,6 +1,6 @@
 import { mount } from "@vue/test-utils";
 import { describe, expect, it, vi } from "vitest";
-import { fixtureLobby } from "../fixtures/data";
+import { fixtureEncounters, fixtureLobby } from "../fixtures/data";
 import PlayerCard from "./PlayerCard.vue";
 
 vi.mock("../services/backend", () => ({
@@ -21,7 +21,7 @@ describe("PlayerCard", () => {
       props: { player, showRecent: true, recentLimit: 10, recentColumns: 2 },
     });
 
-    expect(wrapper.findAll(".bp-player-card__recent > div")).toHaveLength(10);
+    expect(wrapper.findAll("[data-testid='player-recent-match']")).toHaveLength(10);
     expect(wrapper.find(".bp-player-card__section-label").text()).toContain("最近对局 10场");
     expect(wrapper.findAll(".bp-player-card__recent-mode")).toHaveLength(10);
     expect(wrapper.find(".bp-player-card__recent-mode").text()).toBe(player.recentMatches[0].queueName);
@@ -88,5 +88,39 @@ describe("PlayerCard", () => {
     const label = wrapper.find(".bp-player-card__tags").text();
     expect(label).toContain(`遇到过 ${player.encounterCount} 次`);
     expect(label).toContain("最近");
+  });
+
+  it("opens a specific recent match without firing the generic card selection", async () => {
+    const player = fixtureLobby.ally[0];
+    const wrapper = mount(PlayerCard, { props: { player, showRecent: true } });
+
+    await wrapper.get("[data-testid='player-recent-match']").trigger("click");
+
+    expect(wrapper.emitted("select-match")).toEqual([[player, player.recentMatches[0].gameId]]);
+    expect(wrapper.emitted("select")).toBeUndefined();
+  });
+
+  it("hides encounter tags for a member of the local party", () => {
+    const player = fixtureLobby.ally[2];
+    const wrapper = mount(PlayerCard, { props: { player, suppressEncounters: true } });
+
+    expect(wrapper.find(".bp-player-card__tags").text()).not.toContain("遇到过");
+  });
+
+  it("聚焦展开相遇记录且标签点击不触发玩家抽屉", async () => {
+    const player = fixtureLobby.ally[2];
+    const wrapper = mount(PlayerCard, {
+      props: { player, encounterRecords: fixtureEncounters },
+      global: { stubs: { Popover: { props: ["show"], template: '<div><slot name="trigger" /><div v-if="show"><slot /></div></div>' }, AssetIcon: true } },
+    });
+    const trigger = wrapper.get('[data-testid="encounter-trigger"]');
+    await trigger.trigger("focus");
+    expect(wrapper.findAll('[data-testid="encounter-match-open"]')).toHaveLength(3);
+    await trigger.trigger("click");
+    expect(wrapper.emitted("select")).toBeUndefined();
+    await wrapper.get('[data-testid="encounter-match-open"]').trigger("click");
+    expect(wrapper.emitted("select-encounter")?.[0][0]).toEqual(player);
+    expect(wrapper.emitted("select")).toBeUndefined();
+    wrapper.unmount();
   });
 });

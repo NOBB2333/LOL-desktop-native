@@ -13,11 +13,138 @@ const shortcut_service = @import("backend/shortcuts.zig");
 const hotkey_service = @import("backend/hotkeys.zig");
 const jungle_analysis = @import("backend/jungle_analysis.zig");
 const recent_tags = @import("backend/recent_tags.zig");
+const live_loading = @import("backend/live_loading.zig");
 
 const fallback_data_dir = std.fmt.comptimePrint(".{s}", .{build_options.data_dir_name});
+
+test {
+    std.testing.refAllDecls(storage);
+}
+
+test "慢查询期间状态可读取且切换模式后旧结果被拒绝" {
+    const Slow = struct {
+        var started: std.atomic.Value(bool) = .init(false);
+        var release: std.atomic.Value(bool) = .init(false);
+        var failure: ?anyerror = null;
+
+        fn invoke(_: *anyopaque, _: native_sdk.bridge.Invocation, output: []u8) ![]const u8 {
+            started.store(true, .release);
+            const begin = std.Io.Timestamp.now(std.testing.io, .awake);
+            while (!release.load(.acquire) and begin.durationTo(.now(std.testing.io, .awake)).toMilliseconds() < 1500) {
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            }
+            return copyJson("[]", output);
+        }
+
+        fn run(state: *Runtime) void {
+            var output: [128]u8 = undefined;
+            _ = invokeConcurrent(state, .{ .name = "lol.get_match_history", .context = state, .invoke_fn = invoke }, .{
+                .request = .{ .id = "慢查询", .command = "lol.get_match_history", .payload = "{}" },
+                .source = .{ .origin = "zero://app" },
+            }, &output) catch |err| {
+                failure = err;
+            };
+        }
+    };
+    const state = try std.testing.allocator.create(Runtime);
+    defer std.testing.allocator.destroy(state);
+    state.* = Runtime.init();
+    Slow.started.store(false, .release);
+    Slow.release.store(false, .release);
+    Slow.failure = null;
+    const thread = try std.Thread.spawn(.{}, Slow.run, .{state});
+    while (!Slow.started.load(.acquire)) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    var output: [65536]u8 = undefined;
+    const begin = std.Io.Timestamp.now(std.testing.io, .awake);
+    for (state.handlers()) |handler| if (std.mem.eql(u8, handler.name, "lol.set_data_mode")) {
+        _ = try invokeConcurrent(state, handler, .{
+            .request = .{ .id = "切换模式", .command = handler.name, .payload = "{\"mode\":\"fixture\"}" },
+            .source = .{ .origin = "zero://app" },
+        }, &output);
+    };
+    const elapsed = begin.durationTo(.now(std.testing.io, .awake)).toMilliseconds();
+    Slow.release.store(true, .release);
+    thread.join();
+    try std.testing.expect(elapsed < 200);
+    try std.testing.expectEqual(error.AccountChanged, Slow.failure.?);
+}
+
+test "换局取消玩家请求和排队动作而普通查询保留" {
+    const state = try std.testing.allocator.create(Runtime);
+    defer std.testing.allocator.destroy(state);
+    state.* = Runtime.init();
+    const snapshot = try querySnapshot(state);
+    defer std.heap.page_allocator.destroy(snapshot);
+    const ticket = actionTicket(state);
+    snapshot.snapshot_live_generation = state.live_generation;
+    try snapshotControl(snapshot).check();
+    state.live_generation += 1;
+    try std.testing.expectError(error.RequestCancelled, snapshotControl(snapshot).check());
+    try std.testing.expectError(error.RequestCancelled, validateActionTicket(state, ticket));
+    var output: [128]u8 = undefined;
+    for (state.handlers()) |handler| if (std.mem.eql(u8, handler.name, "lol.send_shortcut")) {
+        try std.testing.expectError(error.RequestCancelled, invokeQueued(state, handler, .{
+            .request = .{ .id = "旧消息", .command = handler.name, .payload = "{}" },
+            .source = .{ .origin = "zero://app" },
+        }, &output, ticket));
+    };
+    snapshot.snapshot_live_generation = null;
+    try snapshotControl(snapshot).check();
+    state.request_generation += 1;
+    try std.testing.expectError(error.RequestCancelled, snapshotControl(snapshot).check());
+}
+
+test "展示评分等于分项之和且缺失阵容指标为空" {
+    var output: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    try writeRecentScore(&writer, "[{\"win\":true,\"kills\":8,\"deaths\":3,\"assists\":5},{\"win\":false,\"kills\":1,\"deaths\":8,\"assists\":2},{\"win\":false,\"kills\":2,\"deaths\":7,\"assists\":1}]");
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
+    defer parsed.deinit();
+    var sum: f64 = 0;
+    for (parsed.value.object.get("components").?.array.items) |component| sum += jsonFloat(component, "score");
+    try std.testing.expectApproxEqAbs(jsonFloat(parsed.value, "total"), sum, 0.01);
+    try std.testing.expect(std.mem.indexOf(u8, empty_summary, "\"composition\":null") != null);
+}
+
+pub fn errorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.LcuNotRunning => "尚未连接英雄联盟客户端",
+        error.LcuRequestFailed, error.RequestFailed => "数据请求失败，请稍后重试",
+        error.LcuInvalidResponse => "客户端返回的数据无法读取",
+        error.AccountChanged => "账号已切换，请刷新后重试",
+        error.LobbyLoading => "正在读取当前阵容",
+        error.ReplayUnavailable => "回看功能尚未开放",
+        error.CacheScopeUnavailable => "账号或大区尚未确认，请稍后重试",
+        error.RequestCancelled => "会话已变化，已取消过期请求",
+        error.RequestTimedOut => "请求超时，请稍后重试",
+        error.HttpUnauthorized => "客户端认证已失效，请重新连接",
+        error.HttpForbidden => "当前账号无权访问该数据",
+        error.HttpNotFound => "请求的数据暂不存在",
+        error.HttpRateLimited => "数据源请求过于频繁，请稍后重试",
+        error.HttpServerError => "数据源暂时不可用，请稍后重试",
+        error.HttpStatus => "数据源返回了未预期的状态",
+        error.PlatformMismatch => "对局所属大区与当前客户端不一致",
+        error.MatchDetailUnavailable => "该对局的完整详情暂不可用",
+        error.InvalidRequest => "请求参数无效",
+        error.InvalidShortcut => "快捷消息配置无效",
+        error.ShortcutUnavailable => "当前阶段或资料不足，暂时无法发送",
+        error.ChatUnavailable => "当前聊天会话不可用",
+        error.AdministratorRequired => "游戏内发送需要以管理员身份运行辅助程序",
+        error.GameWindowNotForeground => "游戏窗口不在前台，已停止发送",
+        error.ModifierKeyHeld => "修饰键尚未松开，已取消发送",
+        error.InputProtectionFailed => "无法启用发送防误触，请检查管理员权限或关闭该设置",
+        error.InputSimulationFailed => "游戏未完整接收输入，已停止发送",
+        error.ChatSendPartiallyCompleted => "已有部分消息发送，输入中断后已停止后续消息",
+        error.SendInProgress => "上一批消息仍在发送，请稍后再试",
+        error.NoMessages => "没有可发送的消息",
+        error.InvalidMessage => "消息过长或包含无效字符",
+        error.ResponseTooLarge, error.WriteFailed => "返回数据超出容量，请减少查询数量",
+        error.UnsupportedPlatform => "当前系统不支持此操作",
+        else => "操作未完成，请稍后重试",
+    };
+}
 const path_capacity = 2048;
 const live_lobby_capacity = 512 * 1024;
-const encounter_retention_ms: i64 = 365 * std.time.ms_per_day;
 
 pub const command_names = [_][]const u8{
     "lol.get_bootstrap",
@@ -29,6 +156,7 @@ pub const command_names = [_][]const u8{
     "lol.get_live_lobby",
     "lol.get_live_roster",
     "lol.get_match_history",
+    "lol.get_match_detail",
     "lol.get_champions",
     "lol.get_asset",
     "lol.get_encounters",
@@ -48,10 +176,10 @@ pub const command_names = [_][]const u8{
 };
 
 const default_config =
-    "{\"version\":17,\"appearance\":{\"theme\":\"system\",\"colorMode\":\"dark\",\"compact\":false}," ++
+    "{\"version\":18,\"appearance\":{\"theme\":\"system\",\"colorMode\":\"dark\",\"compact\":false}," ++
     "\"connection\":{\"kind\":\"local\",\"sshTarget\":\"\",\"identityFile\":\"\",\"forwardedPort\":0}," ++
     "\"automation\":{\"enabled\":false,\"advisoryMode\":true,\"autoAccept\":false,\"autoAcceptDelaySeconds\":0,\"autoPick\":false,\"autoPickDelaySeconds\":1,\"autoPickStrategy\":\"show-and-lock-in\",\"autoBan\":false,\"pickChampionIds\":[],\"banChampionIds\":[],\"shortcutSendIntervalMs\":250,\"shortcutRecentGameCount\":5,\"shortcuts\":[{\"id\":\"encounter\",\"label\":\"发送遇到记录\",\"key\":\"Ctrl+F8\",\"target\":\"encounter\",\"template\":\"{encounter}\",\"enabled\":true},{\"id\":\"premade\",\"label\":\"发送已知组队\",\"key\":\"Ctrl+F9\",\"target\":\"premade\",\"template\":\"{position} {name}：组队 {premade}\",\"enabled\":true},{\"id\":\"jungle-preference\",\"label\":\"发送打野偏好\",\"key\":\"Ctrl+F10\",\"target\":\"jungle\",\"template\":\"{name}：{jungle_preference}\",\"enabled\":true},{\"id\":\"enemy\",\"label\":\"发送敌方评估\",\"key\":\"Ctrl+F11\",\"target\":\"enemy\",\"template\":\"{team}{position} {current_champion}：{rank} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"ally\",\"label\":\"发送我方评估\",\"key\":\"Ctrl+F12\",\"target\":\"ally\",\"template\":\"{team}{position} {current_champion}：{rank} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"open-game\",\"label\":\"打开对局速看\",\"key\":\"Ctrl+F1\",\"target\":\"lobby\",\"template\":\"对局速看：{team} {name}\",\"enabled\":true}]}," ++
-    "\"providers\":{\"statsProvider\":\"auto\",\"requestTimeoutSeconds\":6,\"cacheTtlMinutes\":120,\"hideUnfinishedMatches\":false,\"clearLobbyAfterGame\":true}," ++
+    "\"providers\":{\"statsProvider\":\"auto\",\"requestTimeoutSeconds\":6,\"cacheTtlMinutes\":120,\"hideUnfinishedMatches\":false,\"rankedOnly\":false,\"clearLobbyAfterGame\":true}," ++
     "\"ai\":{\"enabled\":false,\"provider\":\"deepseek\",\"protocol\":\"openai\",\"baseUrl\":\"https://api.deepseek.com\",\"model\":\"deepseek-v4-flash\",\"apiKey\":\"\",\"automaticPregameAnalysis\":false}}";
 
 const fixture_connection =
@@ -60,19 +188,26 @@ const fixture_connection =
 const disconnected_connection =
     "{\"status\":\"disconnected\",\"phase\":null,\"summonerName\":null,\"gameName\":null,\"tagLine\":null,\"summonerLevel\":null,\"profileIconId\":null,\"platformId\":null,\"region\":null,\"presence\":\"offline\",\"soloRank\":null,\"flexRank\":null,\"queueLabel\":null,\"message\":\"未检测到 League Client\",\"checkedAt\":\"1970-01-01T00:00:00.000Z\"}";
 
-const empty_summary = "{\"side\":\"ally\",\"score\":0,\"title\":\"暂无实时数据\",\"focusPlayerPuuid\":null,\"strengths\":[],\"risks\":[],\"composition\":{\"early\":0,\"mid\":0,\"late\":0,\"teamfight\":0}}";
-const empty_enemy_summary = "{\"side\":\"enemy\",\"score\":0,\"title\":\"暂无实时数据\",\"focusPlayerPuuid\":null,\"strengths\":[],\"risks\":[],\"composition\":{\"early\":0,\"mid\":0,\"late\":0,\"teamfight\":0}}";
+const empty_summary = "{\"side\":\"ally\",\"score\":0,\"title\":\"暂无实时数据\",\"focusPlayerPuuid\":null,\"strengths\":[],\"risks\":[],\"composition\":null}";
+const empty_enemy_summary = "{\"side\":\"enemy\",\"score\":0,\"title\":\"暂无实时数据\",\"focusPlayerPuuid\":null,\"strengths\":[],\"risks\":[],\"composition\":null}";
 const empty_lobby =
     "{\"id\":\"native-fixture\",\"queueId\":0,\"gameMode\":\"Native SDK Fixture\",\"phase\":\"Fixture\",\"ally\":[],\"enemy\":[]," ++
     "\"allySummary\":" ++ empty_summary ++ ",\"enemySummary\":" ++ empty_summary ++ ",\"layoutKind\":\"generic\",\"teams\":[],\"recentMatch\":null,\"generatedAt\":\"1970-01-01T00:00:00.000Z\",\"isFixture\":true}";
 
 pub const Runtime = struct {
-    // Native bridge work runs off the window thread. Runtime owns mutable
-    // buffers and a single SQLite connection, so commands still execute in a
-    // deterministic order without blocking the Win32/WebView message loop.
+    // 各通道独立处理网络请求，仅复制或提交共享状态时持锁。
     command_mutex: std.atomic.Mutex = .unlocked,
-    // Manual bridge calls and the host-side automation watchdog share this
-    // single-flight lock so a ready-check is never submitted twice at once.
+    request_generation: u64 = 0,
+    stopping: bool = false,
+    is_snapshot: bool = false,
+    snapshot_parent: ?*Runtime = null,
+    snapshot_live_generation: ?u64 = null,
+    snapshot_cancelled: ?*std.atomic.Value(bool) = null,
+    snapshot_lane: CommandLane = .query,
+    automation_config_hash: u64 = 0,
+    cache_platform: [32]u8 = undefined,
+    cache_platform_len: usize = 0,
+    // 手动自动化与后台检查共用互斥锁，避免重复接受同一次匹配。
     automation_mutex: std.atomic.Mutex = .unlocked,
     mode: Mode = .live,
     config: [65536]u8 = undefined,
@@ -105,6 +240,12 @@ pub const Runtime = struct {
     champ_select_handoff_active: bool = false,
     live_roster_hash: u64 = 0,
     live_lobby_enriched: bool = false,
+    live_load: ?*LiveLoadBatch = null,
+    live_generation: u64 = 0,
+    live_session_key: u64 = 0,
+    live_roster_checked_ms: i64 = 0,
+    live_next_load_ms: i64 = 0,
+    force_profile_refresh: bool = false,
     live_owner_puuid: [128]u8 = undefined,
     live_owner_puuid_len: usize = 0,
     event_state: lcu_events.State = .{},
@@ -145,6 +286,7 @@ pub const Runtime = struct {
         if (storage.Store.open(std.heap.page_allocator, io, state.databasePath())) |store| {
             state.storage = store;
             if (state.storage) |*store_ptr| {
+                store_ptr.require_scope = true;
                 // Restore the last complete roster before the first LCU request.
                 // The owner marker is checked again when current-summoner arrives,
                 // so an account switch cannot display another account's lobby.
@@ -185,8 +327,10 @@ pub const Runtime = struct {
         };
         if (state.storage) |*store| if (store.get("settings", "dataMode") catch null) |saved| {
             defer std.heap.page_allocator.free(saved);
-            if (std.json.parseFromSliceLeaky([]const u8, std.heap.page_allocator, saved, .{}) catch null) |saved_mode| {
-                state.mode = std.meta.stringToEnum(Mode, saved_mode) orelse state.mode;
+            if (std.json.parseFromSlice([]const u8, std.heap.page_allocator, saved, .{}) catch null) |saved_mode| {
+                defer saved_mode.deinit();
+                state.mode = std.meta.stringToEnum(Mode, saved_mode.value) orelse state.mode;
+                if (state.mode == .replay) state.mode = .live;
             }
         };
         if (!config_loaded) {
@@ -205,10 +349,26 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
+        self.cancelRequests();
+        if (self.live_load) |batch| {
+            batch.queue.cancelled.store(true, .release);
+            if (batch.thread) |thread| thread.join();
+            std.heap.page_allocator.destroy(batch.snapshot);
+            std.heap.page_allocator.destroy(batch);
+            self.live_load = null;
+        }
         if (self.automation_client) |*client| client.deinit();
         self.automation_client = null;
         if (self.storage) |*store| store.deinit();
         self.storage = null;
+    }
+
+    pub fn cancelRequests(self: *Runtime) void {
+        lockBackendMutex(&self.command_mutex);
+        defer self.command_mutex.unlock();
+        self.stopping = true;
+        self.request_generation +%= 1;
+        if (self.live_load) |batch| batch.queue.cancelled.store(true, .release);
     }
 
     pub fn attachNativeRuntime(self: *Runtime, native_runtime: *native_sdk.Runtime) void {
@@ -216,9 +376,7 @@ pub const Runtime = struct {
         configureShortcuts(self) catch {};
     }
 
-    /// Run the automation state machine from a host watchdog rather than a
-    /// WebView timer. The config is copied while holding the command lock, so
-    /// the LCU request itself never blocks bridge/UI commands or races a save.
+    /// 后台自动化先复制配置再访问网络，状态读取和设置保存可以独立完成。
     pub fn runAutomationBackground(self: *Runtime, io: std.Io) void {
         var config_snapshot: [65536]u8 = undefined;
         var config_len: usize = 0;
@@ -229,6 +387,7 @@ pub const Runtime = struct {
         }
         config_len = self.config_len;
         @memcpy(config_snapshot[0..config_len], self.config[0..config_len]);
+        var guard = AutomationGuard{ .parent = self, .generation = self.request_generation, .config_hash = std.hash.Wyhash.hash(0, config_snapshot[0..config_len]) };
         self.command_mutex.unlock();
 
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -238,12 +397,15 @@ pub const Runtime = struct {
         if (automation != .object or !jsonBool(automation, "enabled") or jsonBool(automation, "advisoryMode")) return;
         if (!jsonBool(automation, "autoAccept") and !jsonBool(automation, "autoPick") and !jsonBool(automation, "autoBan")) return;
 
-        // A manual `run_automation` call may already be waiting on the LCU.
-        // The watchdog is periodic, so skip this tick instead of spinning and
-        // consuming a core while the request completes.
+        // 手动自动化正在运行时跳过本轮，避免轮询线程持续自旋。
         if (!self.automation_mutex.tryLock()) return;
         defer self.automation_mutex.unlock();
         const client = self.ensureAutomationClient(io, config_snapshot[0..config_len]) catch return;
+        client.control = .{ .context = &guard, .check_fn = AutomationGuard.check };
+        client.lane = .action;
+        defer if (self.automation_client) |*retained| {
+            retained.control = .{};
+        };
         var output: [4096]u8 = undefined;
         _ = automation_service.run(io, client.*, config_snapshot[0..config_len], &output) catch |err| {
             if (isAutomationClientFailure(err)) self.dropAutomationClient();
@@ -251,6 +413,11 @@ pub const Runtime = struct {
     }
 
     fn ensureAutomationClient(self: *Runtime, io: std.Io, config_json: []const u8) !*lcu.Client {
+        const hash = std.hash.Wyhash.hash(0, config_json);
+        if (hash != self.automation_config_hash) {
+            self.dropAutomationClient();
+            self.automation_config_hash = hash;
+        }
         if (self.automation_client == null) {
             self.automation_client = try discoverClientWithConfig(self, io, config_json);
         }
@@ -312,6 +479,7 @@ pub const Runtime = struct {
             .{ .name = "lol.get_live_lobby", .context = self, .invoke_fn = getLiveLobby },
             .{ .name = "lol.get_live_roster", .context = self, .invoke_fn = getLiveRoster },
             .{ .name = "lol.get_match_history", .context = self, .invoke_fn = getMatches },
+            .{ .name = "lol.get_match_detail", .context = self, .invoke_fn = getMatchDetail },
             .{ .name = "lol.get_champions", .context = self, .invoke_fn = getChampions },
             .{ .name = "lol.get_asset", .context = self, .invoke_fn = getAsset },
             .{ .name = "lol.get_encounters", .context = self, .invoke_fn = getEncounters },
@@ -334,6 +502,184 @@ pub const Runtime = struct {
 
 fn runtime(context: *anyopaque) *Runtime {
     return @ptrCast(@alignCast(context));
+}
+
+pub const CommandLane = lcu.RequestLane;
+
+pub const ActionTicket = struct { request: u64, session: u64 };
+
+pub fn actionTicket(self: *Runtime) ActionTicket {
+    lockBackendMutex(&self.command_mutex);
+    defer self.command_mutex.unlock();
+    return .{ .request = self.request_generation, .session = self.live_generation };
+}
+
+pub fn validateActionTicket(self: *Runtime, ticket: ActionTicket) !void {
+    const current = actionTicket(self);
+    if (ticket.request != current.request or ticket.session != current.session) return error.RequestCancelled;
+}
+
+pub fn commandLane(name: []const u8) CommandLane {
+    for ([_][]const u8{ "lol.get_live_roster", "lol.refresh_connection", "lol.get_lcu_events" }) |item| {
+        if (std.mem.eql(u8, name, item)) return .roster;
+    }
+    for ([_][]const u8{ "lol.send_shortcut", "lol.delete_friend", "lol.run_automation" }) |item| {
+        if (std.mem.eql(u8, name, item)) return .action;
+    }
+    for ([_][]const u8{ "lol.get_config", "lol.save_config", "lol.set_shortcut_capture", "lol.set_data_mode", "lol.get_live_lobby", "lol.get_shortcut_events", "lol.open_game_view", "lol.validate_shortcut_template" }) |item| {
+        if (std.mem.eql(u8, name, item)) return .state;
+    }
+    return .query;
+}
+
+fn querySnapshot(self: *Runtime) !*Runtime {
+    const snapshot = try std.heap.page_allocator.create(Runtime);
+    snapshot.* = Runtime.init();
+    // 数据缓冲区独占，数据库连接由父运行时保管，所有工作线程退出后才能关闭。
+    inline for (.{ "mode", "config", "config_len", "io", "env_map", "storage", "connection", "connection_len", "live_lobby", "live_lobby_len", "champ_select_lobby", "champ_select_lobby_len", "champ_select_game_id", "last_live_phase", "last_live_phase_len", "champ_select_handoff_active", "live_roster_hash", "live_lobby_enriched", "live_owner_puuid", "live_owner_puuid_len", "event_state", "request_generation", "data_dir_path", "data_dir_path_len", "config_path_buffer", "config_path_len", "database_path_buffer", "database_path_len", "bp_history_path_buffer", "bp_history_path_len", "force_profile_refresh" }) |field| {
+        @field(snapshot, field) = @field(self, field);
+    }
+    snapshot.is_snapshot = true;
+    snapshot.snapshot_parent = self;
+    snapshot.cache_platform = self.cache_platform;
+    snapshot.cache_platform_len = self.cache_platform_len;
+    return snapshot;
+}
+
+fn checkSnapshotRequest(context: *anyopaque) !void {
+    const snapshot = runtime(context);
+    const parent = snapshot.snapshot_parent orelse return;
+    lockBackendMutex(&parent.command_mutex);
+    defer parent.command_mutex.unlock();
+    if (parent.stopping or snapshot.request_generation != parent.request_generation or snapshot.mode != parent.mode) return error.RequestCancelled;
+    if (snapshot.snapshot_live_generation) |generation| if (generation != parent.live_generation) return error.RequestCancelled;
+    if (snapshot.snapshot_cancelled) |cancelled| if (cancelled.load(.acquire)) return error.RequestCancelled;
+}
+
+fn snapshotControl(self: *const Runtime) lcu.RequestControl {
+    return if (self.is_snapshot) .{ .context = @constCast(self), .check_fn = checkSnapshotRequest } else .{};
+}
+
+const AutomationGuard = struct {
+    parent: *Runtime,
+    generation: u64,
+    config_hash: u64,
+
+    fn check(context: *anyopaque) !void {
+        const self: *AutomationGuard = @ptrCast(@alignCast(context));
+        lockBackendMutex(&self.parent.command_mutex);
+        defer self.parent.command_mutex.unlock();
+        if (self.parent.stopping or self.parent.mode != .live or self.parent.request_generation != self.generation or
+            std.hash.Wyhash.hash(0, self.parent.config[0..self.parent.config_len]) != self.config_hash) return error.RequestCancelled;
+    }
+};
+
+fn verifyActionAccount(self: *Runtime, client: lcu.Client) !void {
+    try snapshotControl(self).check();
+    if (self.live_owner_puuid_len == 0 or self.cache_platform_len == 0) return error.CacheScopeUnavailable;
+    const current_json = try client.get("/lol-summoner/v1/current-summoner");
+    defer std.heap.page_allocator.free(current_json);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const current = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), current_json, .{});
+    if (!samePuuid(identityPuuid(current), self.live_owner_puuid[0..self.live_owner_puuid_len])) return error.AccountChanged;
+    const expected = self.cache_platform;
+    const expected_len = self.cache_platform_len;
+    try verifyCachePlatform(self, client);
+    if (!std.ascii.eqlIgnoreCase(expected[0..expected_len], self.cache_platform[0..self.cache_platform_len])) return error.AccountChanged;
+    try snapshotControl(self).check();
+}
+
+fn copyCacheScope(self: *Runtime, snapshot: *Runtime) void {
+    self.cache_platform = snapshot.cache_platform;
+    self.cache_platform_len = snapshot.cache_platform_len;
+    if (self.storage) |*store| store.setScope(self.cache_platform[0..self.cache_platform_len], self.live_owner_puuid[0..self.live_owner_puuid_len]) catch {};
+}
+
+fn cacheOwnerChanged(self: *Runtime, snapshot: *Runtime) bool {
+    return !std.ascii.eqlIgnoreCase(self.live_owner_puuid[0..self.live_owner_puuid_len], snapshot.live_owner_puuid[0..snapshot.live_owner_puuid_len]) or
+        !std.ascii.eqlIgnoreCase(self.cache_platform[0..self.cache_platform_len], snapshot.cache_platform[0..snapshot.cache_platform_len]);
+}
+
+pub fn invokeConcurrent(self: *Runtime, handler: native_sdk.bridge.Handler, invocation: native_sdk.bridge.Invocation, output: []u8) ![]const u8 {
+    return invokeQueued(self, handler, invocation, output, null);
+}
+
+pub fn invokeQueued(self: *Runtime, handler: native_sdk.bridge.Handler, invocation: native_sdk.bridge.Invocation, output: []u8, ticket: ?ActionTicket) ![]const u8 {
+    lockBackendMutex(&self.command_mutex);
+    if (self.stopping or (if (ticket) |value| value.request != self.request_generation or value.session != self.live_generation else false)) {
+        self.command_mutex.unlock();
+        return error.RequestCancelled;
+    }
+    if (std.mem.eql(u8, handler.name, "lol.run_automation")) {
+        self.command_mutex.unlock();
+        return handler.invoke_fn(self, invocation, output);
+    }
+    if (commandLane(handler.name) == .state) {
+        defer self.command_mutex.unlock();
+        return handler.invoke_fn(self, invocation, output);
+    }
+    const snapshot = querySnapshot(self) catch |err| {
+        self.command_mutex.unlock();
+        return err;
+    };
+    const generation = self.request_generation;
+    snapshot.snapshot_lane = commandLane(handler.name);
+    if (snapshot.snapshot_lane == .action) snapshot.snapshot_live_generation = self.live_generation;
+    self.command_mutex.unlock();
+    defer std.heap.page_allocator.destroy(snapshot);
+
+    const result = try handler.invoke_fn(snapshot, invocation, output);
+    lockBackendMutex(&self.command_mutex);
+    defer self.command_mutex.unlock();
+    if (generation != self.request_generation or self.mode != snapshot.mode) return error.AccountChanged;
+    if (commandLane(handler.name) == .roster) {
+        if (std.mem.eql(u8, handler.name, "lol.refresh_connection")) {
+            const owner_changed = cacheOwnerChanged(self, snapshot);
+            if (owner_changed) {
+                clearLiveLobby(self);
+                clearChampSelectLobby(self);
+                self.request_generation +%= 1;
+            }
+            self.live_owner_puuid = snapshot.live_owner_puuid;
+            self.live_owner_puuid_len = snapshot.live_owner_puuid_len;
+            copyCacheScope(self, snapshot);
+            cacheConnection(self, result);
+            refreshLiveGeneration(self);
+        } else if (std.mem.eql(u8, handler.name, "lol.get_lcu_events")) {
+            self.event_state = snapshot.event_state;
+        } else {
+            const owner_changed = cacheOwnerChanged(self, snapshot);
+            if (owner_changed) {
+                clearLiveLobby(self);
+                clearChampSelectLobby(self);
+                self.request_generation +%= 1;
+            }
+            self.live_owner_puuid = snapshot.live_owner_puuid;
+            self.live_owner_puuid_len = snapshot.live_owner_puuid_len;
+            copyCacheScope(self, snapshot);
+            self.last_live_phase = snapshot.last_live_phase;
+            self.last_live_phase_len = snapshot.last_live_phase_len;
+            self.champ_select_handoff_active = snapshot.champ_select_handoff_active;
+            if (snapshot.champ_select_lobby_len == 0) clearChampSelectLobby(self);
+            self.live_roster_hash = snapshot.live_roster_hash;
+            const merged_buffer = try std.heap.page_allocator.alloc(u8, live_lobby_capacity);
+            defer std.heap.page_allocator.free(merged_buffer);
+            const merged = if (self.live_lobby_len > 0)
+                mergeLiveLobbySnapshots(self.live_lobby[0..self.live_lobby_len], result, false, merged_buffer) catch result
+            else
+                result;
+            cacheLiveLobby(self, merged);
+            if (lobbyIsChampSelectSnapshot(merged)) cacheChampSelectLobby(self, merged);
+            self.live_roster_checked_ms = runtimeMonotonicMillis(self);
+            refreshLiveGeneration(self);
+            try startLiveLoading(self);
+            return copyJson(merged, output);
+        }
+    } else if (cacheOwnerChanged(self, snapshot)) {
+        return error.AccountChanged;
+    }
+    return result;
 }
 
 fn lockBackendMutex(mutex: *std.atomic.Mutex) void {
@@ -367,13 +713,20 @@ fn discoverClientWithConfig(self: *const Runtime, io: std.Io, config_json: []con
             forwarded_port,
             requestTimeoutMsFromConfig(config),
             build_options.lcu_verify_tls,
-        )) |remote| return remote else |remote_error| {
+        )) |remote_client| {
+            var remote = remote_client;
+            remote.control = snapshotControl(self);
+            remote.lane = self.snapshot_lane;
+            return remote;
+        } else |remote_error| {
             if (builtin.os.tag != .windows) return remote_error;
         }
     };
     var client = try lcu.Client.discover(std.heap.page_allocator, io, build_options.lcu_lockfile_paths, self.env_map);
     client.timeout_ms = requestTimeoutMsFromConfig(config);
     client.verify_tls = build_options.lcu_verify_tls;
+    client.control = snapshotControl(self);
+    client.lane = self.snapshot_lane;
     return client;
 }
 
@@ -422,6 +775,11 @@ fn runtimeNowMillis(self: *const Runtime) i64 {
     return @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
 }
 
+fn runtimeMonotonicMillis(self: *const Runtime) i64 {
+    const io = self.io orelse return 0;
+    return @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms));
+}
+
 fn getBootstrap(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     _ = invocation;
     const self = runtime(context);
@@ -440,11 +798,6 @@ fn getBootstrap(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
     const encounters_buffer = std.heap.page_allocator.alloc(u8, 256 * 1024) catch null;
     defer if (encounters_buffer) |value| std.heap.page_allocator.free(value);
     const derived_encounters = if (self.mode == .live) if (encounters_buffer) |buffer| cachedEncountersFromMatches(self, buffer) else null else null;
-    var stored_encounters: ?[]u8 = null;
-    if (derived_encounters == null) if (self.storage) |*store| {
-        stored_encounters = store.get("history", "encounters") catch null;
-    };
-    defer if (stored_encounters) |value| std.heap.page_allocator.free(value);
 
     var writer = std.Io.Writer.fixed(output);
     try writer.writeAll("{\"dataMode\":");
@@ -454,7 +807,7 @@ fn getBootstrap(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
     try writer.writeAll(",\"recentMatches\":");
     try writer.writeAll(cached_matches orelse "[]");
     try writer.writeAll(",\"recentEncounters\":");
-    try writer.writeAll(derived_encounters orelse stored_encounters orelse "[]");
+    try writer.writeAll(derived_encounters orelse "[]");
     try writer.writeAll(",\"patch\":\"\",\"cachedChampions\":0},\"configPath\":");
     try jsonString(&writer, self.configPath());
     try writer.writeAll(",\"databasePath\":");
@@ -476,24 +829,46 @@ const SavePayload = struct { value: std.json.Value };
 const ModePayload = struct { mode: []const u8 };
 const TemplatePayload = struct { template: []const u8 };
 
-fn parsePayload(comptime T: type, payload: []const u8) !T {
-    return std.json.parseFromSliceLeaky(T, std.heap.page_allocator, payload, .{ .ignore_unknown_fields = true });
+fn parsePayload(comptime T: type, payload: []const u8) !std.json.Parsed(T) {
+    return std.json.parseFromSlice(T, std.heap.page_allocator, payload, .{ .ignore_unknown_fields = true });
 }
 
 fn saveConfig(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
-    const parsed = parsePayload(SavePayload, invocation.request.payload) catch return error.InvalidConfig;
+    const parsed_json = parsePayload(SavePayload, invocation.request.payload) catch return error.InvalidConfig;
+    defer parsed_json.deinit();
+    const parsed = parsed_json.value;
     var writer = std.Io.Writer.fixed(output);
     var stringify = std.json.Stringify{ .writer = &writer, .options = .{} };
     stringify.write(parsed.value) catch return error.InvalidConfig;
     const serialized = writer.buffered();
     if (serialized.len > self.config.len) return error.ConfigTooLarge;
-    // A connection kind/port can change from the settings page while the
-    // watchdog is holding old LCU credentials. Drop that client at the config
-    // boundary so the next automation tick discovers the new endpoint.
-    lockBackendMutex(&self.automation_mutex);
-    self.dropAutomationClient();
-    self.automation_mutex.unlock();
+    // 自动化在下一轮按配置指纹重建连接，保存时不等待正在执行的网络请求。
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const previous = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.config[0..self.config_len], .{});
+    const old_ranked_only = jsonBool(nestedObject(previous, "providers") orelse .null, "rankedOnly");
+    const new_ranked_only = jsonBool(nestedObject(parsed.value, "providers") orelse .null, "rankedOnly");
+    if (old_ranked_only != new_ranked_only) {
+        // 原始战绩缓存继续复用，取消旧口径的任务并重新生成统计和消息样本。
+        self.request_generation +%= 1;
+        self.live_generation +%= 1;
+        self.live_next_load_ms = 0;
+        if (self.live_load) |batch| batch.queue.cancelled.store(true, .release);
+        clearLiveLobby(self);
+        clearChampSelectLobby(self);
+    }
+    const old_connection = try std.json.Stringify.valueAlloc(arena.allocator(), nestedObject(previous, "connection"), .{});
+    const new_connection = try std.json.Stringify.valueAlloc(arena.allocator(), nestedObject(parsed.value, "connection"), .{});
+    if (!std.mem.eql(u8, old_connection, new_connection)) {
+        self.request_generation +%= 1;
+        clearLiveLobby(self);
+        clearChampSelectLobby(self);
+        self.cache_platform_len = 0;
+        self.live_owner_puuid_len = 0;
+        if (self.storage) |*store| try store.setScope("", "");
+        refreshLiveGeneration(self);
+    }
     @memcpy(self.config[0..serialized.len], serialized);
     self.config_len = serialized.len;
     if (!self.shortcut_capture_active) try configureShortcuts(self);
@@ -570,7 +945,9 @@ fn configureShortcuts(self: *Runtime) !void {
 
 fn setShortcutCapture(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
-    const payload = parsePayload(struct { active: bool = false }, invocation.request.payload) catch return error.InvalidRequest;
+    const payload_json = parsePayload(struct { active: bool = false }, invocation.request.payload) catch return error.InvalidRequest;
+    defer payload_json.deinit();
+    const payload = payload_json.value;
     self.shortcut_capture_active = payload.active;
     try configureShortcuts(self);
     return std.fmt.bufPrint(output, "null", .{});
@@ -578,8 +955,20 @@ fn setShortcutCapture(context: *anyopaque, invocation: native_sdk.bridge.Invocat
 
 fn setDataMode(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
-    const parsed = parsePayload(ModePayload, invocation.request.payload) catch return error.InvalidDataMode;
+    const parsed_json = parsePayload(ModePayload, invocation.request.payload) catch return error.InvalidDataMode;
+    defer parsed_json.deinit();
+    const parsed = parsed_json.value;
     const mode: Runtime.Mode = std.meta.stringToEnum(Runtime.Mode, parsed.mode) orelse return error.InvalidDataMode;
+    if (mode == .replay) return error.ReplayUnavailable;
+    if (self.mode != mode) {
+        self.request_generation +%= 1;
+        self.live_generation +%= 1;
+        self.live_session_key = 0;
+        self.live_roster_checked_ms = 0;
+        self.live_next_load_ms = 0;
+        self.force_profile_refresh = true;
+        if (self.live_load) |batch| batch.queue.cancelled.store(true, .release);
+    }
     self.mode = mode;
     if (mode == .live) {
         @memcpy(self.connection[0..disconnected_connection.len], disconnected_connection);
@@ -623,8 +1012,15 @@ fn refreshConnection(context: *anyopaque, invocation: native_sdk.bridge.Invocati
             // Match history has its own bridge command and cache. Pulling 50
             // games on every five-second connection refresh serializes all
             // live-roster work behind a large request in the synchronous host.
-            const result = connectionDtoDetailedAt(summoner, phase, chat_owned orelse "{}", ranked_owned orelse "{}", lobby_owned orelse "{}", "{}", runtimeNowMillis(self), output) catch |err| return connectionErrorDto(self, output, "error", err);
+            var ranked = std.json.parseFromSliceLeaky(std.json.Value, allocator, ranked_owned orelse "{}", .{}) catch std.json.Value{ .null = {} };
+            if (ranked != .object) ranked = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{}", .{});
+            if (ranked == .object and client.credentials.platformId().len > 0) try ranked.object.put(allocator, "platformId", .{ .string = client.credentials.platformId() });
+            const ranked_json = try std.json.Stringify.valueAlloc(allocator, ranked, .{});
+            const result = connectionDtoDetailedAt(summoner, phase, chat_owned orelse "{}", ranked_json, lobby_owned orelse "{}", "{}", runtimeNowMillis(self), output) catch |err| return connectionErrorDto(self, output, "error", err);
             cacheConnection(self, result);
+            self.cache_platform_len = 0;
+            setCachePlatform(self, firstPlatformId(&.{ranked}));
+            updateLiveLobbyOwner(self, summoner);
             return result;
         }
         return connectionErrorDto(self, output, "disconnected", error.LcuNotRunning);
@@ -645,7 +1041,7 @@ fn connectionErrorDto(self: *Runtime, output: []u8, status: []const u8, err: any
     jsonString(&writer, status) catch return output[0..0];
     writer.writeAll(",\"phase\":null,\"summonerName\":null,\"gameName\":null,\"tagLine\":null,\"summonerLevel\":null,\"profileIconId\":null,\"platformId\":null,\"region\":null,\"presence\":\"offline\",\"soloRank\":null,\"flexRank\":null,\"queueLabel\":null,\"message\":") catch return output[0..0];
     var message: [256]u8 = undefined;
-    const text = std.fmt.bufPrint(&message, "LCU 连接失败：{s}", .{@errorName(err)}) catch "LCU 连接失败";
+    const text = std.fmt.bufPrint(&message, "客户端连接失败：{s}", .{errorMessage(err)}) catch "客户端连接失败";
     jsonString(&writer, text) catch return output[0..0];
     writer.writeAll(",\"checkedAt\":") catch return output[0..0];
     writeIsoTimestamp(&writer, runtimeNowMillis(self)) catch return output[0..0];
@@ -656,7 +1052,330 @@ fn connectionErrorDto(self: *Runtime, output: []u8, status: []const u8, err: any
 }
 
 fn getLiveLobby(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    return getLiveLobbyInternal(context, invocation, output, true);
+    const self = runtime(context);
+    const payload_json = parsePayload(struct { force: bool = false }, invocation.request.payload) catch return error.InvalidRequest;
+    defer payload_json.deinit();
+    const payload = payload_json.value;
+    if (payload.force) {
+        self.force_profile_refresh = true;
+        self.live_next_load_ms = 0;
+        if (self.live_load) |batch| batch.queue.cancelled.store(true, .release);
+    }
+    if (self.mode != .live) return getLiveLobbyInternal(context, invocation, output, false);
+    if (self.live_lobby_len == 0) return error.LobbyLoading;
+    if (!self.is_snapshot) try startLiveLoading(self);
+    return liveLoadingResponse(self, output);
+}
+
+const LiveLoadBatch = struct {
+    parent: *Runtime,
+    // 仅借用数据库连接、输入输出接口和环境变量；配置与数据缓冲区由本批次独占。
+    // 关闭数据库之前，主运行时必须等待本批次退出。
+    snapshot: *Runtime,
+    generation: u64,
+    queue: live_loading.Queue,
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    jobs: []LiveProfileJob = &.{},
+    completed: usize = 0,
+    failed: usize = 0,
+    total: usize = 0,
+    started_ms: i64,
+    first_player_ms: ?i64 = null,
+    finished_ms: ?i64 = null,
+};
+
+fn refreshLiveGeneration(self: *Runtime) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.live_lobby[0..self.live_lobby_len], .{}) catch return;
+    var hash = std.hash.Wyhash.init(0);
+    hash.update(self.live_owner_puuid[0..self.live_owner_puuid_len]);
+    hash.update(jsonField(root, "id"));
+    hash.update(self.cache_platform[0..self.cache_platform_len]);
+    for ([_][]const u8{ "ally", "enemy" }) |side| {
+        const players = if (root == .object) root.object.get(side) else null;
+        if (players) |list| if (list == .array) for (list.array.items) |player| {
+            hash.update(side);
+            const key = jsonField(player, "rosterKey");
+            hash.update(if (key.len > 0) key else jsonField(player, "puuid"));
+            hash.update("\x00");
+        };
+    }
+    const phase = jsonField(root, "phase");
+    hash.update(if (isChampSelectPhase(phase)) "selection" else if (isActiveLivePhase(phase)) "active" else "idle");
+    const key = hash.final();
+    if (key == self.live_session_key) return;
+    self.live_session_key = key;
+    self.live_generation +%= 1;
+    self.live_next_load_ms = 0;
+    // 进入结算时重新读取战绩，普通开局交接继续复用未过期缓存。
+    if (std.mem.eql(u8, phase, "EndOfGame")) self.force_profile_refresh = true;
+    if (self.live_load) |batch| batch.queue.cancelled.store(true, .release);
+}
+
+fn startLiveLoading(self: *Runtime) !void {
+    if (self.live_load) |batch| {
+        if (!batch.done.load(.acquire)) return;
+        if (runtimeMonotonicMillis(self) < self.live_next_load_ms and !self.force_profile_refresh) return;
+        if (batch.thread) |thread| thread.join();
+        std.heap.page_allocator.destroy(batch.snapshot);
+        std.heap.page_allocator.destroy(batch);
+        self.live_load = null;
+    }
+    if (self.io == null or self.live_lobby_len == 0 or runtimeMonotonicMillis(self) < self.live_next_load_ms) return;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const lobby = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.live_lobby[0..self.live_lobby_len], .{});
+    const phase = jsonField(lobby, "phase");
+    if (!isChampSelectPhase(phase) and !isActiveLivePhase(phase) and !std.mem.eql(u8, phase, "EndOfGame")) return;
+    const snapshot = try querySnapshot(self);
+    errdefer std.heap.page_allocator.destroy(snapshot);
+    snapshot.snapshot_live_generation = self.live_generation;
+    const batch = try std.heap.page_allocator.create(LiveLoadBatch);
+    errdefer std.heap.page_allocator.destroy(batch);
+    batch.* = .{
+        .parent = self,
+        .snapshot = snapshot,
+        .generation = self.live_generation,
+        .queue = .{ .count = 0, .context = batch, .execute = loadLivePlayer },
+        .started_ms = runtimeMonotonicMillis(self),
+        .total = lobbyRosterCount(self.live_lobby[0..self.live_lobby_len]),
+    };
+    snapshot.snapshot_cancelled = &batch.queue.cancelled;
+    batch.thread = try std.Thread.spawn(.{}, runLiveLoadBatch, .{batch});
+    self.live_load = batch;
+    self.force_profile_refresh = false;
+}
+
+fn runLiveLoadBatch(batch: *LiveLoadBatch) void {
+    runLiveLoadBatchInner(batch) catch {
+        lockBackendMutex(&batch.parent.command_mutex);
+        batch.failed = @max(batch.failed, batch.total - batch.completed);
+        batch.parent.command_mutex.unlock();
+    };
+    lockBackendMutex(&batch.parent.command_mutex);
+    batch.finished_ms = runtimeMonotonicMillis(batch.snapshot);
+    if (batch.generation == batch.parent.live_generation and !batch.queue.cancelled.load(.acquire)) {
+        batch.parent.live_next_load_ms = batch.finished_ms.? + @as(i64, if (batch.failed > 0) 10_000 else 60_000);
+        batch.parent.live_lobby_enriched = batch.failed == 0;
+    }
+    batch.parent.command_mutex.unlock();
+    batch.done.store(true, .release);
+}
+
+fn runLiveLoadBatchInner(batch: *LiveLoadBatch) !void {
+    const self = batch.snapshot;
+    var client = try discoverClient(self, self.io.?);
+    defer client.deinit();
+    client.timeout_ms = @min(client.timeout_ms, player_enrichment_timeout_ms);
+    const current_json = try client.get("/lol-summoner/v1/current-summoner");
+    defer std.heap.page_allocator.free(current_json);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const current = try std.json.parseFromSliceLeaky(std.json.Value, allocator, current_json, .{});
+    if (!samePuuid(identityPuuid(current), self.live_owner_puuid[0..self.live_owner_puuid_len])) return error.AccountChanged;
+    const expected_platform = self.cache_platform;
+    const expected_platform_len = self.cache_platform_len;
+    try verifyCachePlatform(self, client);
+    if (!std.ascii.eqlIgnoreCase(expected_platform[0..expected_platform_len], self.cache_platform[0..self.cache_platform_len])) return error.AccountChanged;
+    const catalog_json = if (self.storage) |*store| try store.get("cache", "champions") else null;
+    defer if (catalog_json) |value| std.heap.page_allocator.free(value);
+    const catalog = try std.json.parseFromSliceLeaky(std.json.Value, allocator, catalog_json orelse "[]", .{});
+    try runLiveLoadJobs(batch, client, current, catalog);
+}
+
+fn runLiveLoadJobs(batch: *LiveLoadBatch, client: lcu.Client, current: std.json.Value, catalog: std.json.Value) !void {
+    const self = batch.snapshot;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const lobby = try std.json.parseFromSliceLeaky(std.json.Value, allocator, self.live_lobby[0..self.live_lobby_len], .{});
+    var shared_sgp = SharedLiveSgpContext{ .runtime_value = self, .client = client, .allocator = allocator };
+    var jobs: std.array_list.Managed(LiveProfileJob) = .init(allocator);
+    // 双方交错入队，敌方第一名不必等待我方整队完成。
+    const max_players = @max(profileArrayLen(lobby, "ally"), profileArrayLen(lobby, "enemy"));
+    for (0..max_players) |index| for ([_][]const u8{ "ally", "enemy" }) |side| {
+        const players = if (lobby == .object) lobby.object.get(side) else null;
+        if (players) |list| if (list == .array and index < list.array.items.len) {
+            const player = list.array.items[index];
+            var job = liveProfileJob(self, client, null, player, side, index, current, catalog, null);
+            job.shared_sgp = &shared_sgp;
+            job.output = try allocator.alloc(u8, live_profile_output_capacity);
+            try jobs.append(job);
+        };
+    };
+    batch.jobs = jobs.items;
+    batch.queue.count = jobs.items.len;
+    batch.queue.run();
+    batch.jobs = &.{};
+}
+
+fn loadLivePlayer(context: *anyopaque, index: usize) void {
+    const batch: *LiveLoadBatch = @ptrCast(@alignCast(context));
+    const job = &batch.jobs[index];
+    runLiveProfileJob(job);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const profile = if (job.failure == null) std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), job.output.?[0..job.output_len], .{}) catch null else null;
+    lockBackendMutex(&batch.parent.command_mutex);
+    defer batch.parent.command_mutex.unlock();
+    if (batch.generation != batch.parent.live_generation or batch.parent.mode != .live or batch.queue.cancelled.load(.acquire)) return;
+    batch.completed += 1;
+    if (batch.first_player_ms == null) batch.first_player_ms = runtimeMonotonicMillis(batch.snapshot) - batch.started_ms;
+    if (profile == null or !jsonBool(profile.?, "dataComplete")) batch.failed += 1;
+    if (profile) |value| {
+        var publication = value;
+        const key = jsonField(job.player, "rosterKey");
+        publication.object.put(arena.allocator(), "rosterKey", .{ .string = if (key.len > 0) key else jsonField(job.player, "puuid") }) catch return;
+        publishLiveProfile(batch.parent, job.player, publication, job.side, job.index) catch {};
+    }
+}
+
+pub fn verifyLiveProfilePipeline(io: std.Io, port: u16) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const state = try allocator.create(Runtime);
+    state.* = Runtime.init();
+    state.mode = .live;
+    state.io = io;
+    const client = lcu.Client{ .allocator = std.heap.page_allocator, .io = io, .credentials = .{ .port = port, .protocol = "http", .token = "验证凭据" } };
+    var raw_players = std.json.Array.init(allocator);
+    for (0..10) |index| {
+        const json = try std.fmt.allocPrint(allocator,
+            "{{\"puuid\":\"00000000-0000-0000-0000-000000000000\",\"riotIdGameName\":\"{s}{d}\",\"riotIdTagLine\":\"测试\",\"team\":\"{s}\",\"championId\":{d}}}",
+            .{ if (index < 5) "我方" else "敌方", index % 5, if (index < 5) "ORDER" else "CHAOS", index + 1 });
+        try raw_players.append(try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{}));
+    }
+    const players_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .array = raw_players }, .{});
+    const raw_json = try std.fmt.allocPrint(allocator, "{{\"allPlayers\":{s},\"gameData\":{{\"gameId\":42}}}}", .{players_json});
+    const current_json = "{\"puuid\":\"验证身份-0\",\"gameName\":\"我方0\",\"tagLine\":\"测试\"}";
+    const current = try std.json.parseFromSliceLeaky(std.json.Value, allocator, current_json, .{});
+    const output = try allocator.alloc(u8, live_lobby_capacity);
+    const fast = try liveClientEnvelope(state, client, raw_json, null, "InProgress", current_json, "[]", "[]", output, false);
+    cacheLiveLobby(state, fast);
+    refreshLiveGeneration(state);
+    const snapshot = try querySnapshot(state);
+    defer std.heap.page_allocator.destroy(snapshot);
+    snapshot.snapshot_live_generation = state.live_generation;
+    var batch = LiveLoadBatch{ .parent = state, .snapshot = snapshot, .generation = state.live_generation, .started_ms = runtimeMonotonicMillis(state), .total = 10, .queue = .{ .count = 0, .context = undefined, .execute = loadLivePlayer } };
+    batch.queue.context = &batch;
+    try runLiveLoadJobs(&batch, client, current, .null);
+    if (batch.completed != 10 or batch.failed != 0) return error.IncompleteLiveProfiles;
+    const completed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, state.live_lobby[0..state.live_lobby_len], .{});
+    for ([_][]const u8{ "ally", "enemy" }, 0..) |side, team_index| {
+        const players = completed.object.get(side).?.array.items;
+        if (players.len != 5) return error.IncorrectRosterSize;
+        for (players, 0..) |player, index| {
+            const number = team_index * 5 + index;
+            const expected = try std.fmt.allocPrint(allocator, "验证身份-{d}", .{number});
+            if (!std.mem.eql(u8, jsonField(player, "puuid"), expected)) return error.IncorrectPlayerIdentity;
+            if (jsonInt(player, "championId") != number + 1) return error.IncorrectPlayerChampion;
+            const matches = player.object.get("recentMatches").?.array.items;
+            if (matches.len != 2 or jsonInt(matches[0], "gameId") != 1000 + number) return error.IncorrectPlayerHistory;
+        }
+    }
+    std.debug.print("原生十人资料验证：身份、英雄及战绩逐人对应，首名 {d} 毫秒，全部 {d} 毫秒\n", .{ batch.first_player_ms orelse 0, runtimeMonotonicMillis(state) - batch.started_ms });
+}
+
+fn publishLiveProfile(self: *Runtime, original: std.json.Value, profile: std.json.Value, target_side: []const u8, target_index: usize) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, self.live_lobby[0..self.live_lobby_len], .{ .allocate = .alloc_always });
+    if (root != .object) return;
+    for ([_][]const u8{ "ally", "enemy" }) |side| {
+        if (!std.mem.eql(u8, side, target_side)) continue;
+        if (root.object.getPtr(side)) |list| {
+            try updateLiveProfileArray(allocator, list, original, profile, target_index);
+            const summary = try liveSummaryValue(allocator, side, list.*);
+            try root.object.put(allocator, if (std.mem.eql(u8, side, "ally")) "allySummary" else "enemySummary", summary);
+        }
+    }
+    if (root.object.getPtr("teams")) |teams| if (teams.* == .array) for (teams.array.items) |*team| {
+        if (!std.mem.eql(u8, jsonField(team.*, "side"), target_side)) continue;
+        if (team.* == .object) if (team.object.getPtr("players")) |players| {
+            try updateLiveProfileArray(allocator, players, original, profile, target_index);
+            const summary = try liveSummaryValue(allocator, jsonField(team.*, "side"), players.*);
+            try team.object.put(allocator, "summary", summary);
+        };
+    };
+    var timestamp_buffer: [64]u8 = undefined;
+    var stamp_writer = std.Io.Writer.fixed(&timestamp_buffer);
+    try writeIsoTimestamp(&stamp_writer, runtimeNowMillis(self));
+    try root.object.put(allocator, "generatedAt", try std.json.parseFromSliceLeaky(std.json.Value, allocator, stamp_writer.buffered(), .{}));
+    const buffer = try allocator.alloc(u8, live_lobby_capacity);
+    var writer = std.Io.Writer.fixed(buffer);
+    var stringify = std.json.Stringify{ .writer = &writer, .options = .{} };
+    try stringify.write(root);
+    cacheLiveLobby(self, writer.buffered());
+    if (lobbyIsChampSelectSnapshot(writer.buffered())) cacheChampSelectLobby(self, writer.buffered());
+}
+
+fn updateLiveProfileArray(allocator: std.mem.Allocator, list: *std.json.Value, original: std.json.Value, profile: std.json.Value, target_index: usize) !void {
+    if (list.* != .array) return;
+    for (list.array.items, 0..) |*player, index| {
+        // 一次完成事件只更新所属队伍中的一个槽位，空身份不能作为匹配依据。
+        if (index != target_index) continue;
+        const original_key = jsonField(original, "rosterKey");
+        const current_key = jsonField(player.*, "rosterKey");
+        if (original_key.len > 0 and current_key.len > 0) {
+            if (!std.mem.eql(u8, original_key, current_key)) return;
+        } else if (!livePlayerMatches(player.*, original) and !sameRosterSlot(player.*, original) and
+            !samePuuid(jsonField(player.*, "puuid"), jsonField(original, "puuid"))) return;
+        const resolved_puuid = jsonField(profile, "puuid");
+        const resolved_quality = profileIdentityQuality(profile);
+        var merged = try mergeLobbyProfile(allocator, player.*, profile, true);
+        // 战绩加载期间英雄和位置可能变化，以当前阵容为准。
+        overlayDynamicProfile(&merged, player.*);
+        if (resolved_quality > profileIdentityQuality(player.*)) if (merged.object.getPtr("puuid")) |id| {
+            id.* = .{ .string = resolved_puuid };
+        };
+        player.* = merged;
+        return;
+    }
+}
+
+fn liveSummaryValue(allocator: std.mem.Allocator, side: []const u8, players: std.json.Value) !std.json.Value {
+    const json = try std.json.Stringify.valueAlloc(allocator, players, .{});
+    const buffer = try allocator.alloc(u8, 8192);
+    var writer = std.Io.Writer.fixed(buffer);
+    try writeLiveTeamSummary(&writer, side, json);
+    return std.json.parseFromSliceLeaky(std.json.Value, allocator, writer.buffered(), .{});
+}
+
+fn liveLoadingResponse(self: *Runtime, output: []u8) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, self.live_lobby[0..self.live_lobby_len], .{});
+    if (root != .object) return error.LcuInvalidResponse;
+    if (self.live_load) |batch| {
+        const current_batch = batch.generation == self.live_generation and !batch.queue.cancelled.load(.acquire);
+        const progress = .{
+            .active = !batch.done.load(.acquire) or !current_batch,
+            .completed = if (current_batch) batch.completed else 0,
+            .total = if (current_batch) batch.total else lobbyRosterCount(self.live_lobby[0..self.live_lobby_len]),
+            .failed = if (current_batch) batch.failed else 0,
+            .elapsedMs = if (current_batch) (batch.finished_ms orelse runtimeMonotonicMillis(self)) - batch.started_ms else 0,
+            .firstPlayerMs = if (current_batch) batch.first_player_ms else null,
+        };
+        const json = try std.json.Stringify.valueAlloc(allocator, progress, .{});
+        try root.object.put(allocator, "loading", try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{}));
+    }
+    var writer = std.Io.Writer.fixed(output);
+    var stringify = std.json.Stringify{ .writer = &writer, .options = .{} };
+    try stringify.write(root);
+    return writer.buffered();
+}
+
+fn cachedGameAsset(self: *Runtime, client: lcu.Client, key: []const u8, path: []const u8) ![]u8 {
+    if (cachedSnapshot(self, "cache", key, 86400)) |value| return value;
+    const value = try client.get(path);
+    if (self.storage) |*store| store.put("cache", key, value) catch {};
+    return value;
 }
 
 fn getLiveLobbyInternal(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8, enrich: bool) anyerror![]const u8 {
@@ -682,8 +1401,8 @@ fn getLiveLobbyInternal(context: *anyopaque, invocation: native_sdk.bridge.Invoc
             observeLivePhase(self, phase);
             const current = client.get("/lol-summoner/v1/current-summoner") catch null;
             defer if (current) |value| std.heap.page_allocator.free(value);
+            try verifyCachePlatform(self, client);
             updateLiveLobbyOwner(self, current);
-            if (enrich) if (current) |value| primeCurrentHistory(self, client, value);
 
             // The champ-select session disappears as soon as the game client
             // starts. Route each phase to the endpoint that owns that data and
@@ -715,9 +1434,9 @@ fn getLiveLobbyInternal(context: *anyopaque, invocation: native_sdk.bridge.Invoc
                         if (self.live_roster_hash == roster_hash and self.live_lobby_len > 0 and (!enrich or self.live_lobby_enriched)) {
                             return liveLobbyCacheWithPhase(self, phase, output) catch copyJson(self.live_lobby[0..self.live_lobby_len], output);
                         }
-                        const catalog = client.get("/lol-game-data/assets/v1/champion-summary.json") catch null;
+                        const catalog = cachedGameAsset(self, client, "champions", "/lol-game-data/assets/v1/champion-summary.json") catch null;
                         defer if (catalog) |catalog_json| std.heap.page_allocator.free(catalog_json);
-                        const queues = client.get("/lol-game-data/assets/v1/queues.json") catch null;
+                        const queues = cachedGameAsset(self, client, "queues", "/lol-game-data/assets/v1/queues.json") catch null;
                         defer if (queues) |queue_json| std.heap.page_allocator.free(queue_json);
                         const inferred_phase = if (isActiveLivePhase(phase)) phase else "InProgress";
                         const result = liveClientEnvelope(self, client, value, session, inferred_phase, current, catalog orelse "[]", queues orelse "[]", output, enrich) catch null;
@@ -743,9 +1462,9 @@ fn getLiveLobbyInternal(context: *anyopaque, invocation: native_sdk.bridge.Invoc
                 const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, value, .{}) catch null;
                 const has_roster = parsed != null and parsed.? == .object and sessionHasRoster(parsed.?);
                 if (has_roster or std.mem.eql(u8, phase, "ChampSelect") or std.mem.eql(u8, phase, "ReadyCheck")) {
-                    const catalog = client.get("/lol-game-data/assets/v1/champion-summary.json") catch null;
+                    const catalog = cachedGameAsset(self, client, "champions", "/lol-game-data/assets/v1/champion-summary.json") catch null;
                     defer if (catalog) |catalog_json| std.heap.page_allocator.free(catalog_json);
-                    const queues = client.get("/lol-game-data/assets/v1/queues.json") catch null;
+                    const queues = cachedGameAsset(self, client, "queues", "/lol-game-data/assets/v1/queues.json") catch null;
                     defer if (queues) |queue_json| std.heap.page_allocator.free(queue_json);
                     const custom_lobby = if (std.mem.eql(u8, phase, "ChampSelect") or std.mem.eql(u8, phase, "ReadyCheck"))
                         client.get("/lol-lobby/v2/lobby") catch null
@@ -866,6 +1585,9 @@ fn clearChampSelectLobby(self: *Runtime) void {
 }
 
 fn clearLiveLobby(self: *Runtime) void {
+    self.live_generation +%= 1;
+    self.live_next_load_ms = 0;
+    if (self.live_load) |batch| batch.queue.cancelled.store(true, .release);
     self.live_lobby_len = 0;
     self.live_roster_hash = 0;
     self.live_lobby_enriched = false;
@@ -934,12 +1656,13 @@ fn betterCachedLiveLobby(self: *const Runtime, candidate: []const u8, phase: []c
         const cached = self.champ_select_lobby[0..self.champ_select_lobby_len];
         const count = lobbyRosterCount(cached);
         const handoff = self.champ_select_handoff_active and isActiveLivePhase(phase) and lobbyIsChampSelectSnapshot(cached);
-        if ((count > best_count or (handoff and !dynamic_enriched and count == best_count)) and
+        if (count > best_count and
             (lobbyIdsCompatible(candidate, cached) or handoff)) best = cached;
     }
     const cached = best orelse return null;
-    return liveLobbyCacheWithPhaseBuffer(cached, phase, output) catch
-        (copyJson(cached, output) catch return null);
+    // 缓存补足缺失槽位，同时接纳游戏内新公开的名字和英雄。
+    return mergeLiveLobbySnapshotsPolicy(cached, candidate, dynamic_enriched, self.champ_select_handoff_active, output) catch
+        (liveLobbyCacheWithPhaseBuffer(cached, phase, output) catch return null);
 }
 
 fn profileArrayLen(value: std.json.Value, name: []const u8) usize {
@@ -1012,10 +1735,37 @@ fn overlayDynamicProfile(target: *std.json.Value, dynamic: std.json.Value) void 
     copyObjectField(target, dynamic, "side");
 }
 
-fn mergeLobbyProfile(base: std.json.Value, dynamic: std.json.Value, dynamic_enriched: bool) std.json.Value {
+fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
+    const json = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    return std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+}
+
+fn mergeLobbyProfile(allocator: std.mem.Allocator, base: std.json.Value, dynamic: std.json.Value, dynamic_enriched: bool) !std.json.Value {
     const dynamic_complete = jsonBool(dynamic, "dataComplete") or arrayFieldHasItems(dynamic, "recentMatches");
-    var merged = if (dynamic_enriched and dynamic_complete) dynamic else base;
-    if (dynamic_enriched and dynamic_complete) {
+    const status = nestedObject(dynamic, "dataStatus") orelse std.json.Value{ .null = {} };
+    const attempted = dynamic_complete or (jsonField(status, "source").len > 0 and !std.mem.eql(u8, jsonField(status, "source"), "unavailable"));
+    // 合并结果独占对象，避免队伍副本或重复占位共享可变字段。
+    var merged = try cloneJsonValue(allocator, if (dynamic_enriched and attempted) dynamic else base);
+    const base_key = jsonField(base, "rosterKey");
+    const dynamic_key = jsonField(dynamic, "rosterKey");
+    const newly_searchable = !dynamic_enriched and !profileHasKnownName(base) and profileIdentityQuality(base) < 2 and profileHasKnownName(dynamic);
+    const key = if (newly_searchable)
+        try std.fmt.allocPrint(allocator, "lookup:{s}#{s}", .{ jsonField(dynamic, "gameName"), jsonField(dynamic, "tagLine") })
+    else if (base_key.len > 0) base_key else if (dynamic_key.len > 0) dynamic_key else jsonField(base, "puuid");
+    if (key.len > 0) try merged.object.put(allocator, "rosterKey", .{ .string = key });
+    if (dynamic_enriched and attempted) {
+        var retained = false;
+        if (profileSourceMissing(dynamic, "recentMatches") and arrayFieldHasItems(base, "recentMatches")) {
+            for ([_][]const u8{ "recentMatches", "topChampions", "score", "tags", "junglePreference", "positionGames", "positionWinRate", "currentChampionGames", "currentChampionWinRate", "championPoolConcentration" }) |field| copyObjectField(&merged, base, field);
+            retained = true;
+        }
+        if (profileSourceMissing(dynamic, "rank") and !profileSourceMissing(base, "rank")) {
+            for ([_][]const u8{ "rankTier", "rankDivision", "leaguePoints", "wins", "losses", "soloRank", "flexRank" }) |field| copyObjectField(&merged, base, field);
+            retained = true;
+        }
+        if (retained) if (merged.object.getPtr("dataStatus")) |data_status| if (data_status.* == .object) {
+            if (data_status.object.getPtr("isStale")) |stale| stale.* = .{ .bool = true };
+        };
         if (profileIdentityQuality(merged) < profileIdentityQuality(base)) copyObjectField(&merged, base, "puuid");
         if (!profileHasKnownName(merged) and profileHasKnownName(base)) copyObjectField(&merged, base, "gameName");
         if (jsonField(merged, "tagLine").len == 0) copyObjectField(&merged, base, "tagLine");
@@ -1033,6 +1783,15 @@ fn mergeLobbyProfile(base: std.json.Value, dynamic: std.json.Value, dynamic_enri
     }
     overlayDynamicProfile(&merged, dynamic);
     return merged;
+}
+
+fn profileSourceMissing(profile: std.json.Value, source: []const u8) bool {
+    if (profile != .object) return false;
+    const missing = profile.object.get("unavailableSources") orelse return false;
+    if (missing == .array) for (missing.array.items) |item| {
+        if (item == .string and std.mem.eql(u8, item.string, source)) return true;
+    };
+    return false;
 }
 
 fn mergeLobbyTeam(allocator: std.mem.Allocator, base: std.json.Value, dynamic: *std.json.Value, dynamic_enriched: bool) !void {
@@ -1058,16 +1817,16 @@ fn mergeLobbyTeam(allocator: std.mem.Allocator, base: std.json.Value, dynamic: *
                 break;
             }
         }
-        if (matched == null and index < fallback.len and index < used.len) {
+        if (matched == null and index < fallback.len and index < used.len and !used[index]) {
             const unresolved = !profileHasKnownName(member) or profileIdentityQuality(member) < 2;
-            if (unresolved) matched = index;
+            if (unresolved and !profileNamesConflict(member, fallback[index])) matched = index;
         }
         if (matched) |fallback_index| {
             used[fallback_index] = true;
             const value = if (live_is_topology)
-                mergeLobbyProfile(fallback[fallback_index], member, dynamic_enriched)
+                try mergeLobbyProfile(allocator, fallback[fallback_index], member, dynamic_enriched)
             else
-                mergeLobbyProfile(member, fallback[fallback_index], dynamic_enriched);
+                try mergeLobbyProfile(allocator, member, fallback[fallback_index], dynamic_enriched);
             try merged.append(value);
         } else {
             try merged.append(member);
@@ -1078,12 +1837,22 @@ fn mergeLobbyTeam(allocator: std.mem.Allocator, base: std.json.Value, dynamic: *
 
 fn sameRosterSlot(left: std.json.Value, right: std.json.Value) bool {
     if (left != .object or right != .object) return false;
+    if (profileNamesConflict(left, right)) return false;
+    if (profileIdentityQuality(left) == 2 and profileIdentityQuality(right) == 2 and
+        !samePuuid(identityPuuid(left), identityPuuid(right))) return false;
     const left_cell = if (left.object.get("cellId") != null) jsonInt(left, "cellId") else -1;
     const right_cell = if (right.object.get("cellId") != null) jsonInt(right, "cellId") else -1;
     if (left_cell >= 0 and right_cell >= 0 and left_cell == right_cell) return true;
     const left_champion = jsonInt(left, "championId");
     const right_champion = jsonInt(right, "championId");
     return left_champion > 0 and right_champion > 0 and left_champion == right_champion;
+}
+
+fn profileNamesConflict(left: std.json.Value, right: std.json.Value) bool {
+    if (!profileHasKnownName(left) or !profileHasKnownName(right)) return false;
+    return !std.ascii.eqlIgnoreCase(jsonField(left, "gameName"), jsonField(right, "gameName")) or
+        (jsonField(left, "tagLine").len > 0 and jsonField(right, "tagLine").len > 0 and
+        !std.ascii.eqlIgnoreCase(jsonField(left, "tagLine"), jsonField(right, "tagLine")));
 }
 
 /// Merge a fresh topology with the last same-game profile snapshot. Fast
@@ -1164,10 +1933,11 @@ fn cacheLiveLobby(self: *Runtime, value: []const u8) void {
     }
     @memcpy(self.live_lobby[0..value.len], value);
     self.live_lobby_len = value.len;
-    if (self.storage) |*store| {
+    if (!self.is_snapshot) if (self.storage) |*store| {
         store.put("liveLobby", "current", value) catch {};
+        store.put("liveLobby", "profilePolicy", if (runtimeRankedOnly(self)) "v2:ranked" else "v2:all") catch {};
         if (self.live_owner_puuid_len > 0) store.put("liveLobby", "ownerPuuid", self.live_owner_puuid[0..self.live_owner_puuid_len]) catch {};
-    }
+    };
     if (self.champ_select_handoff_active and self.live_lobby_enriched and lobbyIsActiveSnapshot(value) and
         lobbyRosterCount(value) >= lobbyRosterCount(self.champ_select_lobby[0..self.champ_select_lobby_len]))
     {
@@ -1181,10 +1951,36 @@ fn cacheChampSelectLobby(self: *Runtime, value: []const u8) void {
     @memcpy(self.champ_select_lobby[0..value.len], value);
     self.champ_select_lobby_len = value.len;
     self.champ_select_game_id = lobbyGameId(value);
-    if (self.storage) |*store| {
+    if (!self.is_snapshot) if (self.storage) |*store| {
         store.put("liveLobby", "current", value) catch {};
         if (self.live_owner_puuid_len > 0) store.put("liveLobby", "ownerPuuid", self.live_owner_puuid[0..self.live_owner_puuid_len]) catch {};
+    };
+}
+
+fn setCachePlatform(self: *Runtime, platform: []const u8) void {
+    const normalized = if (std.ascii.startsWithIgnoreCase(platform, "TENCENT_")) platform[8..] else platform;
+    if (normalized.len == 0 or normalized.len > self.cache_platform.len) return;
+    if (self.cache_platform_len > 0 and !std.ascii.eqlIgnoreCase(self.cache_platform[0..self.cache_platform_len], normalized)) {
+        clearLiveLobby(self);
+        clearChampSelectLobby(self);
     }
+    @memcpy(self.cache_platform[0..normalized.len], normalized);
+    self.cache_platform_len = normalized.len;
+}
+
+fn verifyCachePlatform(self: *Runtime, client: lcu.Client) !void {
+    if (client.credentials.platformId().len > 0) {
+        setCachePlatform(self, client.credentials.platformId());
+        return;
+    }
+    const json = try client.get("/lol-ranked/v1/current-ranked-stats");
+    defer std.heap.page_allocator.free(json);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const ranked = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{});
+    const platform = firstPlatformId(&.{ranked});
+    if (platform.len == 0) return error.CacheScopeUnavailable;
+    setCachePlatform(self, platform);
 }
 
 fn updateLiveLobbyOwner(self: *Runtime, current_json: ?[]const u8) void {
@@ -1194,6 +1990,7 @@ fn updateLiveLobbyOwner(self: *Runtime, current_json: ?[]const u8) void {
     const current = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{}) catch return;
     const puuid = identityPuuid(firstJsonValue(current));
     if (puuid.len == 0 or puuid.len > self.live_owner_puuid.len) return;
+    if (self.storage) |*store| store.setScope(self.cache_platform[0..self.cache_platform_len], puuid) catch {};
     if (self.live_owner_puuid_len == 0) {
         if (self.storage) |*store| {
             if (store.get("liveLobby", "ownerPuuid") catch null) |stored_owner| {
@@ -1201,7 +1998,11 @@ fn updateLiveLobbyOwner(self: *Runtime, current_json: ?[]const u8) void {
                 if (std.mem.eql(u8, stored_owner, puuid) and stored_owner.len <= self.live_owner_puuid.len) {
                     @memcpy(self.live_owner_puuid[0..stored_owner.len], stored_owner);
                     self.live_owner_puuid_len = stored_owner.len;
-                    if (self.live_lobby_len == 0) if (store.get("liveLobby", "current") catch null) |stored_lobby| {
+                    const policy = store.get("liveLobby", "profilePolicy") catch null;
+                    defer if (policy) |value| std.heap.page_allocator.free(value);
+                    // 旧版可能缓存了重复玩家，升级及过滤口径变化后重新获取阵容。
+                    const reusable = policy != null and std.mem.eql(u8, policy.?, if (runtimeRankedOnly(self)) "v2:ranked" else "v2:all");
+                    if (reusable and self.live_lobby_len == 0) if (store.get("liveLobby", "current") catch null) |stored_lobby| {
                         defer std.heap.page_allocator.free(stored_lobby);
                         if (stored_lobby.len <= self.live_lobby.len) {
                             @memcpy(self.live_lobby[0..stored_lobby.len], stored_lobby);
@@ -1226,7 +2027,7 @@ fn updateLiveLobbyOwner(self: *Runtime, current_json: ?[]const u8) void {
     }
     @memcpy(self.live_owner_puuid[0..puuid.len], puuid);
     self.live_owner_puuid_len = puuid.len;
-    if (self.storage) |*store| store.put("liveLobby", "ownerPuuid", puuid) catch {};
+    if (!self.is_snapshot) if (self.storage) |*store| store.put("liveLobby", "ownerPuuid", puuid) catch {};
 }
 
 fn lobbyRosterCount(value: []const u8) usize {
@@ -1318,13 +2119,22 @@ fn getLiveRoster(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
     // topology without the per-player rank/history lookups; the regular lobby
     // request enriches those cards in the background and the frontend merges
     // the two snapshots by PUUID.
-    return getLiveLobbyInternal(context, invocation, output, false);
+    const self = runtime(context);
+    const result = try getLiveLobbyInternal(context, invocation, output, false);
+    if (self.mode == .live) {
+        cacheLiveLobby(self, result);
+        self.live_roster_checked_ms = runtimeMonotonicMillis(self);
+        refreshLiveGeneration(self);
+    }
+    return result;
 }
 
 fn getMatches(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
     if (self.mode == .live) {
-        const request = parsePayload(struct { summonerName: ?[]const u8 = null, page: usize = 0, pageSize: usize = 20 }, invocation.request.payload) catch return error.InvalidRequest;
+        const request_json = parsePayload(struct { summonerName: ?[]const u8 = null, page: usize = 0, pageSize: usize = 20 }, invocation.request.payload) catch return error.InvalidRequest;
+        defer request_json.deinit();
+        const request = request_json.value;
         const page_size = @max(@as(usize, 1), @min(request.pageSize, @as(usize, 100)));
         const offset = request.page * page_size;
         const explicit_subject = if (request.summonerName) |value| blk: {
@@ -1350,6 +2160,8 @@ fn getMatches(context: *anyopaque, invocation: native_sdk.bridge.Invocation, out
             const parsed_current = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), me, .{}) catch return error.LcuInvalidResponse;
             const current = firstJsonValue(parsed_current);
             if (current != .object) return error.LcuInvalidResponse;
+            try verifyCachePlatform(self, client);
+            updateLiveLobbyOwner(self, me);
 
             var target_owned: ?[]u8 = null;
             defer if (target_owned) |value| std.heap.page_allocator.free(value);
@@ -1380,7 +2192,7 @@ fn getMatches(context: *anyopaque, invocation: native_sdk.bridge.Invocation, out
                     return error.LcuRequestFailed;
                 };
                 defer std.heap.page_allocator.free(lcu_history);
-                const sgp_history: ?[]u8 = fetchSgpHistory(client, current, lcu_history, puuid, 0, 50) catch null;
+                const sgp_history: ?[]u8 = if (historyHasGames(lcu_history)) null else fetchSgpHistory(client, current, lcu_history, puuid, 0, 50) catch null;
                 defer if (sgp_history) |history| std.heap.page_allocator.free(history);
                 const history = sgp_history orelse lcu_history;
                 var cached_catalog: ?[]u8 = null;
@@ -1403,13 +2215,12 @@ fn getMatches(context: *anyopaque, invocation: native_sdk.bridge.Invocation, out
                         store.put("matches", "currentPuuid", puuid) catch {};
                     }
                 }
-                if (explicit_subject == null and historyHasGames(history)) persistEncountersFromHistory(self, history, puuid);
                 const catalog_json = champion_catalog orelse cached_catalog orelse "[]";
-                const dto = matchHistoryDtoPageFiltered(history, catalog_json, puuid, offset, page_size, runtimeHideUnfinishedMatches(self), output) catch |err| {
+                const dto = matchHistoryDtoPageWithFilters(history, catalog_json, puuid, offset, page_size, runtimeHideUnfinishedMatches(self), runtimeRankedOnly(self), output) catch |err| {
                     // A gateway response can be valid JSON but still use a
                     // shape the local DTO parser does not understand. Keep
                     // the LCU payload as a deterministic fallback.
-                    if (sgp_history != null) return matchHistoryDtoPageFiltered(lcu_history, catalog_json, puuid, offset, page_size, runtimeHideUnfinishedMatches(self), output) catch return err;
+                    if (sgp_history != null) return matchHistoryDtoPageWithFilters(lcu_history, catalog_json, puuid, offset, page_size, runtimeHideUnfinishedMatches(self), runtimeRankedOnly(self), output) catch return err;
                     return err;
                 };
                 if (dto.len > 2 or sgp_history == null or !historyHasGames(lcu_history)) {
@@ -1419,7 +2230,7 @@ fn getMatches(context: *anyopaque, invocation: native_sdk.bridge.Invocation, out
                 // Treat an empty SGP page as unavailable. This is common
                 // during an entitlement refresh and must not hide the LCU
                 // history that is already available locally.
-                return matchHistoryDtoPageFiltered(lcu_history, catalog_json, puuid, offset, page_size, runtimeHideUnfinishedMatches(self), output);
+                return matchHistoryDtoPageWithFilters(lcu_history, catalog_json, puuid, offset, page_size, runtimeHideUnfinishedMatches(self), runtimeRankedOnly(self), output);
             }
         }
         if (cachedMatchesPageForSubject(self, explicit_subject, offset, page_size, output)) |cached| return cached;
@@ -1446,10 +2257,20 @@ fn cachedMatchesPageForSubject(self: *Runtime, subject: ?[]const u8, offset: usi
     defer if (current_puuid) |value| std.heap.page_allocator.free(value);
     const catalog = store.get("cache", "champions") catch null;
     defer if (catalog) |value| std.heap.page_allocator.free(value);
-    return matchHistoryDtoPageFiltered(history, catalog orelse "[]", puuid orelse "", offset, limit, runtimeHideUnfinishedMatches(self), output) catch null;
+    return matchHistoryDtoPageWithFilters(history, catalog orelse "[]", puuid orelse "", offset, limit, runtimeHideUnfinishedMatches(self), runtimeRankedOnly(self), output) catch null;
 }
 
 const sgp_user_agent = "LeagueOfLegendsClient/15.0.0.0 (rcp-be-lol-match-history)";
+const player_profile_cache_ttl_seconds: i64 = 20;
+const player_history_cache_ttl_seconds: i64 = 60;
+const player_enrichment_timeout_ms: u32 = 1800;
+
+fn fetchSgpHistoryWithContext(client: lcu.Client, context: JungleSgpContext, target_puuid: []const u8, start: usize, count: usize) ![]u8 {
+    if (target_puuid.len == 0) return error.LcuInvalidResponse;
+    var url_buffer: [2048]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buffer, "https://{s}/match-history-query/v1/products/lol/player/{s}/SUMMARY?startIndex={d}&count={d}", .{ context.host, target_puuid, start, count });
+    return client.getBearerUrl(url, context.token, sgp_user_agent);
+}
 
 fn fetchSgpHistory(client: lcu.Client, current: std.json.Value, lcu_history_json: []const u8, target_puuid: []const u8, start: usize, count: usize) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -1469,9 +2290,7 @@ fn fetchSgpHistory(client: lcu.Client, current: std.json.Value, lcu_history_json
     const token = jsonField(entitlement, "accessToken");
     if (token.len == 0) return error.LcuInvalidResponse;
 
-    var url_buffer: [2048]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buffer, "https://{s}/match-history-query/v1/products/lol/player/{s}/SUMMARY?startIndex={d}&count={d}", .{ host, target_puuid, start, count });
-    return client.getBearerUrl(url, token, sgp_user_agent);
+    return fetchSgpHistoryWithContext(client, .{ .host = host, .platform_id = platform_id, .token = token }, target_puuid, start, count);
 }
 
 fn sgpHost(platform_id: []const u8) ?[]const u8 {
@@ -1576,7 +2395,9 @@ fn getChampions(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
 
 fn getAsset(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
-    const payload = parsePayload(struct { kind: []const u8 = "", id: i64 = 0 }, invocation.request.payload) catch return error.InvalidAsset;
+    const payload_json = parsePayload(struct { kind: []const u8 = "", id: i64 = 0 }, invocation.request.payload) catch return error.InvalidAsset;
+    defer payload_json.deinit();
+    const payload = payload_json.value;
     if (payload.id <= 0) return error.InvalidAsset;
     const kind = assetKind(payload.kind) orelse return error.InvalidAsset;
     if (self.io) |io| {
@@ -1654,111 +2475,171 @@ fn communityDragonAsset(kind: AssetKind, id: i64, output: []u8) ![]const u8 {
     return std.fmt.bufPrint(output, "{{\"kind\":\"{s}\",\"id\":{d},\"mimeType\":\"{s}\",\"dataUrl\":\"https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/v1/{s}/{d}.{s}\",\"source\":\"communitydragon\"}}", .{ @tagName(kind), id, mime, folder, id, extension });
 }
 
-fn encounterArchiveResponse(self: *Runtime, archive: []const u8, target_puuid: []const u8, max_games: usize, output: []u8) ?[]const u8 {
-    var owner: ?[]u8 = null;
-    if (self.storage) |*store| owner = store.get("matches", "currentPuuid") catch null;
-    defer if (owner) |value| std.heap.page_allocator.free(value);
-    var cutoff_buffer: [64]u8 = undefined;
-    var cutoff_writer = std.Io.Writer.fixed(&cutoff_buffer);
-    const now = runtimeNowMillis(self);
-    if (now > encounter_retention_ms) writeIsoTimestamp(&cutoff_writer, now - encounter_retention_ms) catch return null;
-    var limit = max_games;
-    while (limit > 0) {
-        if (encounter_service.queryArchive(archive, owner orelse "", target_puuid, cutoff_writer.buffered(), limit, output)) |response| {
-            return response;
-        } else |_| {
-            // The Native bridge owns a fixed response buffer. Preserve whole
-            // matches and reduce the page size instead of emitting partial JSON.
-            if (limit == 1) return null;
-            limit = @max(limit / 2, 1);
+fn cachedEncounterResponse(self: *Runtime, target_puuid: []const u8, max_games: usize, excluded_game_id: i64, output: []u8) ![]const u8 {
+    const store = if (self.storage) |*value| value else return copyJson("[]", output);
+    const saved_owner = try store.get("matches", "currentPuuid");
+    defer if (saved_owner) |value| std.heap.page_allocator.free(value);
+    const owner = if (self.live_owner_puuid_len > 0) self.live_owner_puuid[0..self.live_owner_puuid_len] else saved_owner orelse "";
+    if (owner.len == 0) return copyJson("[]", output);
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var histories: std.array_list.Managed([]const u8) = .init(arena.allocator());
+    defer for (histories.items) |value| std.heap.page_allocator.free(value);
+    var seen = std.StringHashMap(void).init(arena.allocator());
+    if (saved_owner != null and samePuuid(saved_owner.?, owner)) {
+        if (try store.get("matches", "current")) |history| {
+            histories.append(history) catch |err| {
+                std.heap.page_allocator.free(history);
+                return err;
+            };
         }
     }
-    return null;
+    try appendEncounterHistory(store, owner, &seen, &histories);
+    if (target_puuid.len > 0) {
+        try appendEncounterHistory(store, target_puuid, &seen, &histories);
+    }
+    if (self.live_lobby_len > 0) {
+        const lobby = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.live_lobby[0..self.live_lobby_len], .{});
+        for ([_][]const u8{ "ally", "enemy" }) |side| {
+            const players = if (lobby == .object) lobby.object.get(side) else null;
+            if (players) |list| if (list == .array) for (list.array.items) |player| {
+                try appendEncounterHistory(store, jsonField(player, "puuid"), &seen, &histories);
+            };
+        }
+    }
+    const catalog = try store.get("cache", "champions");
+    defer if (catalog) |value| std.heap.page_allocator.free(value);
+    // 桥接缓冲区不足时减少完整对局数量，不截断单局记录。
+    var limit = @min(max_games, 40);
+    while (true) {
+        return encounter_service.fromHistories(histories.items, owner, target_puuid, catalog orelse "[]", limit, excluded_game_id, output) catch |err| {
+            if (err != error.WriteFailed or limit <= 1) return err;
+            limit = @max(limit / 2, 1);
+            continue;
+        };
+    }
 }
 
-fn cachedEncounterResponse(self: *Runtime, target_puuid: []const u8, max_games: usize, output: []u8) ?[]const u8 {
-    const buffer = std.heap.page_allocator.alloc(u8, 1024 * 1024) catch return null;
-    defer std.heap.page_allocator.free(buffer);
-    const derived = cachedEncountersFromMatches(self, buffer) orelse return null;
-    return encounterArchiveResponse(self, derived, target_puuid, max_games, output);
+fn appendEncounterHistory(store: *storage.Store, puuid: []const u8, seen: *std.StringHashMap(void), histories: *std.array_list.Managed([]const u8)) !void {
+    if (puuid.len == 0) return;
+    const entry = try seen.getOrPut(puuid);
+    if (entry.found_existing) return;
+    if (try store.get("playerHistory", puuid)) |history| {
+        histories.append(history) catch |err| {
+            std.heap.page_allocator.free(history);
+            return err;
+        };
+    }
+}
+
+fn getMatchDetail(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = runtime(context);
+    const payload_json = parsePayload(struct { gameId: i64 = 0, platformId: []const u8 = "", selfPuuid: []const u8 = "", targetPuuid: []const u8 = "" }, invocation.request.payload) catch return error.InvalidRequest;
+    defer payload_json.deinit();
+    const payload = payload_json.value;
+    if (payload.gameId <= 0 or payload.selfPuuid.len == 0) return error.InvalidRequest;
+    if (self.live_owner_puuid_len > 0 and !samePuuid(payload.selfPuuid, self.live_owner_puuid[0..self.live_owner_puuid_len])) return error.AccountChanged;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const connection = try std.json.parseFromSliceLeaky(std.json.Value, allocator, self.connection[0..self.connection_len], .{});
+    const platform = firstPlatformId(&.{connection});
+    if (payload.platformId.len > 0 and platform.len > 0 and !std.ascii.eqlIgnoreCase(payload.platformId, platform)) return error.PlatformMismatch;
+    const catalog = if (self.storage) |*store| try store.get("cache", "champions") else null;
+    defer if (catalog) |value| std.heap.page_allocator.free(value);
+    if (self.storage) |*store| {
+        for ([_][]const u8{ payload.selfPuuid, payload.targetPuuid }) |puuid| {
+            if (puuid.len == 0) continue;
+            if (try store.get("playerHistory", puuid)) |history| {
+                defer std.heap.page_allocator.free(history);
+                if (cachedSingleMatch(history, payload.gameId, payload.selfPuuid, payload.targetPuuid, catalog orelse "[]", output)) |result| return result else |_| {}
+            }
+        }
+        const owner = try store.get("matches", "currentPuuid");
+        defer if (owner) |value| std.heap.page_allocator.free(value);
+        if (owner != null and samePuuid(owner.?, payload.selfPuuid)) if (try store.get("matches", "current")) |history| {
+            defer std.heap.page_allocator.free(history);
+            if (cachedSingleMatch(history, payload.gameId, payload.selfPuuid, payload.targetPuuid, catalog orelse "[]", output)) |result| return result else |_| {}
+        };
+    }
+    if (self.mode != .live) return error.MatchDetailUnavailable;
+    var client = try discoverClient(self, self.io orelse return error.LcuNotRunning);
+    defer client.deinit();
+    client.timeout_ms = @min(client.timeout_ms, player_enrichment_timeout_ms);
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "/lol-match-history/v1/games/{d}", .{payload.gameId});
+    if (client.get(path)) |json| {
+        defer std.heap.page_allocator.free(json);
+        const game = std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{}) catch std.json.Value{ .null = {} };
+        if (singleMatchDto(game, payload.gameId, payload.selfPuuid, payload.targetPuuid, catalog orelse "[]", "lcu", output)) |result| return result else |_| {}
+    } else |_| {}
+    if (prepareJungleSgpContext(self, client, allocator)) |sgp| {
+        if (payload.platformId.len > 0 and !std.ascii.eqlIgnoreCase(payload.platformId, sgp.platform_id)) return error.PlatformMismatch;
+        var url_buffer: [1024]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buffer, "https://{s}/match-history-query/v1/products/lol/{s}_{d}/SUMMARY", .{ sgp.host, sgp.platform_id, payload.gameId });
+        const json = try client.getBearerUrl(url, sgp.token, sgp_user_agent);
+        defer std.heap.page_allocator.free(json);
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+        const game = unwrapHistoryGame(allocator, value) orelse return error.MatchDetailUnavailable;
+        return singleMatchDto(game, payload.gameId, payload.selfPuuid, payload.targetPuuid, catalog orelse "[]", "sgp", output);
+    }
+    return error.MatchDetailUnavailable;
+}
+
+fn cachedSingleMatch(json: []const u8, game_id: i64, owner: []const u8, target: []const u8, catalog: []const u8, output: []u8) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{});
+    const games = historyGames(root) orelse return error.MatchDetailUnavailable;
+    for (games.array.items) |entry| {
+        const game = unwrapHistoryGame(arena.allocator(), entry) orelse continue;
+        if (jsonInt(game, "gameId") == game_id) return singleMatchDto(game, game_id, owner, target, catalog, "sqlite-fresh", output);
+    }
+    return error.MatchDetailUnavailable;
+}
+
+fn singleMatchDto(game: std.json.Value, game_id: i64, owner: []const u8, target: []const u8, catalog: []const u8, source: []const u8, output: []u8) ![]const u8 {
+    if (game != .object or jsonInt(game, "gameId") != game_id) return error.MatchDetailUnavailable;
+    const participants = game.object.get("participants") orelse return error.MatchDetailUnavailable;
+    if (participants != .array or participants.array.items.len < 2) return error.MatchDetailUnavailable;
+    var has_owner = false;
+    var has_target = target.len == 0;
+    for (participants.array.items) |participant| {
+        const identity = participantIdentityForId(game, jsonInt(participant, "participantId"));
+        const player = if (identity) |value| nestedObject(value, "player") orelse value else std.json.Value{ .null = {} };
+        const puuid = if (jsonField(participant, "puuid").len > 0) jsonField(participant, "puuid") else if (jsonField(participant, "playerPuuid").len > 0) jsonField(participant, "playerPuuid") else jsonField(player, "puuid");
+        if (samePuuid(puuid, owner)) has_owner = true;
+        if (samePuuid(puuid, target)) has_target = true;
+    }
+    if (!has_owner or !has_target) return error.MatchDetailUnavailable;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var list = std.json.Array.init(allocator);
+    try list.append(game);
+    const history = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .array = list }, .{});
+    const dto_buffer = try allocator.alloc(u8, live_lobby_capacity);
+    const dto = try matchHistoryDtoPage(history, catalog, owner, 0, 1, dto_buffer);
+    const mapped = try std.json.parseFromSliceLeaky(std.json.Value, allocator, dto, .{});
+    if (mapped != .array or mapped.array.items.len != 1) return error.MatchDetailUnavailable;
+    var result = mapped.array.items[0];
+    if (result.object.getPtr("dataStatus")) |status| if (status.* == .object) {
+        try status.object.put(allocator, "source", .{ .string = source });
+    };
+    var writer = std.Io.Writer.fixed(output);
+    var stringify = std.json.Stringify{ .writer = &writer, .options = .{} };
+    try stringify.write(result);
+    return writer.buffered();
 }
 
 fn getEncounters(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
-    const payload = parsePayload(struct { puuid: ?[]const u8 = null, limitGames: i64 = 100 }, invocation.request.payload) catch return error.InvalidRequest;
-    const target_puuid = payload.puuid orelse "";
-    const max_games: usize = @intCast(std.math.clamp(payload.limitGames, @as(i64, 1), @as(i64, 100)));
-    // A previous native build wrote an empty encounter snapshot before the
-    // first live history request completed. Treat an empty snapshot as a
-    // miss, otherwise the homepage can remain blank forever after that first
-    // failed request. Live mode always refreshes from LCU first and only uses
-    // a non-empty snapshot as a fallback.
-    var cached: ?[]u8 = null;
-    if (self.storage) |*store| cached = store.get("history", "encounters") catch null;
-    defer if (cached) |value| std.heap.page_allocator.free(value);
-    if (self.io) |io| {
-        if (std.Io.Dir.cwd().readFileAlloc(io, self.encountersPath(), std.heap.page_allocator, .limited(4 * 1024 * 1024))) |value| {
-            if (value.len > 2) {
-                if (cached == null) cached = value else std.heap.page_allocator.free(value);
-            } else {
-                std.heap.page_allocator.free(value);
-            }
-        } else |_| {}
-        if (self.mode == .live) {
-            if (discoverClient(self, io)) |client_value| {
-                var client = client_value;
-                defer client.deinit();
-                const me = client.get("/lol-summoner/v1/current-summoner") catch {
-                    if (cachedEncounterResponse(self, target_puuid, max_games, output)) |derived| return derived;
-                    if (cached) |value| if (value.len > 2) return encounterArchiveResponse(self, value, target_puuid, max_games, output) orelse std.fmt.bufPrint(output, "[]", .{});
-                    return std.fmt.bufPrint(output, "[]", .{});
-                };
-                defer std.heap.page_allocator.free(me);
-                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-                defer arena.deinit();
-                const me_value = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), me, .{}) catch return error.LcuInvalidResponse;
-                const puuid = if (me_value == .object) jsonField(me_value, "puuid") else "";
-                if (puuid.len > 0) {
-                    if (self.storage) |*store| store.put("matches", "currentPuuid", puuid) catch {};
-                    var history_path: [512]u8 = undefined;
-                    const path = std.fmt.bufPrint(&history_path, "/lol-match-history/v1/products/lol/{s}/matches?begIndex=0&endIndex=20", .{puuid}) catch return error.LcuInvalidResponse;
-                    const lcu_history: ?[]u8 = client.get(path) catch null;
-                    defer if (lcu_history) |history| std.heap.page_allocator.free(history);
-                    const sgp_history: ?[]u8 = fetchSgpHistory(client, me_value, lcu_history orelse "{}", puuid, 0, 20) catch null;
-                    defer if (sgp_history) |history| std.heap.page_allocator.free(history);
-                    const history = preferredHistory(lcu_history, sgp_history) orelse {
-                        if (cachedEncounterResponse(self, target_puuid, max_games, output)) |derived| return derived;
-                        if (cached) |value| if (value.len > 2) return encounterArchiveResponse(self, value, target_puuid, max_games, output) orelse std.fmt.bufPrint(output, "[]", .{});
-                        return std.fmt.bufPrint(output, "[]", .{});
-                    };
-                    if (self.storage) |*store| {
-                        store.put("matches", "current", history) catch {};
-                        store.put("matches", "currentPuuid", puuid) catch {};
-                    }
-                    const encounter_catalog = if (self.storage) |*store| store.get("cache", "champions") catch null else null;
-                    defer if (encounter_catalog) |value| std.heap.page_allocator.free(value);
-                    const derived_buffer = std.heap.page_allocator.alloc(u8, 1024 * 1024) catch return error.ResponseTooLarge;
-                    defer std.heap.page_allocator.free(derived_buffer);
-                    const derived = encounter_service.fromHistory(history, puuid, encounter_catalog orelse "[]", derived_buffer) catch return error.LcuInvalidResponse;
-                    if (derived.len > 2) {
-                        _ = updateEncounterArchive(self, derived, null);
-                        if (self.storage) |*store| {
-                            const latest = store.get("history", "encounters") catch null;
-                            defer if (latest) |value| std.heap.page_allocator.free(value);
-                            if (latest) |archive| if (encounterArchiveResponse(self, archive, target_puuid, max_games, output)) |response| return response;
-                        }
-                        return encounterArchiveResponse(self, derived, target_puuid, max_games, output) orelse std.fmt.bufPrint(output, "[]", .{});
-                    }
-                    if (cachedEncounterResponse(self, target_puuid, max_games, output)) |fallback| return fallback;
-                    if (cached) |value| if (value.len > 2) return encounterArchiveResponse(self, value, target_puuid, max_games, output) orelse std.fmt.bufPrint(output, "[]", .{});
-                    return std.fmt.bufPrint(output, "[]", .{});
-                }
-            } else |_| {}
-        }
-    }
-    if (cachedEncounterResponse(self, target_puuid, max_games, output)) |derived| return derived;
-    if (cached) |value| if (value.len > 2) return encounterArchiveResponse(self, value, target_puuid, max_games, output) orelse std.fmt.bufPrint(output, "[]", .{});
-    return std.fmt.bufPrint(output, "[]", .{});
+    const payload_json = parsePayload(struct { puuid: ?[]const u8 = null, limitGames: i64 = 40, excludeGameId: i64 = 0 }, invocation.request.payload) catch return error.InvalidRequest;
+    defer payload_json.deinit();
+    const payload = payload_json.value;
+    const limit: usize = @intCast(std.math.clamp(payload.limitGames, @as(i64, 1), @as(i64, 40)));
+    return cachedEncounterResponse(self, payload.puuid orelse "", limit, payload.excludeGameId, output);
 }
 
 fn getFriends(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
@@ -1846,7 +2727,9 @@ fn cachedFriendLastGame(self: *Runtime, puuid: []const u8) ?[]u8 {
 
 fn getFriendLastGame(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
-    const payload = parsePayload(struct { puuid: []const u8 = "", force: bool = false }, invocation.request.payload) catch return error.InvalidRequest;
+    const payload_json = parsePayload(struct { puuid: []const u8 = "", force: bool = false }, invocation.request.payload) catch return error.InvalidRequest;
+    defer payload_json.deinit();
+    const payload = payload_json.value;
     if (payload.puuid.len == 0) return error.InvalidRequest;
     if (!payload.force) if (self.storage) |*store| {
         const updated_at = store.getUpdatedAt("friendLastGame", payload.puuid) catch null;
@@ -1928,58 +2811,23 @@ fn unwrapHistoryGame(allocator: std.mem.Allocator, entry: std.json.Value) ?std.j
 
 fn deleteFriend(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
-    const payload = parsePayload(struct { id: []const u8 = "" }, invocation.request.payload) catch return error.InvalidRequest;
+    const payload_json = parsePayload(struct { id: []const u8 = "" }, invocation.request.payload) catch return error.InvalidRequest;
+    defer payload_json.deinit();
+    const payload = payload_json.value;
     if (self.mode != .live or payload.id.len == 0 or std.mem.indexOfScalar(u8, payload.id, '/') != null) return error.InvalidRequest;
     const io = self.io orelse return error.LcuNotRunning;
     var client = discoverClient(self, io) catch return error.LcuNotRunning;
     defer client.deinit();
     var path_buffer: [512]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buffer, "/lol-chat/v1/friends/{s}", .{payload.id}) catch return error.InvalidRequest;
-    const response = client.delete(path) catch return error.LcuRequestFailed;
+    try verifyActionAccount(self, client);
+    const response = try client.delete(path);
     defer std.heap.page_allocator.free(response);
     return std.fmt.bufPrint(output, "{{\"deleted\":true}}", .{});
 }
 
 fn cachedEncountersFromMatches(self: *Runtime, output: []u8) ?[]const u8 {
-    const store = if (self.storage) |*value| value else return null;
-    const history = (store.get("matches", "current") catch return null) orelse return null;
-    defer std.heap.page_allocator.free(history);
-    const puuid = (store.get("matches", "currentPuuid") catch return null) orelse return null;
-    defer std.heap.page_allocator.free(puuid);
-    const catalog = store.get("cache", "champions") catch null;
-    defer if (catalog) |value| std.heap.page_allocator.free(value);
-    const derived = encounter_service.fromHistory(history, puuid, catalog orelse "[]", output) catch return null;
-    if (derived.len > 2) return updateEncounterArchive(self, derived, output) orelse derived;
-    return derived;
-}
-
-fn persistEncountersFromHistory(self: *Runtime, history: []const u8, puuid: []const u8) void {
-    const buffer = std.heap.page_allocator.alloc(u8, 1024 * 1024) catch return;
-    defer std.heap.page_allocator.free(buffer);
-    const catalog = if (self.storage) |*store| store.get("cache", "champions") catch null else null;
-    defer if (catalog) |value| std.heap.page_allocator.free(value);
-    const derived = encounter_service.fromHistory(history, puuid, catalog orelse "[]", buffer) catch return;
-    if (derived.len > 2) _ = updateEncounterArchive(self, derived, null);
-}
-
-fn updateEncounterArchive(self: *Runtime, newest: []const u8, output: ?[]u8) ?[]const u8 {
-    const store = if (self.storage) |*value| value else return null;
-    const existing = store.get("history", "encounters") catch null;
-    defer if (existing) |value| std.heap.page_allocator.free(value);
-    var cutoff_buffer: [64]u8 = undefined;
-    var cutoff_writer = std.Io.Writer.fixed(&cutoff_buffer);
-    const now = runtimeNowMillis(self);
-    if (now > encounter_retention_ms) writeIsoTimestamp(&cutoff_writer, now - encounter_retention_ms) catch return null;
-    const merged_buffer = std.heap.page_allocator.alloc(u8, 4 * 1024 * 1024) catch return null;
-    defer std.heap.page_allocator.free(merged_buffer);
-    const owner = store.get("matches", "currentPuuid") catch null;
-    defer if (owner) |value| std.heap.page_allocator.free(value);
-    const merged = encounter_service.mergeArchive(existing orelse "[]", newest, owner orelse "", cutoff_writer.buffered(), merged_buffer) catch return null;
-    store.put("history", "encounters", merged) catch return null;
-    const destination = output orelse return null;
-    if (merged.len > destination.len) return null;
-    @memcpy(destination[0..merged.len], merged);
-    return destination[0..merged.len];
+    return cachedEncounterResponse(self, "", 40, lobbyGameId(self.live_lobby[0..self.live_lobby_len]), output) catch null;
 }
 
 fn mergeEncounterArchive(existing_json: []const u8, newest_json: []const u8, cutoff_iso: []const u8, output: []u8) ![]const u8 {
@@ -2227,7 +3075,9 @@ fn getBpHistory(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
 
 fn saveMatchExport(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
-    const payload = parsePayload(struct { gameId: i64 = 0, format: []const u8 = "json", content: []const u8 = "" }, invocation.request.payload) catch return error.InvalidExport;
+    const payload_json = parsePayload(struct { gameId: i64 = 0, format: []const u8 = "json", content: []const u8 = "" }, invocation.request.payload) catch return error.InvalidExport;
+    defer payload_json.deinit();
+    const payload = payload_json.value;
     if (self.io) |io| {
         var export_dir: [512]u8 = undefined;
         const export_path = native_sdk.app_dirs.join(native_sdk.app_dirs.currentPlatform(), &export_dir, &.{ self.dataDir(), "exports" }) catch return error.ExportFailed;
@@ -2262,12 +3112,16 @@ fn resolveShortcutLobby(self: *Runtime, context: *anyopaque, invocation: native_
         }
     }
     if (best != null and best_count > 0) return best.?;
-    return getLiveLobbyInternal(context, invocation, output, true);
+    return getLiveLobby(context, invocation, output);
 }
 
 fn sendShortcut(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
-    const payload = parsePayload(struct { shortcutId: []const u8 = "", premadeSide: ?[]const u8 = null }, invocation.request.payload) catch return error.InvalidShortcut;
+    const payload_json = parsePayload(struct { shortcutId: []const u8 = "", premadeSide: ?[]const u8 = null }, invocation.request.payload) catch return error.InvalidShortcut;
+    defer payload_json.deinit();
+    const payload = payload_json.value;
+    hotkey_service.beginSend(payload.shortcutId);
+    defer hotkey_service.endSend();
     if (self.mode != .live) {
         if (shortcutUsesEncounter(self, payload.shortcutId)) return std.fmt.bufPrint(output, "[]", .{});
         return shortcut_service.buildLines(
@@ -2291,10 +3145,7 @@ fn sendShortcut(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
         const lobby_buffer = std.heap.page_allocator.alloc(u8, live_lobby_capacity) catch return error.ShortcutUnavailable;
         defer std.heap.page_allocator.free(lobby_buffer);
         var lobby_json = resolveShortcutLobby(self, context, invocation, lobby_buffer) catch return error.ShortcutUnavailable;
-        // A champ-select snapshot commonly has no summoner-spell fields. For
-        // jungle-aware shortcuts, refresh the lightweight live roster before
-        // rendering so Smite detection cannot fall back to an old first-slot
-        // snapshot after the game has started.
+        // 选人快照可能没有召唤师技能；打野消息先补轻量阵容，避免错误定位玩家。
         var fresh_jungle_lobby: ?[]u8 = null;
         var fresh_jungle_merged: ?[]u8 = null;
         defer if (fresh_jungle_lobby) |value| std.heap.page_allocator.free(value);
@@ -2304,11 +3155,7 @@ fn sendShortcut(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
             if (fresh_jungle_lobby) |buffer| {
                 if (getLiveLobbyInternal(context, invocation, buffer, false)) |fresh| {
                     if (lobbyRosterCount(fresh) >= lobbyRosterCount(lobby_json)) {
-                        // Keep the enriched snapshot's spell/position fields
-                        // when the fast response only contains slot and
-                        // champion data. Replacing equal-sized arrays here
-                        // was the last path that made jungle targeting fall
-                        // back to the first player.
+                        // 快速响应字段不足时保留已获取的技能与位置。
                         fresh_jungle_merged = std.heap.page_allocator.alloc(u8, live_lobby_capacity) catch null;
                         if (fresh_jungle_merged) |merged_buffer| {
                             lobby_json = mergeLiveLobbySnapshots(lobby_json, fresh, false, merged_buffer) catch fresh;
@@ -2324,18 +3171,22 @@ fn sendShortcut(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
         const shortcut_lobby = prepareJungleShortcutLobby(self, client, payload.shortcutId, lobby_json, analyzed_lobby_buffer) catch lobby_json;
         var lines_buffer: [128 * 1024]u8 = undefined;
         const lines_json = if (shortcutUsesEncounter(self, payload.shortcutId)) blk: {
-            const archive = if (self.storage) |*store| store.get("history", "encounters") catch null else null;
-            defer if (archive) |value| std.heap.page_allocator.free(value);
+            const encounter_buffer = try std.heap.page_allocator.alloc(u8, 1024 * 1024);
+            defer std.heap.page_allocator.free(encounter_buffer);
+            const archive = cachedEncountersFromMatches(self, encounter_buffer);
             const owner = if (self.storage) |*store| store.get("matches", "currentPuuid") catch null else null;
             defer if (owner) |value| std.heap.page_allocator.free(value);
-            break :blk shortcut_service.buildEncounterLinesOwned(archive orelse "[]", shortcut_lobby, owner orelse "", &lines_buffer) catch return error.InvalidShortcut;
+            const current_owner = if (self.live_owner_puuid_len > 0) self.live_owner_puuid[0..self.live_owner_puuid_len] else owner orelse "";
+            break :blk shortcut_service.buildEncounterLinesOwned(archive orelse "[]", shortcut_lobby, current_owner, &lines_buffer) catch return error.InvalidShortcut;
         } else shortcut_service.buildLines(self.config[0..self.config_len], payload.shortcutId, shortcut_lobby, phase, .{ .premade_side = payload.premadeSide }, &lines_buffer) catch return error.InvalidShortcut;
         const lines = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), lines_json, .{}) catch return error.InvalidShortcut;
         if (lines != .array or lines.array.items.len == 0) return error.ShortcutUnavailable;
         const cfg = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.config[0..self.config_len], .{}) catch return error.InvalidConfig;
         const interval_ms = std.math.clamp(configAutomationInt(cfg, "shortcutSendIntervalMs", 250), @as(i64, 250), @as(i64, 5000));
+        const protect_input = if (configAutomation(cfg)) |automation| if (automation.object.get("protectChatInput")) |value| value != .bool or value.bool else true else true;
+        try verifyActionAccount(self, client);
         if (std.mem.eql(u8, phase, "InProgress") or std.mem.eql(u8, phase, "GameStart")) {
-            native_input.sendChatLines(io, lines, interval_ms) catch |err| return err;
+            try native_input.sendChatLines(io, lines, interval_ms, protect_input, snapshotControl(self));
             return copyJson(lines_json, output);
         }
         if (!std.mem.eql(u8, phase, "ChampSelect") and !std.mem.eql(u8, phase, "ReadyCheck")) return error.ShortcutUnavailable;
@@ -2343,30 +3194,13 @@ fn sendShortcut(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
         defer std.heap.page_allocator.free(conversations_json);
         const conversations = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), conversations_json, .{}) catch return error.LcuInvalidResponse;
         const conversation_id = findConversationId(conversations, "championSelect") orelse return error.ChatUnavailable;
-        var response = std.Io.Writer.fixed(output);
-        try response.writeByte('[');
-        var first = true;
-        for (lines.array.items) |line| {
-            if (line != .string or line.string.len == 0) continue;
-            if (!first) {
-                try response.writeByte(',');
-                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(interval_ms), .awake) catch {};
-            }
-            var body: [32 * 1024]u8 = undefined;
-            var body_writer = std.Io.Writer.fixed(&body);
-            try body_writer.writeAll("{\"body\":");
-            try jsonString(&body_writer, line.string);
-            try body_writer.writeAll(",\"type\":\"chat\"}");
-            const body_json = body_writer.buffered();
-            var endpoint: [512]u8 = undefined;
-            const path = std.fmt.bufPrint(&endpoint, "/lol-chat/v1/conversations/{s}/messages", .{conversation_id}) catch return error.ResponseTooLarge;
-            const sent = client.post(path, body_json) catch return error.LcuRequestFailed;
-            std.heap.page_allocator.free(sent);
-            try jsonString(&response, line.string);
-            first = false;
-        }
-        try response.writeByte(']');
-        return response.buffered();
+        const body_json = try shortcut_service.chatMessageBody(lines, arena.allocator());
+        var endpoint: [512]u8 = undefined;
+        const path = std.fmt.bufPrint(&endpoint, "/lol-chat/v1/conversations/{s}/messages", .{conversation_id}) catch return error.ResponseTooLarge;
+        // 选人阶段合并成一次聊天请求，避免多次等待期间会话发生切换。
+        const sent = try client.post(path, body_json);
+        std.heap.page_allocator.free(sent);
+        return copyJson(lines_json, output);
     }
     return error.LcuNotRunning;
 }
@@ -2403,10 +3237,7 @@ fn runAutomation(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
     const self = runtime(context);
     _ = invocation;
     const io = self.io orelse return error.LcuNotRunning;
-    // This handler is allowed to run without the bridge worker's global
-    // command lock. Take a coherent config snapshot before the network work
-    // so save_config can proceed while ReadyCheck or champion-select is
-    // waiting on LCU.
+    // 网络期间只使用一致的配置快照，不占用状态通道的锁。
     var config_snapshot: [65536]u8 = undefined;
     var config_len: usize = 0;
     lockBackendMutex(&self.command_mutex);
@@ -2416,11 +3247,17 @@ fn runAutomation(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
     }
     config_len = self.config_len;
     @memcpy(config_snapshot[0..config_len], self.config[0..config_len]);
+    var guard = AutomationGuard{ .parent = self, .generation = self.request_generation, .config_hash = std.hash.Wyhash.hash(0, config_snapshot[0..config_len]) };
     self.command_mutex.unlock();
 
     lockBackendMutex(&self.automation_mutex);
     defer self.automation_mutex.unlock();
     const client = self.ensureAutomationClient(io, config_snapshot[0..config_len]) catch return error.LcuNotRunning;
+    client.control = .{ .context = &guard, .check_fn = AutomationGuard.check };
+    client.lane = .action;
+    defer if (self.automation_client) |*retained| {
+        retained.control = .{};
+    };
     return automation_service.run(io, client.*, config_snapshot[0..config_len], output) catch |err| {
         if (isAutomationClientFailure(err)) self.dropAutomationClient();
         return err;
@@ -2429,7 +3266,9 @@ fn runAutomation(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
 
 fn previewShortcut(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
-    const payload = parsePayload(struct { shortcutId: []const u8 = "" }, invocation.request.payload) catch return error.InvalidShortcut;
+    const payload_json = parsePayload(struct { shortcutId: []const u8 = "" }, invocation.request.payload) catch return error.InvalidShortcut;
+    defer payload_json.deinit();
+    const payload = payload_json.value;
     const lobby_buffer = std.heap.page_allocator.alloc(u8, live_lobby_capacity) catch return error.ShortcutUnavailable;
     defer std.heap.page_allocator.free(lobby_buffer);
     var client_value: ?lcu.Client = null;
@@ -2451,8 +3290,9 @@ fn previewShortcut(context: *anyopaque, invocation: native_sdk.bridge.Invocation
     const lobby = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), shortcut_lobby, .{}) catch return error.InvalidShortcut;
     const phase = if (jsonField(lobby, "phase").len > 0) jsonField(lobby, "phase") else if (self.mode == .replay) "Replay" else "Fixture";
     if (shortcutUsesEncounter(self, payload.shortcutId)) {
-        const archive = if (self.storage) |*store| store.get("history", "encounters") catch null else null;
-        defer if (archive) |value| std.heap.page_allocator.free(value);
+        const encounter_buffer = try std.heap.page_allocator.alloc(u8, 1024 * 1024);
+        defer std.heap.page_allocator.free(encounter_buffer);
+        const archive = cachedEncountersFromMatches(self, encounter_buffer);
         const owner = if (self.storage) |*store| store.get("matches", "currentPuuid") catch null else null;
         defer if (owner) |value| std.heap.page_allocator.free(value);
         return shortcut_service.buildEncounterLinesOwned(archive orelse "[]", shortcut_lobby, owner orelse "", output);
@@ -2516,7 +3356,7 @@ fn prepareJungleShortcutLobby(self: *Runtime, client: lcu.Client, shortcut_id: [
 
 fn prepareJungleSgpContext(self: *Runtime, client: lcu.Client, allocator: std.mem.Allocator) ?JungleSgpContext {
     const connection = std.json.parseFromSliceLeaky(std.json.Value, allocator, self.connection[0..self.connection_len], .{}) catch std.json.Value{ .null = {} };
-    var platform_id = firstPlatformId(&.{connection});
+    var platform_id = if (self.cache_platform_len > 0) self.cache_platform[0..self.cache_platform_len] else firstPlatformId(&.{connection});
     if (platform_id.len == 0) {
         const current_json = client.get("/lol-summoner/v1/current-summoner") catch return null;
         defer std.heap.page_allocator.free(current_json);
@@ -2622,7 +3462,7 @@ fn addJungleGameDetails(self: *Runtime, client: lcu.Client, sgp_context: ?Jungle
     return aggregate.addTimeline(timeline, participant_id);
 }
 
-fn enrichRecentGankMetrics(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, recent_json: []const u8, puuid: []const u8, output: []u8) !?[]const u8 {
+fn enrichRecentGankMetrics(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, recent_json: []const u8, puuid: []const u8, output: []u8, allow_network: bool) !?[]const u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2637,7 +3477,7 @@ fn enrichRecentGankMetrics(self: *Runtime, client: lcu.Client, sgp_context: ?Jun
             jsonInt(match.*, "durationMinutes") <= 0 or
             isJunglePosition(jsonField(match.*, "position"))) continue;
         inspected += 1;
-        const metric = earlyDeathGankMetric(self, client, sgp_context, jsonInt(match.*, "gameId"), puuid) orelse continue;
+        const metric = earlyDeathGankMetric(self, client, sgp_context, jsonInt(match.*, "gameId"), puuid, allow_network) orelse continue;
         try match.object.put(allocator, "earlyDeathsWithEnemyJungler", .{ .integer = @intCast(metric) });
         samples += 1;
     }
@@ -2649,7 +3489,7 @@ fn enrichRecentGankMetrics(self: *Runtime, client: lcu.Client, sgp_context: ?Jun
     return writer.buffered();
 }
 
-fn earlyDeathGankMetric(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, game_id: i64, puuid: []const u8) ?usize {
+fn earlyDeathGankMetric(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, game_id: i64, puuid: []const u8, allow_network: bool) ?usize {
     var metric_key_buffer: [256]u8 = undefined;
     const metric_key = std.fmt.bufPrint(&metric_key_buffer, "{d}:{s}", .{ game_id, puuid }) catch return null;
     if (self.storage) |*store| if (store.get("gankMetric", metric_key) catch null) |cached| {
@@ -2667,6 +3507,8 @@ fn earlyDeathGankMetric(self: *Runtime, client: lcu.Client, sgp_context: ?Jungle
             return metric;
         }
     };
+
+    if (!allow_network) return null;
 
     if (sgp_context) |sgp| {
         var url_buffer: [2048]u8 = undefined;
@@ -2703,7 +3545,9 @@ fn cacheGankMetric(self: *Runtime, key: []const u8, metric: usize) void {
 
 fn validateShortcut(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     _ = context;
-    const parsed = parsePayload(TemplatePayload, invocation.request.payload) catch return error.InvalidTemplate;
+    const parsed_json = parsePayload(TemplatePayload, invocation.request.payload) catch return error.InvalidTemplate;
+    defer parsed_json.deinit();
+    const parsed = parsed_json.value;
     return shortcut_service.validationDto(parsed.template, output);
 }
 
@@ -2789,11 +3633,10 @@ fn getShortcutEvents(context: *anyopaque, invocation: native_sdk.bridge.Invocati
 }
 
 fn copyJson(value: []const u8, output: []u8) ![]const u8 {
-    _ = std.json.parseFromSliceLeaky(std.json.Value, std.heap.page_allocator, value, .{}) catch return error.LcuInvalidResponse;
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, value, .{}) catch return error.LcuInvalidResponse;
+    defer parsed.deinit();
     if (value.len > output.len) return error.ResponseTooLarge;
-    // Envelope builders commonly return a slice of `output` and then pass it
-    // through a cache merge. A different-game branch may therefore copy a
-    // buffer onto itself; memmove also covers partial overlap.
+    // 阵容合并可能复用输出缓冲区，允许源数据与目标部分重叠。
     @memmove(output[0..value.len], value);
     return output[0..value.len];
 }
@@ -2914,8 +3757,15 @@ fn matchPerformance(win: bool, kills: i64, deaths: i64, assists: i64, damage_sha
     const kda = @as(f64, @floatFromInt(kills + assists)) / @as(f64, @floatFromInt(@max(deaths, 1)));
     if (win and (kda >= 4 or damage_share >= 0.3)) return "carry";
     if (!win and kda < 1.5 and damage_share < 0.18) return "struggling";
-    if (!win) return "carried";
+    if (!win) return "solid";
     return "solid";
+}
+
+test "lost matches are never classified as carried" {
+    try std.testing.expectEqualStrings("solid", matchPerformance(false, 8, 3, 7, 0.28));
+    try std.testing.expectEqualStrings("struggling", matchPerformance(false, 1, 8, 2, 0.12));
+    try std.testing.expectEqualStrings("solid", matchPerformance(true, 1, 4, 4, 0.12));
+    try std.testing.expectEqualStrings("carry", matchPerformance(true, 8, 2, 9, 0.31));
 }
 
 /// Keep the live payload's team summaries compatible with the Rust analysis
@@ -2981,7 +3831,7 @@ fn writeLiveTeamSummary(writer: *std.Io.Writer, side: []const u8, players_json: 
             try jsonString(writer, value);
         }
     }
-    try writer.writeAll("],\"composition\":{\"early\":0,\"mid\":0,\"late\":0,\"teamfight\":0}}");
+    try writer.writeAll("],\"composition\":null}");
 }
 
 fn writeBanNames(writer: *std.Io.Writer, game: std.json.Value, catalog: std.json.Value) !void {
@@ -3250,6 +4100,22 @@ fn matchHistoryDtoPage(json: []const u8, catalog_json: []const u8, self_puuid: [
 }
 
 fn matchHistoryDtoPageFiltered(json: []const u8, catalog_json: []const u8, self_puuid: []const u8, offset: usize, limit: usize, hide_unfinished: bool, output: []u8) ![]const u8 {
+    return matchHistoryDtoPageWithFilters(json, catalog_json, self_puuid, offset, limit, hide_unfinished, false, output);
+}
+
+fn runtimeRankedOnly(self: *Runtime) bool {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const config = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.config[0..self.config_len], .{}) catch return false;
+    return jsonBool(nestedObject(config, "providers") orelse .null, "rankedOnly");
+}
+
+fn isRankedHistoryGame(game: std.json.Value) bool {
+    const queue = jsonInt(game, "queueId");
+    return queue == 420 or queue == 440;
+}
+
+fn matchHistoryDtoPageWithFilters(json: []const u8, catalog_json: []const u8, self_puuid: []const u8, offset: usize, limit: usize, hide_unfinished: bool, ranked_only: bool, output: []u8) ![]const u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -3274,6 +4140,7 @@ fn matchHistoryDtoPageFiltered(json: []const u8, catalog_json: []const u8, self_
         } else entry else entry;
         if (game != .object) continue;
         if (hide_unfinished and isHiddenHistoryGame(game)) continue;
+        if (ranked_only and !isRankedHistoryGame(game)) continue;
         const current_index = game_index;
         game_index += 1;
         if (current_index < offset) continue;
@@ -3522,11 +4389,18 @@ fn riotIdentity(value: std.json.Value) RiotIdentity {
 fn identityPuuid(value: std.json.Value) []const u8 {
     if (value != .object) return "";
     for ([_][]const u8{ "puuid", "obfuscatedPuuid", "botUuid", "botId" }) |field| {
-        if (jsonField(value, field).len > 0) return jsonField(value, field);
+        const id = jsonField(value, field);
+        if (!isEmptyPlayerIdentity(id)) return id;
     }
     if (nestedObject(value, "summoner")) |summoner| return identityPuuid(summoner);
     if (nestedObject(value, "player")) |player| return identityPuuid(player);
     return "";
+}
+
+fn isEmptyPlayerIdentity(value: []const u8) bool {
+    const id = std.mem.trim(u8, value, " \t\r\n");
+    return id.len == 0 or std.mem.eql(u8, id, "0") or
+        std.mem.eql(u8, id, "00000000-0000-0000-0000-000000000000");
 }
 
 const puuid_obfuscation_key = [_]u8{ 0x81, 0x70, 0x76, 0xa9, 0xf4, 0x51, 0x50, 0x9b, 0x95, 0x98, 0x68, 0x13, 0xce, 0x91, 0x17, 0xe7 };
@@ -3537,13 +4411,13 @@ const puuid_obfuscation_key = [_]u8{ 0x81, 0x70, 0x76, 0xa9, 0xf4, 0x51, 0x50, 0
 fn resolvedIdentityPuuid(value: std.json.Value, buffer: *[36]u8) []const u8 {
     if (value != .object) return "";
     const direct = jsonField(value, "puuid");
-    if (direct.len > 0) return direct;
+    if (!isEmptyPlayerIdentity(direct)) return direct;
     for ([_][]const u8{ "botUuid", "botId" }) |field| {
         const bot_id = jsonField(value, field);
         if (bot_id.len > 0) return bot_id;
     }
     const obfuscated = jsonField(value, "obfuscatedPuuid");
-    if (obfuscated.len > 0) return deobfuscatePuuid(obfuscated, buffer) orelse "";
+    if (!isEmptyPlayerIdentity(obfuscated)) return deobfuscatePuuid(obfuscated, buffer) orelse "";
     if (nestedObject(value, "summoner")) |summoner| {
         const nested = resolvedIdentityPuuid(summoner, buffer);
         if (nested.len > 0) return nested;
@@ -3912,12 +4786,34 @@ fn liveClientEnvelope(self: *Runtime, client: lcu.Client, live_json: []const u8,
     const enemy_json = std.heap.page_allocator.alloc(u8, 512 * 1024) catch return error.ResponseTooLarge;
     defer std.heap.page_allocator.free(enemy_json);
     const sgp_context = if (enrich) prepareJungleSgpContext(self, client, allocator) else null;
-    var ally_writer = std.Io.Writer.fixed(ally_json);
-    try writeLiveClientProfiles(self, client, sgp_context, &ally_writer, players, current_team, true, current, catalog, enrich);
-    const ally_value = ally_writer.buffered();
-    var enemy_writer = std.Io.Writer.fixed(enemy_json);
-    try writeLiveClientProfiles(self, client, sgp_context, &enemy_writer, players, current_team, false, current, catalog, enrich);
-    const enemy_value = enemy_writer.buffered();
+    var ally_len: usize = 0;
+    var enemy_len: usize = 0;
+    if (enrich) {
+        var team_jobs = [_]LiveProfileTeamJob{
+            liveProfileTeamJob(self, client, sgp_context, players, current_team, true, current, catalog, ally_json),
+            liveProfileTeamJob(self, client, sgp_context, players, current_team, false, current, catalog, enemy_json),
+        };
+        var team_threads = [_]?std.Thread{ null, null };
+        for (&team_jobs, 0..) |*job, index| {
+            team_threads[index] = std.Thread.spawn(.{}, runLiveProfileTeamJob, .{job}) catch blk: {
+                runLiveProfileTeamJob(job);
+                break :blk null;
+            };
+        }
+        for (team_threads) |thread| if (thread) |worker| worker.join();
+        for (team_jobs) |job| if (job.failure) |err| return err;
+        ally_len = team_jobs[0].output_len;
+        enemy_len = team_jobs[1].output_len;
+    } else {
+        var ally_writer = std.Io.Writer.fixed(ally_json);
+        try writeLiveClientProfiles(self, client, sgp_context, &ally_writer, players, current_team, true, current, catalog, false);
+        ally_len = ally_writer.buffered().len;
+        var enemy_writer = std.Io.Writer.fixed(enemy_json);
+        try writeLiveClientProfiles(self, client, sgp_context, &enemy_writer, players, current_team, false, current, catalog, false);
+        enemy_len = enemy_writer.buffered().len;
+    }
+    const ally_value = ally_json[0..ally_len];
+    const enemy_value = enemy_json[0..enemy_len];
 
     const game_data = nestedObject(root, "gameData") orelse std.json.Value{ .null = {} };
     const session_game_data = nestedObject(session, "gameData") orelse std.json.Value{ .null = {} };
@@ -3926,8 +4822,6 @@ fn liveClientEnvelope(self: *Runtime, client: lcu.Client, live_json: []const u8,
     const raw_mode = if (jsonField(game_data, "gameMode").len > 0) jsonField(game_data, "gameMode") else if (jsonField(queue, "gameMode").len > 0) jsonField(queue, "gameMode") else if (jsonField(session, "gameMode").len > 0) jsonField(session, "gameMode") else if (jsonField(root, "gameMode").len > 0) jsonField(root, "gameMode") else "League of Legends";
     const mode = queueNameFromCatalog(queue_catalog, queue_id, raw_mode);
     const game_id = if (jsonInt(session_game_data, "gameId") > 0) jsonInt(session_game_data, "gameId") else if (jsonInt(game_data, "gameId") > 0) jsonInt(game_data, "gameId") else if (jsonInt(session, "gameId") > 0) jsonInt(session, "gameId") else if (jsonInt(root, "gameId") > 0) jsonInt(root, "gameId") else 0;
-
-    if (enrich and game_id > 0) persistLiveLobbyEncounters(self, players, current, current_team, game_id, queue_id, mode, catalog);
 
     var writer = std.Io.Writer.fixed(output);
     try writer.writeAll("{\"id\":");
@@ -3967,97 +4861,21 @@ fn liveClientEnvelope(self: *Runtime, client: lcu.Client, live_json: []const u8,
     return writer.buffered();
 }
 
-fn persistLiveLobbyEncounters(self: *Runtime, players: std.json.Value, current: std.json.Value, current_team: []const u8, game_id: i64, queue_id: i64, queue_name: []const u8, catalog: std.json.Value) void {
-    if (self.storage == null or players != .array or game_id <= 0) return;
-    var current_puuid_buffer: [36]u8 = undefined;
-    const current_puuid = resolvedIdentityPuuid(current, &current_puuid_buffer);
-    if (current_puuid.len == 0) return;
-    if (self.storage) |*store| store.put("matches", "currentPuuid", current_puuid) catch {};
-    var self_player = current;
-    for (players.array.items) |player| if (player == .object and livePlayerMatches(player, current)) {
-        self_player = player;
-        break;
-    };
-    const self_current_identity = riotIdentity(current);
-    const self_live_identity = riotIdentity(self_player);
-    const self_name = if (self_current_identity.name.len > 0) self_current_identity.name else if (self_live_identity.name.len > 0) self_live_identity.name else "未知玩家";
-    const self_tag = if (self_current_identity.tag.len > 0) self_current_identity.tag else self_live_identity.tag;
-    const self_champion_id = liveChampionId(self_player, catalog);
-    const self_champion_name = if (self_champion_id > 0) catalogChampionName(catalog, self_champion_id, jsonField(self_player, "championName")) else championDisplayName(jsonField(self_player, "championName"), "未知英雄");
-    const self_position = playerPosition(self_player);
-    var output: [512 * 1024]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&output);
-    writer.writeByte('[') catch return;
-    var first = true;
-    var timestamp_buffer: [64]u8 = undefined;
-    var timestamp_writer = std.Io.Writer.fixed(&timestamp_buffer);
-    writeIsoTimestamp(&timestamp_writer, runtimeNowMillis(self)) catch return;
-    const encountered_at = timestamp_writer.buffered();
-    for (players.array.items) |player| {
-        if (player != .object) continue;
-        var player_puuid_buffer: [36]u8 = undefined;
-        const puuid = resolvedIdentityPuuid(player, &player_puuid_buffer);
-        if (puuid.len == 0 or std.mem.indexOf(u8, puuid, "-slot-") != null or samePuuid(puuid, current_puuid)) continue;
-        const identity = riotIdentity(player);
-        const team = jsonField(player, "team");
-        const same_team = if (team.len > 0)
-            sameLiveTeam(team, current_team)
-        else blk: {
-            const player_side = teamIdSide(jsonInt(player, "teamId"));
-            const current_side = liveTeamSide(current_team);
-            break :blk player_side >= 0 and current_side >= 0 and player_side == current_side;
-        };
-        const side = if (same_team) "ally" else "enemy";
-        const champion_id = liveChampionId(player, catalog);
-        const champion_name = if (champion_id > 0) catalogChampionName(catalog, champion_id, jsonField(player, "championName")) else championDisplayName(jsonField(player, "championName"), "未知英雄");
-        if (!first) writer.writeByte(',') catch return;
-        first = false;
-        writer.print("{{\"gameId\":{d},\"queueId\":{d},\"queueName\":", .{ game_id, queue_id }) catch return;
-        jsonString(&writer, if (queue_name.len > 0) queue_name else "对局") catch return;
-        writer.writeAll(",\"selfPuuid\":") catch return;
-        jsonString(&writer, current_puuid) catch return;
-        writer.writeAll(",\"selfGameName\":") catch return;
-        jsonString(&writer, self_name) catch return;
-        writer.writeAll(",\"selfTagLine\":") catch return;
-        jsonString(&writer, self_tag) catch return;
-        writer.print(",\"selfChampionId\":{d},\"selfChampionName\":", .{self_champion_id}) catch return;
-        jsonString(&writer, self_champion_name) catch return;
-        writer.writeAll(",\"selfPosition\":") catch return;
-        jsonString(&writer, self_position) catch return;
-        writer.writeAll(",\"puuid\":") catch return;
-        jsonString(&writer, puuid) catch return;
-        writer.writeAll(",\"gameName\":") catch return;
-        jsonString(&writer, if (identity.name.len > 0) identity.name else "未知玩家") catch return;
-        writer.writeAll(",\"tagLine\":") catch return;
-        jsonString(&writer, identity.tag) catch return;
-        writer.print(",\"championId\":{d},\"championName\":", .{champion_id}) catch return;
-        jsonString(&writer, champion_name) catch return;
-        writer.writeAll(",\"side\":") catch return;
-        jsonString(&writer, side) catch return;
-        writer.writeAll(",\"position\":") catch return;
-        jsonString(&writer, playerPosition(player)) catch return;
-        writer.writeAll(",\"result\":null,\"liveSnapshot\":true,\"encounteredAt\":") catch return;
-        writer.writeAll(encountered_at) catch return;
-        writer.writeByte('}') catch return;
-    }
-    writer.writeByte(']') catch return;
-    const records = writer.buffered();
-    if (records.len > 2) _ = updateEncounterArchive(self, records, null);
-}
-
 fn livePlayerMatches(player: std.json.Value, identity: std.json.Value) bool {
     if (player != .object or identity != .object) return false;
     var player_puuid_buffer: [36]u8 = undefined;
     var identity_puuid_buffer: [36]u8 = undefined;
-    const player_puuid = resolvedIdentityPuuid(player, &player_puuid_buffer);
-    const identity_puuid = resolvedIdentityPuuid(identity, &identity_puuid_buffer);
-    if (player_puuid.len > 0 and identity_puuid.len > 0) return samePuuid(player_puuid, identity_puuid);
+    const raw_player_puuid = resolvedIdentityPuuid(player, &player_puuid_buffer);
+    const player_puuid = if (std.mem.indexOf(u8, raw_player_puuid, "-slot-") == null) raw_player_puuid else "";
+    const raw_identity_puuid = resolvedIdentityPuuid(identity, &identity_puuid_buffer);
+    const identity_puuid = if (std.mem.indexOf(u8, raw_identity_puuid, "-slot-") == null) raw_identity_puuid else "";
+    if (player_puuid.len > 0 and identity_puuid.len > 0 and isNumericIdentity(player_puuid) == isNumericIdentity(identity_puuid)) return samePuuid(player_puuid, identity_puuid);
     const player_id = identityNumericId(player);
     const identity_id = identityNumericId(identity);
     if (player_id > 0 and identity_id > 0) return player_id == identity_id;
     const player_riot = riotIdentity(player);
     const identity_riot = riotIdentity(identity);
-    if (player_riot.name.len == 0 or identity_riot.name.len == 0 or
+    if (player_riot.name.len == 0 or identity_riot.name.len == 0 or std.mem.eql(u8, player_riot.name, "未知玩家") or
         !std.ascii.eqlIgnoreCase(player_riot.name, identity_riot.name)) return false;
     return player_riot.tag.len == 0 or identity_riot.tag.len == 0 or
         std.ascii.eqlIgnoreCase(player_riot.tag, identity_riot.tag);
@@ -4090,7 +4908,7 @@ fn writeCachedLatestMatch(self: *Runtime, writer: *std.Io.Writer) !void {
         return;
     };
     defer std.heap.page_allocator.free(buffer);
-    const dto = matchHistoryDtoPage(history, catalog orelse "[]", puuid.?, 0, 1, buffer) catch {
+    const dto = matchHistoryDtoPageWithFilters(history, catalog orelse "[]", puuid.?, 0, 1, runtimeHideUnfinishedMatches(self), runtimeRankedOnly(self), buffer) catch {
         try writer.writeAll("null");
         return;
     };
@@ -4109,6 +4927,22 @@ fn writeCachedLatestMatch(self: *Runtime, writer: *std.Io.Writer) !void {
 }
 
 fn writeLiveClientProfiles(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, writer: *std.Io.Writer, players: std.json.Value, current_team: []const u8, ally: bool, current: std.json.Value, catalog: std.json.Value, enrich: bool) !void {
+    if (enrich) {
+        const jobs = try std.heap.page_allocator.alloc(LiveProfileJob, players.array.items.len);
+        defer std.heap.page_allocator.free(jobs);
+        var job_count: usize = 0;
+        var side_index: usize = 0;
+        for (players.array.items) |player| {
+            if (player != .object) continue;
+            const same_team = sameLiveTeam(jsonField(player, "team"), current_team);
+            if (same_team != ally) continue;
+            jobs[job_count] = liveProfileJob(self, client, sgp_context, player, if (ally) "ally" else "enemy", side_index, current, catalog, players);
+            job_count += 1;
+            side_index += 1;
+        }
+        return writeLiveProfileJobs(writer, jobs[0..job_count]);
+    }
+
     try writer.writeByte('[');
     var first = true;
     var side_index: usize = 0;
@@ -4118,13 +4952,175 @@ fn writeLiveClientProfiles(self: *Runtime, client: lcu.Client, sgp_context: ?Jun
         if (same_team != ally) continue;
         if (!first) try writer.writeByte(',');
         first = false;
-        try writeLiveClientProfile(self, client, sgp_context, writer, player, if (ally) "ally" else "enemy", side_index, current, catalog, enrich, players);
+        try writeLiveClientProfile(self, client, sgp_context, writer, player, if (ally) "ally" else "enemy", side_index, current, catalog, enrich, players, null);
         side_index += 1;
     }
     try writer.writeByte(']');
 }
 
-fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, writer: *std.Io.Writer, player: std.json.Value, side: []const u8, index: usize, current: std.json.Value, catalog: std.json.Value, enrich: bool, group_members: ?std.json.Value) !void {
+const live_profile_output_capacity = 512 * 1024;
+
+const LiveProfileTeamJob = struct {
+    runtime_value: *Runtime,
+    client: lcu.Client,
+    sgp_context: ?JungleSgpContext,
+    players: std.json.Value,
+    current_team: []const u8,
+    ally: bool,
+    current: std.json.Value,
+    catalog: std.json.Value,
+    output: []u8,
+    output_len: usize = 0,
+    failure: ?anyerror = null,
+};
+
+fn liveProfileTeamJob(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, players: std.json.Value, current_team: []const u8, ally: bool, current: std.json.Value, catalog: std.json.Value, output: []u8) LiveProfileTeamJob {
+    return .{
+        .runtime_value = self,
+        .client = client,
+        .sgp_context = sgp_context,
+        .players = players,
+        .current_team = current_team,
+        .ally = ally,
+        .current = current,
+        .catalog = catalog,
+        .output = output,
+    };
+}
+
+fn runLiveProfileTeamJob(job: *LiveProfileTeamJob) void {
+    var writer = std.Io.Writer.fixed(job.output);
+    writeLiveClientProfiles(job.runtime_value, job.client, job.sgp_context, &writer, job.players, job.current_team, job.ally, job.current, job.catalog, true) catch |err| {
+        job.failure = err;
+        return;
+    };
+    job.output_len = writer.buffered().len;
+}
+
+const SharedLiveSgpContext = struct {
+    runtime_value: *Runtime,
+    client: lcu.Client,
+    allocator: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    prepared: bool = false,
+    value: ?JungleSgpContext = null,
+
+    fn get(self: *@This()) ?JungleSgpContext {
+        while (!self.mutex.tryLock()) {
+            self.client.control.check() catch return null;
+            std.Io.sleep(self.client.io, .fromMilliseconds(5), .awake) catch return null;
+        }
+        defer self.mutex.unlock();
+        // 只有主源缺失时才准备备用源，同批次共用一次认证结果。
+        if (!self.prepared) {
+            self.value = prepareJungleSgpContext(self.runtime_value, self.client, self.allocator);
+            self.prepared = true;
+        }
+        return self.value;
+    }
+};
+
+const LiveProfileJob = struct {
+    shared_sgp: ?*SharedLiveSgpContext = null,
+    runtime_value: *Runtime,
+    client: lcu.Client,
+    sgp_context: ?JungleSgpContext,
+    player: std.json.Value,
+    side: []const u8,
+    index: usize,
+    current: std.json.Value,
+    catalog: std.json.Value,
+    group_members: ?std.json.Value,
+    output: ?[]u8 = null,
+    output_len: usize = 0,
+    failure: ?anyerror = null,
+};
+
+const PlayerRankRequestJob = struct {
+    client: lcu.Client,
+    puuid: []const u8,
+    result: ?[]u8 = null,
+};
+
+fn runPlayerRankRequest(job: *PlayerRankRequestJob) void {
+    var path_buffer: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/lol-ranked/v1/ranked-stats/{s}", .{job.puuid}) catch return;
+    job.result = job.client.get(path) catch null;
+}
+
+const PlayerLcuHistoryRequestJob = struct {
+    client: lcu.Client,
+    puuid: []const u8,
+    result: ?[]u8 = null,
+};
+
+fn runPlayerLcuHistoryRequest(job: *PlayerLcuHistoryRequestJob) void {
+    var path_buffer: [768]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/lol-match-history/v1/products/lol/{s}/matches?begIndex=0&endIndex=49", .{job.puuid}) catch return;
+    job.result = job.client.get(path) catch null;
+}
+
+const PlayerSgpHistoryRequestJob = struct {
+    client: lcu.Client,
+    context: JungleSgpContext,
+    puuid: []const u8,
+    result: ?[]u8 = null,
+};
+
+fn runPlayerSgpHistoryRequest(job: *PlayerSgpHistoryRequestJob) void {
+    job.result = fetchSgpHistoryWithContext(job.client, job.context, job.puuid, 0, 20) catch null;
+}
+
+fn liveProfileJob(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, player: std.json.Value, side: []const u8, index: usize, current: std.json.Value, catalog: std.json.Value, group_members: ?std.json.Value) LiveProfileJob {
+    return .{
+        .runtime_value = self,
+        .client = client,
+        .sgp_context = sgp_context,
+        .player = player,
+        .side = side,
+        .index = index,
+        .current = current,
+        .catalog = catalog,
+        .group_members = group_members,
+    };
+}
+
+fn runLiveProfileJob(job: *LiveProfileJob) void {
+    var writer = std.Io.Writer.fixed(job.output.?);
+    writeLiveClientProfile(job.runtime_value, job.client, job.sgp_context, &writer, job.player, job.side, job.index, job.current, job.catalog, true, job.group_members, job.shared_sgp) catch |err| {
+        job.failure = err;
+        return;
+    };
+    job.output_len = writer.buffered().len;
+}
+
+fn writeLiveProfileJobs(writer: *std.Io.Writer, jobs: []LiveProfileJob) !void {
+    defer for (jobs) |job| if (job.output) |output| std.heap.page_allocator.free(output);
+    for (jobs) |*job| {
+        job.output = try std.heap.page_allocator.alloc(u8, live_profile_output_capacity);
+    }
+
+    const threads = try std.heap.page_allocator.alloc(?std.Thread, jobs.len);
+    defer std.heap.page_allocator.free(threads);
+    @memset(threads, null);
+    for (jobs, 0..) |*job, index| {
+        threads[index] = std.Thread.spawn(.{}, runLiveProfileJob, .{job}) catch blk: {
+            runLiveProfileJob(job);
+            break :blk null;
+        };
+    }
+    for (threads) |thread| if (thread) |worker| worker.join();
+
+    try writer.writeByte('[');
+    for (jobs, 0..) |job, index| {
+        if (job.failure) |err| return err;
+        if (index > 0) try writer.writeByte(',');
+        try writer.writeAll(job.output.?[0..job.output_len]);
+    }
+    try writer.writeByte(']');
+}
+
+fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, writer: *std.Io.Writer, player: std.json.Value, side: []const u8, index: usize, current: std.json.Value, catalog: std.json.Value, enrich: bool, group_members: ?std.json.Value, shared_sgp: ?*SharedLiveSgpContext) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -4136,41 +5132,37 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     const is_bot = isBotMember(player) or std.ascii.eqlIgnoreCase(tag_line, "BOT");
     const is_current = livePlayerMatches(player, current);
     var player_puuid_buffer: [36]u8 = undefined;
-    const player_puuid = resolvedIdentityPuuid(player, &player_puuid_buffer);
+    const raw_player_puuid = resolvedIdentityPuuid(player, &player_puuid_buffer);
+    const player_puuid = if (std.mem.indexOf(u8, raw_player_puuid, "-slot-") == null) raw_player_puuid else "";
     const player_numeric_identity = identityNumericId(player);
+    var enrichment_client = client;
+    enrichment_client.timeout_ms = @min(client.timeout_ms, player_enrichment_timeout_ms);
 
     var identity_owned: ?[]u8 = null;
     defer if (identity_owned) |value| std.heap.page_allocator.free(value);
     var identity = if (is_current) current else std.json.Value{ .null = {} };
-    if (enrich and !is_bot and !is_current) {
-        // A stable PUUID is the most reliable identity key. ChampSelect often
-        // omits Riot ID text, and name lookup is not consistently supported by
-        // every regional client build.
-        // Live Client already supplies Riot ID and PUUID for most players.
-        // Resolving the same PUUID through /summoner adds one serial request
-        // per card; only fall back when the roster omitted a display name.
-        if (player_puuid.len > 0 and game_name.len == 0 and !isNumericIdentity(player_puuid)) {
+    if (enrich and !is_bot and !is_current and (player_puuid.len > 0 or player_numeric_identity > 0 or (game_name.len > 0 and !std.mem.eql(u8, game_name, "未知玩家")))) {
+        // 优先使用真实身份；只有缺少名字时才补查，避免每张卡片多一次串行请求。
+        if (player_puuid.len > 0 and (game_name.len == 0 or std.mem.eql(u8, game_name, "未知玩家")) and !isNumericIdentity(player_puuid)) {
             var path_buffer: [512]u8 = undefined;
             const path = std.fmt.bufPrint(&path_buffer, "/lol-summoner/v2/summoners/puuid/{s}", .{player_puuid}) catch "";
-            if (path.len > 0) identity_owned = client.get(path) catch null;
+            if (path.len > 0) identity_owned = enrichment_client.get(path) catch null;
         }
         var riot_id_buffer: [512]u8 = undefined;
-        if (identity_owned == null and game_name.len > 0) {
+        if (identity_owned == null and (player_puuid.len == 0 or isNumericIdentity(player_puuid)) and game_name.len > 0 and !std.mem.eql(u8, game_name, "未知玩家")) {
             const riot_id = if (tag_line.len > 0) std.fmt.bufPrint(&riot_id_buffer, "{s}#{s}", .{ game_name, tag_line }) catch game_name else game_name;
             var encoded_buffer: [1536]u8 = undefined;
             if (percentEncodeQuery(riot_id, &encoded_buffer)) |encoded| {
                 var path_buffer: [1792]u8 = undefined;
                 const path = std.fmt.bufPrint(&path_buffer, "/lol-summoner/v1/summoners?name={s}", .{encoded}) catch "";
-                if (path.len > 0) identity_owned = client.get(path) catch null;
+                if (path.len > 0) identity_owned = enrichment_client.get(path) catch null;
             } else |_| {}
         }
-        // Gameflow team members often contain only a numeric summonerId once
-        // the client enters InProgress. Resolve that stable id when Riot ID
-        // text is unavailable so the card still gets PUUID, rank and history.
+        // 游戏开始后可能只提供数字召唤师编号，用它补齐真实身份和后续资料。
         if (identity_owned == null and player_numeric_identity > 0) {
             var path_buffer: [256]u8 = undefined;
             const path = std.fmt.bufPrint(&path_buffer, "/lol-summoner/v1/summoners/{d}", .{player_numeric_identity}) catch "";
-            if (path.len > 0) identity_owned = client.get(path) catch null;
+            if (path.len > 0) identity_owned = enrichment_client.get(path) catch null;
         }
         if (identity_owned) |value| {
             const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, value, .{}) catch std.json.Value{ .null = {} };
@@ -4185,64 +5177,71 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     const resolved_identity = if (identity != .null) riotIdentity(identity) else RiotIdentity{};
     const resolved_name = if (resolved_identity.name.len > 0) resolved_identity.name else game_name;
     const resolved_tag = if (resolved_identity.tag.len > 0) resolved_identity.tag else tag_line;
+    if (puuid.len > 0 and resolved_name.len > 0 and resolved_tag.len > 0) if (self.storage) |*store| {
+        var riot_id_buffer: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&riot_id_buffer, "{s}#{s}", .{ resolved_name, resolved_tag })) |riot_id| {
+            store.put("historySubject", riot_id, puuid) catch {};
+        } else |_| {}
+    };
     const profile_icon_id = if (identity != .null and jsonInt(identity, "profileIconId") > 0) jsonInt(identity, "profileIconId") else if (jsonInt(player, "profileIconId") > 0) jsonInt(player, "profileIconId") else jsonInt(summoner, "profileIconId");
     const champion_id = liveChampionId(player, catalog);
     const raw_champion_name = if (jsonField(player, "championName").len > 0) jsonField(player, "championName") else jsonField(player, "rawChampionName");
     const champion_name = if (champion_id > 0) catalogChampionName(catalog, champion_id, raw_champion_name) else championDisplayName(raw_champion_name, "已选择");
     const position = if (playerPosition(player).len > 0) playerPosition(player) else "NONE";
 
-    var rank_owned: ?[]u8 = null;
+    var rank_owned = if (enrich and !self.force_profile_refresh and !is_bot and puuid.len > 0) cachedSnapshot(self, "playerRank", puuid, player_profile_cache_ttl_seconds) else null;
     defer if (rank_owned) |value| std.heap.page_allocator.free(value);
-    var ranked = std.json.Value{ .null = {} };
-    if (enrich and !is_bot and puuid.len > 0) {
-        if (self.storage) |*store| {
-            rank_owned = store.get("playerRank", puuid) catch null;
-            if (rank_owned) |value| ranked = std.json.parseFromSliceLeaky(std.json.Value, allocator, value, .{}) catch std.json.Value{ .null = {} };
-        }
-        var path_buffer: [512]u8 = undefined;
-        if (rank_owned == null) {
-            const path = std.fmt.bufPrint(&path_buffer, "/lol-ranked/v1/ranked-stats/{s}", .{puuid}) catch "";
-            if (path.len > 0) rank_owned = client.get(path) catch null;
-            if (rank_owned) |value| {
-                ranked = std.json.parseFromSliceLeaky(std.json.Value, allocator, value, .{}) catch std.json.Value{ .null = {} };
-                if (ranked != .null) if (self.storage) |*store| store.put("playerRank", puuid, value) catch {};
-            }
-        }
-    }
-    const solo = rankQueueValue(ranked, "RANKED_SOLO_5x5");
-
-    var history_owned = if (enrich and !is_bot and puuid.len > 0) cachedPlayerHistory(self, puuid, is_current) else null;
+    var history_owned = if (enrich and !self.force_profile_refresh and !is_bot and puuid.len > 0) cachedPlayerHistory(self, puuid, is_current) else null;
     defer if (history_owned) |value| std.heap.page_allocator.free(value);
-    if (enrich and !is_bot and puuid.len > 0 and history_owned == null) {
-        var path_buffer: [768]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buffer, "/lol-match-history/v1/products/lol/{s}/matches?begIndex=0&endIndex=19", .{puuid}) catch "";
-        if (path.len > 0) history_owned = client.get(path) catch null;
-        if (history_owned) |value| if (self.storage) |*store| store.put(if (is_current) "matches" else "playerHistory", if (is_current) "current" else puuid, value) catch {};
-    }
-
-    // Tencent clients can return an empty LCU match-history envelope for
-    // other players even though SGP has the same data. Rust builds one SGP
-    // context per lobby and uses it as the fallback; keep the same provider
-    // behavior here so cards do not lose recentMatches after GameStart.
+    const history_cached = history_owned != null;
+    var history_source: []const u8 = if (history_cached) "sqlite-fresh" else "lcu";
     var sgp_history_owned: ?[]u8 = null;
     defer if (sgp_history_owned) |value| std.heap.page_allocator.free(value);
-    if (enrich and !is_bot and puuid.len > 0 and
-        (history_owned == null or !historyHasGames(history_owned.?)))
-    {
-        sgp_history_owned = fetchSgpHistory(client, current, history_owned orelse "{}", puuid, 0, 20) catch null;
-        if (sgp_history_owned) |value| {
-            if (historyHasGames(value)) {
-                if (self.storage) |*store| {
-                    store.put(if (is_current) "matches" else "playerHistory", if (is_current) "current" else puuid, value) catch {};
-                    if (is_current) store.put("matches", "currentPuuid", puuid) catch {};
+    if (enrich and !is_bot and puuid.len > 0 and !isNumericIdentity(puuid)) {
+        var rank_job = PlayerRankRequestJob{ .client = enrichment_client, .puuid = puuid };
+        // 段位与战绩互不依赖，共用有上限的网络配额并行请求。
+        const rank_thread = if (rank_owned == null) std.Thread.spawn(.{}, runPlayerRankRequest, .{&rank_job}) catch null else null;
+        if (rank_owned == null) {
+            if (rank_thread == null) runPlayerRankRequest(&rank_job);
+        }
+        if (history_owned == null) {
+            var job = PlayerLcuHistoryRequestJob{ .client = enrichment_client, .puuid = puuid };
+            runPlayerLcuHistoryRequest(&job);
+            history_owned = job.result;
+            // 主源有数据就直接使用；只有缺失或为空时才在同一并发配额内查询备选源。
+            if (history_owned == null or !historyHasGames(history_owned.?)) {
+                const fallback_context = if (shared_sgp) |shared| shared.get() else sgp_context;
+                sgp_history_owned = if (fallback_context) |context|
+                    fetchSgpHistoryWithContext(enrichment_client, context, puuid, 0, 50) catch null
+                else if (shared_sgp != null) null
+                else
+                    fetchSgpHistory(enrichment_client, current, history_owned orelse "{}", puuid, 0, 50) catch null;
+                if (sgp_history_owned) |value| {
+                    if (historyHasGames(value)) {
+                        history_source = "sgp";
+                    } else {
+                        std.heap.page_allocator.free(value);
+                        sgp_history_owned = null;
+                    }
                 }
-            } else {
-                std.heap.page_allocator.free(value);
-                sgp_history_owned = null;
             }
+            if (self.storage) |*store| if (preferredHistory(history_owned, sgp_history_owned)) |value| {
+                store.put("playerHistory", puuid, value) catch {};
+            };
+        }
+        if (rank_thread) |thread| thread.join();
+        if (rank_owned == null) {
+            rank_owned = rank_job.result;
+            if (self.storage) |*store| if (rank_owned) |value| store.put("playerRank", puuid, value) catch {};
         }
     }
+    const ranked = if (rank_owned) |value| std.json.parseFromSliceLeaky(std.json.Value, allocator, value, .{}) catch std.json.Value{ .null = {} } else std.json.Value{ .null = {} };
+    const solo = rankQueueValue(ranked, "RANKED_SOLO_5x5");
     const preferred_history = preferredHistory(history_owned, sgp_history_owned) orelse history_owned;
+    const history_ready = if (preferred_history) |value| blk: {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, value, .{}) catch break :blk false;
+        break :blk historyGames(parsed) != null;
+    } else false;
 
     var recent_owned: ?[]u8 = null;
     defer if (recent_owned) |value| std.heap.page_allocator.free(value);
@@ -4252,10 +5251,8 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
         recent_owned = std.heap.page_allocator.alloc(u8, 256 * 1024) catch null;
         if (recent_owned) |buffer| {
             var recent_writer = std.Io.Writer.fixed(buffer);
-            // Keep enough history for the live-page stepper (1..20). The
-            // shortcut formatter still limits its own statistics to the
-            // configured recent-game count.
-            recent_count = writeRecentMatches(&recent_writer, history, catalog, puuid, 20) catch 0;
+            // 卡片最多保留二十场，快捷消息按自己的场数设置统计。
+            recent_count = writeRecentMatchesFiltered(&recent_writer, history, catalog, puuid, 20, runtimeRankedOnly(self)) catch 0;
             recent_json = recent_writer.buffered();
         }
     }
@@ -4265,7 +5262,7 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     if (enrich and !is_bot and puuid.len > 0 and recent_count > 0 and !isJunglePosition(position)) {
         gank_metrics_owned = std.heap.page_allocator.alloc(u8, 256 * 1024) catch null;
         if (gank_metrics_owned) |buffer| {
-            if (enrichRecentGankMetrics(self, client, sgp_context, recent_json, puuid, buffer) catch null) |enriched| {
+            if (enrichRecentGankMetrics(self, client, sgp_context, recent_json, puuid, buffer, false) catch null) |enriched| {
                 recent_json = enriched;
             }
         }
@@ -4316,60 +5313,74 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     try writePremadeFields(writer, player, group_members);
     try writer.writeAll(",\"positionGames\":");
     try writer.print("{d},\"positionWinRate\":{d:.4},\"currentChampionGames\":{d},\"currentChampionWinRate\":{d:.4},\"championPoolConcentration\":{d:.4},\"dataComplete\":", .{ recentPositionGames(recent_json, position), recentPositionWinRate(recent_json, position), recentChampionGames(recent_json, champion_id), recentChampionWinRate(recent_json, champion_id), recentChampionConcentration(recent_json) });
-    try writer.writeAll(if (is_bot or recent_count > 0) "true" else "false");
+    const complete = is_bot or (history_ready and ranked != .null);
+    try writer.writeAll(if (complete) "true" else "false");
     try writer.writeAll(",\"unavailableSources\":[");
     var missing = false;
     if (!is_bot and ranked == .null) {
         try jsonString(writer, "rank");
         missing = true;
     }
-    if (!is_bot and recent_count == 0) {
+    if (!is_bot and !history_ready) {
         if (missing) try writer.writeByte(',');
         try jsonString(writer, "recentMatches");
     }
-    try writer.writeAll("],\"dataStatus\":{\"source\":\"lcu\",\"fetchedAt\":");
+    try writer.writeAll("],\"dataStatus\":{\"source\":");
+    try jsonString(writer, if (!enrich) "unavailable" else history_source);
+    try writer.writeAll(",\"fetchedAt\":");
     try writeIsoTimestamp(writer, runtimeNowMillis(self));
-    try writer.writeAll(",\"expiresAt\":null,\"isStale\":false,\"error\":null},\"side\":");
+    try writer.writeAll(",\"expiresAt\":null,\"isStale\":false,\"error\":");
+    if (enrich and !complete) try jsonString(writer, "部分资料读取失败，将自动重试") else try writer.writeAll("null");
+    try writer.writeAll("},\"side\":");
     try jsonString(writer, side);
     try writer.writeByte('}');
 }
 
 fn cachedPlayerHistory(self: *Runtime, puuid: []const u8, is_current: bool) ?[]u8 {
+    if (cachedSnapshot(self, "playerHistory", puuid, player_history_cache_ttl_seconds)) |value| return value;
+    if (!is_current) return null;
     const store = if (self.storage) |*value| value else return null;
-    if (is_current) {
-        const owner = store.get("matches", "currentPuuid") catch null orelse return null;
-        defer std.heap.page_allocator.free(owner);
-        if (owner.len == 0 or !std.mem.eql(u8, owner, puuid)) return null;
+    const owner = store.get("matches", "currentPuuid") catch null orelse return null;
+    defer std.heap.page_allocator.free(owner);
+    if (!samePuuid(owner, puuid)) return null;
+    return cachedSnapshot(self, "matches", "current", player_history_cache_ttl_seconds);
+}
+
+fn cachedSnapshot(self: *Runtime, kind: []const u8, key: []const u8, ttl_seconds: i64) ?[]u8 {
+    const store = if (self.storage) |*value| value else return null;
+    const value = (store.get(kind, key) catch return null) orelse return null;
+    const now_ms = runtimeNowMillis(self);
+    if (now_ms == 0) return value;
+    const updated_at = (store.getUpdatedAt(kind, key) catch null) orelse {
+        std.heap.page_allocator.free(value);
+        return null;
+    };
+    const now_seconds = @divTrunc(now_ms, std.time.ms_per_s);
+    if (now_seconds - updated_at >= ttl_seconds) {
+        std.heap.page_allocator.free(value);
+        return null;
     }
-    return store.get(if (is_current) "matches" else "playerHistory", if (is_current) "current" else puuid) catch null;
+    return value;
 }
 
 const EncounterSummary = recent_tags.EncounterSummary;
 
 fn encounterProfileSummary(self: *Runtime, puuid: []const u8) EncounterSummary {
     var summary = EncounterSummary{};
-    var encounters_owned: ?[]u8 = null;
-    defer if (encounters_owned) |value| std.heap.page_allocator.free(value);
-    if (puuid.len > 0) if (self.storage) |*store| {
-        const owner = store.get("matches", "currentPuuid") catch null;
-        defer if (owner) |value| std.heap.page_allocator.free(value);
-        encounters_owned = store.get("history", "encounters") catch null;
-        if (encounters_owned) |json| {
-            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            defer arena.deinit();
-            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch std.json.Value{ .null = {} };
-            if (parsed == .array) for (parsed.array.items) |record| {
-                if (record != .object or !samePuuid(jsonField(record, "puuid"), puuid)) continue;
-                if (owner) |current_owner| if (!samePuuid(jsonField(record, "selfPuuid"), current_owner)) continue;
-                summary.count += 1;
-                const encountered_at = jsonField(record, "encounteredAt");
-                const latest = summary.latestValue();
-                if (encountered_at.len > 0 and encountered_at.len <= summary.latest.len and (latest.len == 0 or std.mem.order(u8, encountered_at, latest) == .gt)) {
-                    @memcpy(summary.latest[0..encountered_at.len], encountered_at);
-                    summary.latest_len = encountered_at.len;
-                }
-            };
-            return summary;
+    if (puuid.len == 0) return summary;
+    const buffer = std.heap.page_allocator.alloc(u8, 1024 * 1024) catch return summary;
+    defer std.heap.page_allocator.free(buffer);
+    const json = cachedEncounterResponse(self, puuid, 40, lobbyGameId(self.live_lobby[0..self.live_lobby_len]), buffer) catch return summary;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch return summary;
+    if (parsed == .array) for (parsed.array.items) |record| {
+        if (!samePuuid(jsonField(record, "puuid"), puuid)) continue;
+        summary.count += 1;
+        const stamp = jsonField(record, "encounteredAt");
+        if (stamp.len > 0 and stamp.len <= summary.latest.len and std.mem.order(u8, stamp, summary.latestValue()) == .gt) {
+            @memcpy(summary.latest[0..stamp.len], stamp);
+            summary.latest_len = stamp.len;
         }
     };
     return summary;
@@ -4378,40 +5389,6 @@ fn encounterProfileSummary(self: *Runtime, puuid: []const u8) EncounterSummary {
 fn writeEncounterProfileFields(writer: *std.Io.Writer, summary: EncounterSummary) !void {
     try writer.print(",\"encounterCount\":{d},\"lastEncounteredAt\":", .{summary.count});
     if (summary.latest_len > 0) try jsonString(writer, summary.latestValue()) else try writer.writeAll("null");
-}
-
-fn primeCurrentHistory(self: *Runtime, client: lcu.Client, current_json: []const u8) void {
-    const store = if (self.storage) |*value| value else return;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const current = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), current_json, .{}) catch return;
-    const identity = firstJsonValue(current);
-    if (identity != .object) return;
-    const puuid = jsonField(identity, "puuid");
-    if (puuid.len == 0) return;
-
-    // Do not spend another request when the dashboard already primed the same
-    // account. A changed Riot account must replace the owner marker before its
-    // history is exposed to the live page.
-    const owner = store.get("matches", "currentPuuid") catch null;
-    defer if (owner) |value| std.heap.page_allocator.free(value);
-    if (owner) |value| if (std.mem.eql(u8, value, puuid)) {
-        if (store.get("matches", "current") catch null) |history| {
-            defer std.heap.page_allocator.free(history);
-            if (historyHasGames(history)) return;
-        }
-    };
-
-    var path_buffer: [768]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buffer, "/lol-match-history/v1/products/lol/{s}/matches?begIndex=0&endIndex=49", .{puuid}) catch return;
-    const lcu_history = client.get(path) catch null;
-    defer if (lcu_history) |history| std.heap.page_allocator.free(history);
-    const sgp_history: ?[]u8 = fetchSgpHistory(client, identity, lcu_history orelse "{}", puuid, 0, 50) catch null;
-    defer if (sgp_history) |history| std.heap.page_allocator.free(history);
-    const history = preferredHistory(lcu_history, sgp_history) orelse return;
-    store.put("matches", "current", history) catch return;
-    store.put("matches", "currentPuuid", puuid) catch {};
-    persistEncountersFromHistory(self, history, puuid);
 }
 
 fn firstJsonValue(value: std.json.Value) std.json.Value {
@@ -4497,6 +5474,10 @@ fn rankQueueValue(ranked: std.json.Value, queue_type: []const u8) ?std.json.Valu
 }
 
 fn writeRecentMatches(writer: *std.Io.Writer, history_json: []const u8, catalog: std.json.Value, puuid: []const u8, limit: usize) !usize {
+    return writeRecentMatchesFiltered(writer, history_json, catalog, puuid, limit, false);
+}
+
+fn writeRecentMatchesFiltered(writer: *std.Io.Writer, history_json: []const u8, catalog: std.json.Value, puuid: []const u8, limit: usize, ranked_only: bool) !usize {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -4523,6 +5504,7 @@ fn writeRecentMatches(writer: *std.Io.Writer, history_json: []const u8, catalog:
         // Live scouting follows the Rust implementation and excludes custom,
         // training, aborted, and sub-minute records from the ten-game sample.
         if (isHiddenHistoryGame(game)) continue;
+        if (ranked_only and !isRankedHistoryGame(game)) continue;
         const participants = game.object.get("participants") orelse continue;
         const participant = participantForPuuid(game, participants, puuid);
         if (participant == .null) continue;
@@ -4547,7 +5529,7 @@ fn writeRecentMatches(writer: *std.Io.Writer, history_json: []const u8, catalog:
         const performance = matchPerformance(statBool(participant, "win"), kills, deaths, assists, damage_share);
         const is_mvp = teamParticipantCount(participants, team_id) >= 2 and
             participantScore(participant, team_damage) >= bestTeamScore(participants, team_id, team_damage);
-        try writer.print("{{\"gameId\":{d},\"championId\":{d},\"championName\":", .{ jsonInt(game, "gameId"), champion_id });
+        try writer.print("{{\"gameId\":{d},\"queueId\":{d},\"championId\":{d},\"championName\":", .{ jsonInt(game, "gameId"), jsonInt(game, "queueId"), champion_id });
         try jsonString(writer, catalogChampionName(catalog, champion_id, jsonField(participant, "championName")));
         try writer.writeAll(",\"queueName\":");
         try jsonString(writer, queueLabelFromGame(game));
@@ -4804,7 +5786,7 @@ fn isJunglePosition(value: []const u8) bool {
 }
 
 fn samePuuid(left: []const u8, right: []const u8) bool {
-    return left.len > 0 and right.len > 0 and
+    return !isEmptyPlayerIdentity(left) and !isEmptyPlayerIdentity(right) and
         std.ascii.eqlIgnoreCase(std.mem.trim(u8, left, " \t\r\n"), std.mem.trim(u8, right, " \t\r\n"));
 }
 
@@ -4969,8 +5951,10 @@ fn writeRecentScore(writer: *std.Io.Writer, json: []const u8) !void {
     }
     const win_rate = @as(f64, @floatFromInt(stats.wins)) / @as(f64, @floatFromInt(stats.count));
     const average_kda = stats.kda_total / @as(f64, @floatFromInt(stats.count));
-    const total = @min(100.0, @max(0.0, 35.0 + win_rate * 45.0 + @min(average_kda, 5.0) * 4.0));
-    try writer.print("{{\"total\":{d:.1},\"confidence\":{d:.1},\"components\":[{{\"key\":\"recent\",\"label\":\"近期战绩\",\"score\":{d:.1},\"maxScore\":60,\"evidence\":\"近{d}场胜率 {d:.0}%\"}},{{\"key\":\"kda\",\"label\":\"KDA\",\"score\":{d:.1},\"maxScore\":40,\"evidence\":\"平均 KDA {d:.2}\"}}]}}", .{ total, @min(100.0, @as(f64, @floatFromInt(stats.count * 10))), win_rate * 60.0, stats.count, win_rate * 100.0, @min(40.0, average_kda * 4.0), average_kda });
+    const recent_score = @round(win_rate * 450.0) / 10.0;
+    const kda_score = @round(@min(average_kda, 5.0) * 40.0) / 10.0;
+    const total = 35.0 + recent_score + kda_score;
+    try writer.print("{{\"total\":{d:.1},\"confidence\":{d:.1},\"components\":[{{\"key\":\"base\",\"label\":\"基础分\",\"score\":35,\"maxScore\":35,\"evidence\":\"有效近期样本的基础分\"}},{{\"key\":\"recent\",\"label\":\"近期战绩\",\"score\":{d:.1},\"maxScore\":45,\"evidence\":\"近{d}场胜率 {d:.0}%\"}},{{\"key\":\"kda\",\"label\":\"击杀助攻比\",\"score\":{d:.1},\"maxScore\":20,\"evidence\":\"平均击杀助攻比 {d:.2}\"}}]}}", .{ total, @min(100.0, @as(f64, @floatFromInt(stats.count * 10))), recent_score, stats.count, win_rate * 100.0, kda_score, average_kda });
 }
 
 fn writeRecentTags(writer: *std.Io.Writer, json: []const u8, assigned_position: []const u8, current_champion_id: i64, encounter: EncounterSummary) !void {
@@ -5197,25 +6181,27 @@ fn unresolvedRosterMember(member: std.json.Value) bool {
 }
 
 fn writeProfileArrayEnriched(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, writer: *std.Io.Writer, value: ?std.json.Value, side: []const u8, current: std.json.Value, catalog: std.json.Value) !void {
-    try writer.writeByte('[');
     if (value) |candidate| if (arrayLike(candidate)) |array| {
-        var first = true;
+        const jobs = try std.heap.page_allocator.alloc(LiveProfileJob, array.array.items.len);
+        defer std.heap.page_allocator.free(jobs);
+        var job_count: usize = 0;
         var index: usize = 0;
         for (array.array.items) |participant| {
             if (participant != .object) continue;
-            if (!first) try writer.writeByte(',');
-            first = false;
-            try writeLiveClientProfile(self, client, sgp_context, writer, participant, side, index, current, catalog, true, array);
+            jobs[job_count] = liveProfileJob(self, client, sgp_context, participant, side, index, current, catalog, array);
+            job_count += 1;
             index += 1;
         }
+        return writeLiveProfileJobs(writer, jobs[0..job_count]);
     };
-    try writer.writeByte(']');
+    try writer.writeAll("[]");
 }
 
 fn writeProfileArraySelectionEnriched(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, writer: *std.Io.Writer, value: std.json.Value, side: []const u8, current: std.json.Value, catalog: std.json.Value) !void {
-    try writer.writeByte('[');
     if (arrayLike(value)) |array| {
-        var first = true;
+        const jobs = try std.heap.page_allocator.alloc(LiveProfileJob, array.array.items.len);
+        defer std.heap.page_allocator.free(jobs);
+        var job_count: usize = 0;
         var side_index: usize = 0;
         for (array.array.items, 0..) |participant, index| {
             if (participant != .object) continue;
@@ -5224,13 +6210,13 @@ fn writeProfileArraySelectionEnriched(self: *Runtime, client: lcu.Client, sgp_co
                 (std.mem.eql(u8, side, "ally") and teamIdSide(team_id) == 0) or (std.mem.eql(u8, side, "enemy") and teamIdSide(team_id) == 1)
             else if (std.mem.eql(u8, side, "ally")) index < 5 else index >= 5;
             if (!include) continue;
-            if (!first) try writer.writeByte(',');
-            first = false;
-            try writeLiveClientProfile(self, client, sgp_context, writer, participant, side, side_index, current, catalog, true, array);
+            jobs[job_count] = liveProfileJob(self, client, sgp_context, participant, side, side_index, current, catalog, array);
+            job_count += 1;
             side_index += 1;
         }
+        return writeLiveProfileJobs(writer, jobs[0..job_count]);
     }
-    try writer.writeByte(']');
+    try writer.writeAll("[]");
 }
 
 fn writeProfileArraySelection(writer: *std.Io.Writer, value: std.json.Value, side: []const u8, catalog: std.json.Value) !void {
@@ -5595,6 +6581,245 @@ fn arrayContainsIdentity(value: ?std.json.Value, current: std.json.Value) bool {
         if (livePlayerMatches(item, current)) return true;
     }
     return false;
+}
+
+test "相遇读取核验缓存归属且不改写旧归档" {
+    var state = Runtime.init();
+    var store = try storage.Store.open(std.heap.page_allocator, std.testing.io, ":memory:");
+    defer store.deinit();
+    state.storage = store;
+    @memcpy(state.live_owner_puuid[0.."本人".len], "本人");
+    state.live_owner_puuid_len = "本人".len;
+    const history =
+        \\{"games":{"games":[{"gameId":321,"gameCreation":1700000000000,"queueId":420,"participants":[{"puuid":"甲","teamId":100},{"puuid":"乙","teamId":200}]}]}}
+    ;
+    try store.put("matches", "currentPuuid", "甲");
+    try store.put("matches", "current", history);
+    try store.put("history", "encounters", "旧归档保持原样");
+    var output: [32768]u8 = undefined;
+    try std.testing.expectEqualStrings("[]", try cachedEncounterResponse(&state, "乙", 40, 0, &output));
+    @memcpy(state.live_owner_puuid[0.."甲".len], "甲");
+    state.live_owner_puuid_len = "甲".len;
+    const result = try cachedEncounterResponse(&state, "乙", 40, 0, &output);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"gameId\":321") != null);
+    const archive = (try store.get("history", "encounters")).?;
+    defer std.heap.page_allocator.free(archive);
+    try std.testing.expectEqualStrings("旧归档保持原样", archive);
+    try std.testing.expectEqualStrings("[]", try cachedEncounterResponse(&state, "乙", 40, 321, &output));
+}
+
+test "单局详情严格匹配对局编号及双方身份" {
+    const history =
+        \\{"games":{"games":[{"gameId":456,"gameCreation":1700000000000,"gameDuration":1800,"queueId":420,"participants":[{"participantId":1,"puuid":"本人","teamId":100,"championId":1,"stats":{"win":true,"kills":3,"deaths":1,"assists":5}},{"participantId":2,"puuid":"目标","teamId":200,"championId":2,"stats":{"win":false,"kills":1,"deaths":3,"assists":2}}]}]}}
+    ;
+    var output: [128 * 1024]u8 = undefined;
+    const result = try cachedSingleMatch(history, 456, "本人", "目标", "[]", &output);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 456), jsonInt(parsed.value, "gameId"));
+    try std.testing.expectError(error.MatchDetailUnavailable, cachedSingleMatch(history, 457, "本人", "目标", "[]", &output));
+    try std.testing.expectError(error.MatchDetailUnavailable, cachedSingleMatch(history, 456, "他人", "目标", "[]", &output));
+    try std.testing.expectError(error.MatchDetailUnavailable, cachedSingleMatch(history, 456, "本人", "他人", "[]", &output));
+}
+
+test "资料发布更新双方视图和队伍摘要并保留当前英雄" {
+    var state = Runtime.init();
+    const lobby =
+        \\{"id":"789","phase":"ChampSelect","ally":[{"puuid":"123","gameName":"未知玩家","championId":2,"championName":"当前英雄","assignedPosition":"TOP","recentMatches":[],"score":{"total":0}}],"enemy":[],"teams":[{"side":"ally","players":[{"puuid":"123","gameName":"未知玩家","championId":2,"championName":"当前英雄","assignedPosition":"TOP","recentMatches":[],"score":{"total":0}}]}]}
+    ;
+    cacheLiveLobby(&state, lobby);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const original = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"puuid\":\"123\"}", .{});
+    const profile = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"puuid":"真实身份","rosterKey":"123","gameName":"玩家","championId":1,"championName":"请求时英雄","assignedPosition":"MIDDLE","recentMatches":[{"gameId":55}],"score":{"total":75},"dataComplete":true,"dataStatus":{"source":"lcu"}}
+    , .{});
+    try publishLiveProfile(&state, original, profile, "ally", 0);
+    const updated = try std.json.parseFromSliceLeaky(std.json.Value, allocator, state.live_lobby[0..state.live_lobby_len], .{});
+    const ally = updated.object.get("ally").?.array.items[0];
+    const team = updated.object.get("teams").?.array.items[0];
+    for ([_]std.json.Value{ ally, team.object.get("players").?.array.items[0] }) |player| {
+        try std.testing.expectEqualStrings("真实身份", jsonField(player, "puuid"));
+        try std.testing.expectEqualStrings("123", jsonField(player, "rosterKey"));
+        try std.testing.expectEqual(@as(i64, 2), jsonInt(player, "championId"));
+        try std.testing.expectEqualStrings("TOP", jsonField(player, "assignedPosition"));
+        try std.testing.expectEqual(@as(usize, 1), profileArrayLen(player, "recentMatches"));
+    }
+    try std.testing.expectEqual(@as(i64, 75), jsonInt(updated.object.get("allySummary").?, "score"));
+    try std.testing.expectEqual(@as(i64, 75), jsonInt(team.object.get("summary").?, "score"));
+}
+
+test "全零身份不能匹配玩家且五个敌方占位保持独立" {
+    const empty_id = "00000000-0000-0000-0000-000000000000";
+    try std.testing.expect(!samePuuid(empty_id, empty_id));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const first = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"puuid":"00000000-0000-0000-0000-000000000000","gameName":"敌方甲","tagLine":"测试"}
+    , .{});
+    const second = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"puuid":"00000000-0000-0000-0000-000000000000","gameName":"敌方乙","tagLine":"测试"}
+    , .{});
+    try std.testing.expect(!livePlayerMatches(first, second));
+    try std.testing.expectEqual(@as(u8, 0), profileIdentityQuality(first));
+    var buffer: [8192]u8 = undefined;
+    for (0..5) |index| {
+        var writer = std.Io.Writer.fixed(&buffer);
+        try writeProfileWithGroupIndexed(&writer, first, "enemy", index, .null, null);
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, writer.buffered(), .{ .allocate = .alloc_always });
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "enemy-slot-{d}", .{index}), jsonField(value, "puuid"));
+    }
+}
+
+test "开局同人数的新阵容不会被选人占位缓存挡住且公开名字后立即换批次" {
+    var state = Runtime.init();
+    const selection =
+        \\{"id":"42","phase":"ChampSelect","ally":[],"enemy":[{"puuid":"enemy-slot-0","gameName":"未知玩家","championId":1,"recentMatches":[]}]}
+    ;
+    const active =
+        \\{"id":"42","phase":"InProgress","ally":[],"enemy":[{"puuid":"enemy-slot-0","gameName":"已公开敌方","tagLine":"测试","championId":1,"recentMatches":[]}]}
+    ;
+    cacheLiveLobby(&state, selection);
+    cacheChampSelectLobby(&state, selection);
+    state.champ_select_handoff_active = true;
+    refreshLiveGeneration(&state);
+    const generation = state.live_generation;
+    var output: [32768]u8 = undefined;
+    try std.testing.expect(betterCachedLiveLobby(&state, active, "InProgress", false, &output) == null);
+    const merged = try mergeWithBestLiveCache(&state, active, false, &output);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, merged, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("已公开敌方", jsonField(parsed.value.object.get("enemy").?.array.items[0], "gameName"));
+    cacheLiveLobby(&state, merged);
+    refreshLiveGeneration(&state);
+    try std.testing.expect(state.live_generation > generation);
+    const searchable_generation = state.live_generation;
+    cacheLiveLobby(&state, try mergeWithBestLiveCache(&state, active, false, &output));
+    refreshLiveGeneration(&state);
+    try std.testing.expectEqual(searchable_generation, state.live_generation);
+}
+
+test "敌方资料乱序发布只更新自身槽位且不会改变后续批次" {
+    var state = Runtime.init();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var players = std.json.Array.init(allocator);
+    for (0..5) |index| {
+        const json = try std.fmt.allocPrint(allocator,
+            "{{\"puuid\":\"enemy-slot-{d}\",\"gameName\":\"敌方{d}\",\"tagLine\":\"测试\",\"championId\":{d},\"recentMatches\":[],\"score\":{{\"total\":0}}}}",
+            .{ index, index, index + 1 });
+        try players.append(try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{}));
+    }
+    const team_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .array = players }, .{});
+    cacheLiveLobby(&state, try std.fmt.allocPrint(allocator,
+        "{{\"id\":\"789\",\"phase\":\"InProgress\",\"ally\":[],\"enemy\":{s},\"teams\":[{{\"side\":\"enemy\",\"players\":{s}}}]}}", .{ team_json, team_json }));
+    refreshLiveGeneration(&state);
+    const generation = state.live_generation;
+    var completed = [_]bool{false} ** 5;
+    for ([_]usize{ 3, 1, 4, 0, 2 }) |index| {
+        const profile_json = try std.fmt.allocPrint(allocator,
+            "{{\"puuid\":\"已解析{d}\",\"rosterKey\":\"enemy-slot-{d}\",\"gameName\":\"敌方{d}\",\"championId\":999,\"recentMatches\":[{{\"gameId\":{d}}}],\"score\":{{\"total\":{d}}},\"dataComplete\":true}}",
+            .{ index, index, index, 100 + index, 60 + index });
+        const profile = try std.json.parseFromSliceLeaky(std.json.Value, allocator, profile_json, .{});
+        try publishLiveProfile(&state, players.items[index], profile, "enemy", index);
+        completed[index] = true;
+        refreshLiveGeneration(&state);
+        try std.testing.expectEqual(generation, state.live_generation);
+        const updated = try std.json.parseFromSliceLeaky(std.json.Value, allocator, state.live_lobby[0..state.live_lobby_len], .{ .allocate = .alloc_always });
+        for ([_]std.json.Value{ updated.object.get("enemy").?, updated.object.get("teams").?.array.items[0].object.get("players").? }) |team| {
+            for (team.array.items, 0..) |player, slot| {
+                try std.testing.expectEqual(@as(i64, @intCast(slot + 1)), jsonInt(player, "championId"));
+                try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "敌方{d}", .{slot}), jsonField(player, "gameName"));
+                if (completed[slot]) {
+                    try std.testing.expectEqual(@as(i64, @intCast(100 + slot)), jsonInt(player.object.get("recentMatches").?.array.items[0], "gameId"));
+                } else try std.testing.expectEqual(@as(usize, 0), profileArrayLen(player, "recentMatches"));
+            }
+        }
+        try std.testing.expectEqual(@as(i64, 999), jsonInt(profile, "championId"));
+    }
+}
+
+test "排位过滤先筛选再分页和统计且关闭后恢复全部原始战绩" {
+    const history =
+        \\{"games":{"games":[{"gameId":1,"queueId":450,"gameDuration":1800,"participants":[{"puuid":"本人","championId":1,"teamId":100,"win":false}]},{"gameId":2,"queueId":420,"gameDuration":1800,"participants":[{"puuid":"本人","championId":1,"teamId":100,"win":true}]},{"gameId":3,"queueId":440,"gameDuration":1800,"participants":[{"puuid":"本人","championId":1,"teamId":100,"win":true}]}]}}
+    ;
+    var output: [32 * 1024]u8 = undefined;
+    const page = try matchHistoryDtoPageWithFilters(history, "[]", "本人", 1, 1, false, true, &output);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, page, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    try std.testing.expectEqual(@as(i64, 3), jsonInt(parsed.value.array.items[0], "gameId"));
+    var writer = std.Io.Writer.fixed(&output);
+    try std.testing.expectEqual(@as(usize, 2), try writeRecentMatchesFiltered(&writer, history, .null, "本人", 20, true));
+    const recent = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
+    defer recent.deinit();
+    for (recent.value.array.items) |game| try std.testing.expect(jsonBool(game, "win") and isRankedHistoryGame(game));
+    writer = std.Io.Writer.fixed(&output);
+    try std.testing.expectEqual(@as(usize, 3), try writeRecentMatchesFiltered(&writer, history, .null, "本人", 20, false));
+}
+
+test "切换排位口径取消旧批次并清除已生成统计" {
+    var state = Runtime.init();
+    cacheLiveLobby(&state, "{\"id\":\"42\",\"phase\":\"InProgress\",\"ally\":[{\"puuid\":\"本人\"}],\"enemy\":[]}");
+    refreshLiveGeneration(&state);
+    const Context = struct {
+        fn execute(_: *anyopaque, _: usize) void {}
+    };
+    var dummy: u8 = 0;
+    var batch = LiveLoadBatch{ .parent = &state, .snapshot = &state, .generation = state.live_generation, .started_ms = 0, .queue = .{ .count = 0, .context = &dummy, .execute = Context.execute } };
+    state.live_load = &batch;
+    const old_request_generation = state.request_generation;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var config = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), state.config[0..state.config_len], .{});
+    config.object.getPtr("providers").?.object.getPtr("rankedOnly").?.* = .{ .bool = true };
+    const payload = try std.json.Stringify.valueAlloc(arena.allocator(), .{ .value = config }, .{});
+    var output: [16 * 1024]u8 = undefined;
+    _ = try saveConfig(&state, .{ .request = .{ .id = "设置验证", .command = "lol.save_config", .payload = payload }, .source = .{ .origin = "zero://app" } }, &output);
+    try std.testing.expect(runtimeRankedOnly(&state));
+    try std.testing.expectEqual(@as(usize, 0), state.live_lobby_len);
+    try std.testing.expect(batch.queue.cancelled.load(.acquire));
+    try std.testing.expect(state.request_generation > old_request_generation);
+    try std.testing.expect(state.live_generation > batch.generation);
+}
+
+test "部分资料失败保留已成功字段并标记旧数据" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const base = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"puuid":"本人","rankTier":"GOLD","recentMatches":[{"gameId":1}],"score":{"total":60},"unavailableSources":[]}
+    , .{});
+    const partial = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"puuid":"本人","rankTier":"DIAMOND","recentMatches":[],"score":{"total":0},"dataComplete":false,"unavailableSources":["recentMatches"],"dataStatus":{"source":"lcu","isStale":false}}
+    , .{});
+    const merged = try mergeLobbyProfile(arena.allocator(), base, partial, true);
+    try std.testing.expectEqualStrings("DIAMOND", jsonField(merged, "rankTier"));
+    try std.testing.expectEqual(@as(usize, 1), profileArrayLen(merged, "recentMatches"));
+    try std.testing.expect(jsonBool(merged.object.get("dataStatus").?, "isStale"));
+}
+
+test "身份补全不会换批次而换局会取消旧任务" {
+    var state = Runtime.init();
+    cacheLiveLobby(&state, "{\"id\":\"1\",\"phase\":\"ChampSelect\",\"ally\":[{\"puuid\":\"123\"}],\"enemy\":[]}");
+    refreshLiveGeneration(&state);
+    const generation = state.live_generation;
+    const Context = struct {
+        fn execute(_: *anyopaque, _: usize) void {}
+    };
+    var dummy: u8 = 0;
+    var batch = LiveLoadBatch{ .parent = &state, .snapshot = &state, .generation = generation, .started_ms = 0, .queue = .{ .count = 0, .context = &dummy, .execute = Context.execute } };
+    state.live_load = &batch;
+    cacheLiveLobby(&state, "{\"id\":\"1\",\"phase\":\"ChampSelect\",\"ally\":[{\"puuid\":\"真实身份\",\"rosterKey\":\"123\"}],\"enemy\":[]}");
+    refreshLiveGeneration(&state);
+    try std.testing.expectEqual(generation, state.live_generation);
+    try std.testing.expect(!batch.queue.cancelled.load(.acquire));
+    cacheLiveLobby(&state, "{\"id\":\"2\",\"phase\":\"InProgress\",\"ally\":[{\"puuid\":\"其他玩家\"}],\"enemy\":[]}");
+    refreshLiveGeneration(&state);
+    try std.testing.expect(state.live_generation > generation);
+    try std.testing.expect(batch.queue.cancelled.load(.acquire));
 }
 
 test "maps LCU match history into frontend summaries" {

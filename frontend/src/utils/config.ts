@@ -1,6 +1,6 @@
 import type { AppConfig, ShortcutDefinition } from "../types/domain";
 
-export const CURRENT_CONFIG_VERSION = 17;
+export const CURRENT_CONFIG_VERSION = 18;
 export const defaultOpenGameShortcutKey = "Ctrl+F1";
 
 export const defaultAssessmentTemplate =
@@ -26,6 +26,14 @@ export const encounterShortcut: ShortcutDefinition = {
 
 export function migrateAppConfig(config: AppConfig) {
   let changed = false;
+  if (typeof config.providers.rankedOnly !== "boolean") {
+    config.providers.rankedOnly = false;
+    changed = true;
+  }
+  if (typeof config.automation.protectChatInput !== "boolean") {
+    config.automation.protectChatInput = true;
+    changed = true;
+  }
   if (!Number.isFinite(config.automation.autoAcceptDelaySeconds)) {
     config.automation.autoAcceptDelaySeconds = 0;
     changed = true;
@@ -80,11 +88,14 @@ export function migrateAppConfig(config: AppConfig) {
       changed = true;
     }
   }
-  if (config.version < CURRENT_CONFIG_VERSION) {
+  if (config.version < 16) {
     config.automation.shortcutSendIntervalMs = 250;
     for (const shortcut of config.automation.shortcuts) {
       if (shortcut.id === "enemy" || shortcut.id === "ally") shortcut.template = defaultAssessmentTemplate;
     }
+    changed = true;
+  }
+  if (config.version < CURRENT_CONFIG_VERSION) {
     config.version = CURRENT_CONFIG_VERSION;
     changed = true;
   }

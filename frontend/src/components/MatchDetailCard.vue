@@ -17,14 +17,14 @@ const unfinished = (match: MatchSummary | RecentMatch) => match.durationMinutes 
 const win = (match: MatchSummary | RecentMatch) => !unfinished(match) && ("win" in match ? match.win : match.result === "胜利");
 const resultLabel = (match: MatchSummary | RecentMatch) => unfinished(match) ? "未完成" : win(match) ? "胜利" : "失败";
 const resultClass = (match: MatchSummary | RecentMatch) => unfinished(match) ? "unfinished" : win(match) ? "win" : "loss";
-const performance = (match: MatchSummary | RecentMatch) => match.performance;
+const performance = (match: MatchSummary | RecentMatch) => !win(match) && match.performance === "carried" ? "solid" : match.performance;
 const performanceLabel = (match: MatchSummary | RecentMatch) => {
   const labels = { carry: "Carry", solid: "正常", carried: "躺赢", struggling: "低迷" } as const;
   return labels[performance(match)];
 };
 const outcomeLabel = (match: MatchSummary | RecentMatch) => {
   if (unfinished(match)) return null;
-  if (performance(match) === "carried") return "躺赢局";
+  if (win(match) && performance(match) === "carried") return "躺赢局";
   if (win(match) && match.kills >= 8 && match.deaths <= 3 && match.damageShare >= 0.25) return "碾压局";
   if (!win(match) && match.deaths <= 4 && match.damageShare >= 0.25) return "惜败局";
   return null;

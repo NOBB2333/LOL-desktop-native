@@ -13,12 +13,13 @@
 - 本工程明确不引入 Electron：LCU lockfile 发现、loopback HTTPS、DTO 转换、查询轮询和自动化动作都在 Zig 原生层，Vue 只负责界面和交互。
 - Native bridge 已覆盖配置、连接、实时会话、历史、英雄目录、资源、导出、快捷消息和自动化命令；没有 LCU 进程时返回可解释的 `LcuNotRunning`，不会把 Fixture 当作实时数据。
 - LCU 凭据支持 `LeagueClientUx.exe` 命令行和 lockfile 发现；REST 使用 loopback HTTPS。应用级轮询持续观察 gameflow、champ-select、lobby、ready-check 和 spectator 资源，不要求停留在对局页面。
-- SQLite snapshots 已用于配置、战绩/英雄缓存和遭遇/BP 数据；JSON 文件仍作为可迁移的降级格式。
+- SQLite snapshots 用于配置、已有战绩/英雄缓存和 BP 数据；玩家缓存按账号和大区隔离。“遇到过”从已有战绩派生，不限制最近一年，不新增长期玩家档案，旧相遇归档退出运行时读写。
+- 状态、阵容、查询和动作使用独立原生通道，玩家资料最多四名同时加载并逐名发布。Windows HTTP 支持来源配额、总超时和取消，排队消息跨会话自动失效。
 - Windows manifest shortcut 提供默认全局快捷键，页面监听配置文件中的自定义组合键；快捷消息在英雄选择阶段通过 LCU chat API 发送，游戏内阶段由 Zig 直接调用 Windows `SendInput` 发送 Unicode 键盘事件，不启动 PowerShell也不改写剪贴板。
 
 ## 开发
 
-需要 Node.js、npm/pnpm、Zig 0.16 和 Native SDK CLI。
+需要 Node.js 24.15.0（见 `.node-version`）、npm/pnpm、Zig 0.16 和 Native SDK CLI。若 SDK 安装在全局目录，Zig 命令需要显式传入 `-Dnative-sdk-path=<SDK路径>`；默认路径是项目内的 `node_modules/@native-sdk/cli`。
 
 ```sh
 npm install --prefix frontend
@@ -44,6 +45,10 @@ zig build -Dplatform=null
 Native SDK 路径、开发端口、LCU 常规/2999 探测超时、证书策略、版本检查地址、Windows 管理员权限和打包目标优先读取 `config/native.json`，也可以显式传入
 `-Dnative-sdk-path=...`。应用运行时不依赖项目自定义环境变量。
 `scripts/build.*` 会先根据该文件同步 `app.json` 的开发 URL 和 origin，端口只需修改一处。
+
+受控网络验证使用 `node scripts/verify-network.mjs -Dnative-sdk-path=<SDK路径>`；只读客户端验证使用 `zig build verify-runtime -Dplatform=null -Dnative-sdk-path=<SDK路径>`。后者仅在内存中缓存读取结果，不发送聊天或执行自动化。
+
+改造状态、实测边界和本轮分发产物见 [改造结果与验收方案](docs/IMPROVEMENT_PLAN.md)。
 
 ## Bridge 约定
 

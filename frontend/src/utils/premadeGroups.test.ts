@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { fixtureLobby } from "../fixtures/data";
 import type { PlayerProfile } from "../types/domain";
-import { assignPremadeTones } from "./premadeGroups";
+import { assignPremadeTones, findLocalPlayer, isLocalPartyMember } from "./premadeGroups";
 
 function player(name: string, premadeWith: string[] = [], isPremade = premadeWith.length > 0): PlayerProfile {
   return {
@@ -89,5 +89,20 @@ describe("premade card tones", () => {
     expect(tones.get(allyFirst)).toBe(tones.get(allySecond));
     expect(tones.get(enemyFirst)).toBe(tones.get(enemySecond));
     expect(tones.get(allyFirst)).not.toBe(tones.get(enemyFirst));
+  });
+
+  it("identifies only players in the current account's party", () => {
+    const local = { ...player("本人", ["开黑队友"]), tagLine: "ME" };
+    const party = player("开黑队友", ["本人"]);
+    const otherPartyA = player("其他甲", ["其他乙"]);
+    const otherPartyB = player("其他乙", ["其他甲"]);
+    const players = [local, party, otherPartyA, otherPartyB];
+    const tones = assignPremadeTones([players]);
+    const found = findLocalPlayer(players, "本人", "ME");
+
+    expect(found).toBe(local);
+    expect(isLocalPartyMember(found, party, tones)).toBe(true);
+    expect(isLocalPartyMember(found, otherPartyA, tones)).toBe(false);
+    expect(isLocalPartyMember(found, local, tones)).toBe(false);
   });
 });

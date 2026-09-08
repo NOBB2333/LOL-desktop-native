@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { NModal } from "naive-ui";
+import { RefreshCw } from "@lucide/vue";
 import { computed } from "vue";
-import type { EncounterRecord } from "../types/domain";
+import type { EncounterRecord, MatchSummary } from "../types/domain";
 import { championImage, roleName } from "../utils/format";
 import AssetIcon from "./AssetIcon.vue";
 
@@ -23,8 +24,11 @@ const props = defineProps<{
   show: boolean;
   records: EncounterRecord[];
   targetPuuid: string;
+  detail?: MatchSummary;
+  loading?: boolean;
+  error?: boolean;
 }>();
-const emit = defineEmits<{ "update:show": [value: boolean] }>();
+const emit = defineEmits<{ "update:show": [value: boolean]; retry: [] }>();
 const sides = ["ally", "enemy"] as const;
 
 const anchor = computed(() => props.records[0] ?? null);
@@ -93,7 +97,7 @@ function isSelf(player: EncounterParticipant) {
     :show="show"
     preset="card"
     class="encounter-match"
-    :style="{ width: 'min(920px, calc(100vw - 32px))' }"
+    :style="{ width: 'min(1180px, calc(100vw - 32px))' }"
     :title="anchor ? `历史对局 #${anchor.gameId}` : '历史对局'"
     :bordered="false"
     @update:show="emit('update:show', $event)"
@@ -103,7 +107,10 @@ function isSelf(player: EncounterParticipant) {
       <span>{{ new Date(anchor.encounteredAt).toLocaleString("zh-CN", { hour12: false }) }}</span>
       <b :data-win="anchor.selfWin === true">{{ anchor.result || "结果待结算" }}</b>
     </div>
-    <div class="encounter-match__teams">
+    <div v-if="loading" class="encounter-match__status" role="status">正在读取完整对局...</div>
+    <div v-else-if="error" class="encounter-match__status" role="alert">完整详情读取失败，当前显示相遇摘要<button type="button" title="重试完整详情" aria-label="重试完整详情" @click="emit('retry')"><RefreshCw :size="14" /></button></div>
+    <slot v-if="detail" name="detail" />
+    <div v-else class="encounter-match__teams">
       <section v-for="side in sides" :key="side" :data-side="side">
         <header><strong>{{ side === "ally" ? "我方阵容" : "敌方阵容" }}</strong><span>{{ team(side).length }} 人</span></header>
         <div class="encounter-match__players">
@@ -120,6 +127,8 @@ function isSelf(player: EncounterParticipant) {
 </template>
 
 <style scoped>
+.encounter-match__status { display: flex; align-items: center; gap: 12px; padding: 10px 0; color: var(--text-secondary); font-size: 12px; }
+.encounter-match__status button { display: grid; place-items: center; width: 28px; height: 28px; border: 1px solid var(--line); color: inherit; background: transparent; cursor: pointer; }
 .encounter-match__meta { display: flex; align-items: center; gap: 10px; padding: 0 0 12px; border-bottom: 1px solid var(--line); }
 .encounter-match__meta strong { font-size: 13px; }
 .encounter-match__meta span { flex: 1; color: var(--text-secondary); font-size: 10px; }

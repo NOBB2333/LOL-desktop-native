@@ -1,5 +1,31 @@
 const std = @import("std");
 
+pub fn chatMessageBody(lines: std.json.Value, allocator: std.mem.Allocator) ![]const u8 {
+    if (lines != .array) return error.InvalidMessage;
+    var joined: std.array_list.Managed(u8) = .init(allocator);
+    defer joined.deinit();
+    for (lines.array.items) |line| {
+        if (line != .string) continue;
+        const text = std.mem.trim(u8, line.string, " \t\r\n");
+        if (text.len == 0) continue;
+        if (joined.items.len > 0) try joined.append('\n');
+        try joined.appendSlice(text);
+    }
+    if (joined.items.len == 0) return error.NoMessages;
+    return std.json.Stringify.valueAlloc(allocator, .{ .body = joined.items, .type = "chat" }, .{});
+}
+
+test "选人消息一次提交并保留换行与引号" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "[\"第一条\",\"  \",\"带有\\\"引号\\\"的第二条\"]", .{});
+    defer parsed.deinit();
+    const body = try chatMessageBody(parsed.value, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    const result = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("第一条\n带有\"引号\"的第二条", result.value.object.get("body").?.string);
+    try std.testing.expectEqualStrings("chat", result.value.object.get("type").?.string);
+}
+
 const max_chat_line_chars = 120;
 const max_premade_players = 16;
 const premade_inference_match_threshold = 5;
@@ -129,6 +155,21 @@ pub fn buildEncounterLinesOwned(archive_json: []const u8, lobby_json: []const u8
     const archive = std.json.parseFromSliceLeaky(std.json.Value, allocator, archive_json, .{}) catch return error.InvalidLobby;
     const lobby = std.json.parseFromSliceLeaky(std.json.Value, allocator, lobby_json, .{}) catch return error.InvalidLobby;
     if (archive != .array or lobby != .object) return std.fmt.bufPrint(output, "[]", .{});
+    var owner_player: ?std.json.Value = null;
+    var owner_side: []const u8 = "";
+    if (owner_puuid.len > 0) {
+        for ([_][]const u8{ "ally", "enemy" }) |side| {
+            const players = arrayField(lobby, side) orelse continue;
+            for (players.array.items) |player| {
+                if (player == .object and std.ascii.eqlIgnoreCase(jsonStringField(player, "puuid"), owner_puuid)) {
+                    owner_player = player;
+                    owner_side = side;
+                    break;
+                }
+            }
+            if (owner_player != null) break;
+        }
+    }
     var writer = std.Io.Writer.fixed(output);
     try writer.writeByte('[');
     var emitted = false;
@@ -140,6 +181,15 @@ pub fn buildEncounterLinesOwned(archive_json: []const u8, lobby_json: []const u8
             if (player != .object) continue;
             const puuid = jsonStringField(player, "puuid");
             if (puuid.len == 0) continue;
+            if (owner_player) |owner| {
+                if (std.mem.eql(u8, side, owner_side) and
+                    (samePremadeGroup(owner, player) or
+                        referencesPremadePlayer(owner, player, players.array.items) or
+                        referencesPremadePlayer(player, owner, players.array.items)))
+                {
+                    continue;
+                }
+            }
             for (archive.array.items) |record| {
                 if (record != .object or !std.mem.eql(u8, jsonStringField(record, "puuid"), puuid)) continue;
                 if (owner_puuid.len > 0 and !std.ascii.eqlIgnoreCase(jsonStringField(record, "selfPuuid"), owner_puuid)) continue;
@@ -1200,6 +1250,16 @@ test "encounter shortcut excludes another owner and the current game" {
     const lobby = "{\"id\":\"8\",\"ally\":[],\"enemy\":[{\"puuid\":\"enemy\"}]}";
     var output: [4096]u8 = undefined;
     try std.testing.expectEqualStrings("[]", try buildEncounterLinesOwned(archive, lobby, "self", &output));
+}
+
+test "encounter shortcut excludes the local player's current premade" {
+    const archive = "[{\"gameId\":7,\"selfPuuid\":\"self\",\"puuid\":\"party\",\"gameName\":\"开黑队友\",\"encounteredAt\":\"2026-09-06T10:00:00.000Z\"},{\"gameId\":6,\"selfPuuid\":\"self\",\"puuid\":\"random\",\"gameName\":\"随机队友\",\"encounteredAt\":\"2026-09-05T10:00:00.000Z\"},{\"gameId\":5,\"selfPuuid\":\"self\",\"puuid\":\"enemy\",\"gameName\":\"随机对手\",\"encounteredAt\":\"2026-09-04T10:00:00.000Z\"}]";
+    const lobby = "{\"ally\":[{\"puuid\":\"self\",\"gameName\":\"本人\",\"premadeGroup\":\"party-a\"},{\"puuid\":\"party\",\"gameName\":\"开黑队友\",\"premadeGroup\":\"party-a\"},{\"puuid\":\"random\",\"gameName\":\"随机队友\"}],\"enemy\":[{\"puuid\":\"enemy\",\"gameName\":\"随机对手\"}]}";
+    var output: [4096]u8 = undefined;
+    const result = try buildEncounterLinesOwned(archive, lobby, "self", &output);
+    try std.testing.expect(std.mem.indexOf(u8, result, "开黑队友") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "随机队友") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "随机对手") != null);
 }
 
 test "premade summary joins one inferred party in a single bracket" {

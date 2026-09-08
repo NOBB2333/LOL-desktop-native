@@ -7,6 +7,26 @@ function normalizedName(value: string) {
   return value.trim().toLocaleLowerCase();
 }
 
+export function findLocalPlayer(players: readonly PlayerProfile[], gameName?: string | null, tagLine?: string | null) {
+  const name = normalizedName(gameName ?? "");
+  const tag = normalizedName(tagLine ?? "");
+  if (!name) return null;
+  return players.find((player) => {
+    if (normalizedName(player.gameName) !== name) return false;
+    return !tag || !player.tagLine || normalizedName(player.tagLine) === tag;
+  }) ?? null;
+}
+
+export function isLocalPartyMember(local: PlayerProfile | null, player: PlayerProfile, tones: ReadonlyMap<PlayerProfile, number>) {
+  if (!local || local === player || (local.puuid && player.puuid && local.puuid === player.puuid)) return false;
+  const localTone = tones.get(local);
+  if (localTone !== undefined && tones.get(player) === localTone) return true;
+  const localGroup = local.premadeGroup?.trim();
+  if (localGroup && localGroup !== "0" && localGroup === player.premadeGroup?.trim()) return true;
+  return local.premadeWith.some((name) => normalizedName(name) === normalizedName(player.gameName))
+    || player.premadeWith.some((name) => normalizedName(name) === normalizedName(local.gameName));
+}
+
 function teamPremadeGroups(players: readonly PlayerProfile[]) {
   const names = new Map<string, number[]>();
   players.forEach((player, index) => {

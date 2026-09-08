@@ -537,8 +537,12 @@ fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
 test "selects a local in-progress action and skips occupied candidates" {
     const config_json = "{\"automation\":{\"enabled\":true,\"autoPick\":true,\"autoBan\":true,\"pickChampionIds\":[103,64]}}";
     const session_json = "{\"localPlayerCellId\":1,\"myTeam\":[{\"championId\":103}],\"theirTeam\":[],\"actions\":[[{\"id\":9,\"actorCellId\":2,\"type\":\"pick\",\"completed\":false,\"isInProgress\":true},{\"id\":10,\"actorCellId\":1,\"type\":\"pick\",\"completed\":false,\"isInProgress\":true}]]}";
-    const config = try std.json.parseFromSliceLeaky(std.json.Value, std.testing.allocator, config_json, .{});
-    const session = try std.json.parseFromSliceLeaky(std.json.Value, std.testing.allocator, session_json, .{});
+    const config_json_value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer config_json_value.deinit();
+    const config = config_json_value.value;
+    const session_json_value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, session_json, .{});
+    defer session_json_value.deinit();
+    const session = session_json_value.value;
     const action = selectPendingAction(config, session).?;
     try std.testing.expectEqualStrings("pick", action.action_type);
     try std.testing.expectEqual(@as(i64, 10), action.action_id);
@@ -548,8 +552,12 @@ test "selects a local in-progress action and skips occupied candidates" {
 test "keeps the LCU champion pick intent when it is the available candidate" {
     const config_json = "{\"automation\":{\"enabled\":true,\"autoPick\":true,\"pickChampionIds\":[103,64]}}";
     const session_json = "{\"localPlayerCellId\":1,\"myTeam\":[{\"championId\":103}],\"theirTeam\":[],\"actions\":[[{\"id\":10,\"actorCellId\":1,\"type\":\"pick\",\"championId\":0,\"championPickIntent\":64,\"completed\":false,\"isInProgress\":true}]]}";
-    const config = try std.json.parseFromSliceLeaky(std.json.Value, std.testing.allocator, config_json, .{});
-    const session = try std.json.parseFromSliceLeaky(std.json.Value, std.testing.allocator, session_json, .{});
+    const config_json_value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer config_json_value.deinit();
+    const config = config_json_value.value;
+    const session_json_value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, session_json, .{});
+    defer session_json_value.deinit();
+    const session = session_json_value.value;
     const action = selectPendingAction(config, session).?;
     try std.testing.expectEqual(@as(i64, 64), action.champion_id);
     try std.testing.expectEqual(@as(i64, 64), action.current_champion_id);
@@ -558,8 +566,12 @@ test "keeps the LCU champion pick intent when it is the available candidate" {
 test "auto pick keeps configured candidate separate from transient action id" {
     const config_json = "{\"automation\":{\"enabled\":true,\"autoPick\":true,\"pickChampionIds\":[103,64]}}";
     const session_json = "{\"localPlayerCellId\":1,\"myTeam\":[],\"theirTeam\":[],\"actions\":[[{\"id\":10,\"actorCellId\":1,\"type\":\"pick\",\"championId\":0,\"championPickIntent\":64,\"completed\":false,\"isInProgress\":true}]]}";
-    const config = try std.json.parseFromSliceLeaky(std.json.Value, std.testing.allocator, config_json, .{});
-    const session = try std.json.parseFromSliceLeaky(std.json.Value, std.testing.allocator, session_json, .{});
+    const config_json_value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer config_json_value.deinit();
+    const config = config_json_value.value;
+    const session_json_value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, session_json, .{});
+    defer session_json_value.deinit();
+    const session = session_json_value.value;
     const action = selectPendingAction(config, session).?;
     try std.testing.expectEqual(@as(i64, 103), action.champion_id);
     try std.testing.expectEqual(@as(i64, 64), action.current_champion_id);
@@ -584,12 +596,16 @@ test "pick action body is an intent while bans complete immediately" {
 
 test "unknown pick strategies are safe and still show before locking" {
     const config_json = "{\"automation\":{\"autoPickStrategy\":\"legacy-immediate\"}}";
-    const config = try std.json.parseFromSliceLeaky(std.json.Value, std.testing.allocator, config_json, .{});
+    const config_json_value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer config_json_value.deinit();
+    const config = config_json_value.value;
     try std.testing.expectEqualStrings("show-and-lock-in", pickStrategy(config));
 }
 
 test "treats the current champion-select ban list as occupied" {
-    const session = try std.json.parseFromSliceLeaky(std.json.Value, std.testing.allocator, "{\"bans\":{\"champions\":[103,64]}}", .{});
+    const session_json_value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"bans\":{\"champions\":[103,64]}}", .{});
+    defer session_json_value.deinit();
+    const session = session_json_value.value;
     try std.testing.expect(championOccupied(session, 103));
     try std.testing.expect(!championOccupied(session, 7));
 }

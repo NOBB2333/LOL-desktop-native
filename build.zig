@@ -378,6 +378,15 @@ pub fn build(b: *std.Build) void {
     backend_test_mod.addImport("storage", storage_test_mod);
     addSqliteEngine(b, backend_test_mod, native_sdk_path);
     const backend_tests = b.addTest(.{ .root_module = backend_test_mod });
+    const verify_mod = localModule(b, target, optimize, "src/verify_runtime.zig");
+    verify_mod.addImport("backend", backend_test_mod);
+    verify_mod.addImport("lcu", lcu_mod);
+    verify_mod.addImport("storage", storage_test_mod);
+    const verify_exe = b.addExecutable(.{ .name = "verify-runtime", .root_module = verify_mod });
+    const verify_run = b.addRunArtifact(verify_exe);
+    if (b.args) |args| verify_run.addArgs(args);
+    const verify_step = b.step("verify-runtime", "验证受控网络或只读客户端接口");
+    verify_step.dependOn(&verify_run.step);
     const lcu_tests = b.addTest(.{ .root_module = lcu_mod });
     const runner_tests = b.addTest(.{ .root_module = runner_mod });
     test_step.dependOn(&b.addRunArtifact(app_tests).step);

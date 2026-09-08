@@ -9,7 +9,7 @@ const labels = { early: "前期", mid: "中期", late: "后期", teamfight: "团
 <template>
   <section class="team-summary-card" :data-side="side">
     <div class="summary-score"><span>队伍评分</span><strong>{{ summary.score.toFixed(1) }}</strong><small>{{ summary.title }}</small></div>
-    <div class="composition-grid">
+    <div v-if="summary.composition" class="composition-grid">
       <div v-for="(value, key) in summary.composition" :key="key">
         <span>{{ labels[key] }}</span><i><b :class="meterClass(value)" /></i><em>{{ value }}</em>
       </div>

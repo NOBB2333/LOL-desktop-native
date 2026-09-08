@@ -8,45 +8,58 @@ import MatchDetailCard from "../components/MatchDetailCard.vue";
 import PageHeader from "../components/PageHeader.vue";
 import PlayerCard from "../components/PlayerCard.vue";
 import PlayerDetailDrawer from "../components/PlayerDetailDrawer.vue";
+import EncounterDetails from "../components/EncounterDetails.vue";
+import { useEncounters } from "../composables/useEncounters";
 import TeamSummaryCard from "../components/TeamSummaryCard.vue";
 import { backend, isTauri } from "../services/backend";
 import { useAppStore } from "../stores/app";
-import type { LiveLobby, LiveTeam, PlayerProfile } from "../types/domain";
+import type { EncounterRecord, LiveLobby, LiveTeam, PlayerProfile } from "../types/domain";
 import { createCoalescedAsyncRunner } from "../utils/coalescedAsync";
 import { roleName } from "../utils/format";
-import { enrichedRosterCoversOverlay, mergeRosterSnapshot } from "../utils/liveRoster";
+import { enrichedRosterCoversOverlay, mergeRosterSnapshot, playerCardKey } from "../utils/liveRoster";
 import { isActiveGamePhase, isCurrentLiveSnapshot, isVisibleGamePhase, shouldAutoHideLivePanel, shouldResetClearedLivePanel } from "../utils/livePanel";
-import { assignPremadeTones } from "../utils/premadeGroups";
+import { assignPremadeTones, findLocalPlayer, isLocalPartyMember } from "../utils/premadeGroups";
 import { queueLabel } from "../utils/queue";
 
 const app = useAppStore();
 const message = useMessage();
 const MAX_RECENT_MATCHES = 20;
-// Resolve the fast topology first so the ten-player board can render before
-// the rank/history enrichment request completes.
+// 先展示快速阵容，再逐步补齐各玩家的段位和战绩。
 const initialRosterReady = ref(!isTauri());
 const lastSuccessfulLobbyRequestStartedAt = ref(0);
+let forceNextLobby = false;
 async function fetchLobby() {
   const startedAt = Date.now();
-  const snapshot = await backend.lobby();
+  const force = forceNextLobby;
+  forceNextLobby = false;
+  const snapshot = await backend.lobby(force);
   lastSuccessfulLobbyRequestStartedAt.value = startedAt;
   return snapshot;
 }
 const lobby = useQuery({
-  queryKey: computed(() => ["lobby", app.mode, app.connection.platformId, app.connection.gameName, app.connection.tagLine]),
+  queryKey: computed(() => ["lobby", app.mode, app.connection.platformId, app.connection.gameName, app.connection.tagLine, app.config.providers.rankedOnly]),
   queryFn: fetchLobby,
   enabled: computed(() => app.initialized && initialRosterReady.value),
   staleTime: 2000,
-  refetchInterval: computed(() => {
+  refetchInterval: (query) => {
+    if (query.state.data?.loading?.active) return 750;
     if (!app.initialized || app.mode !== "live") return false;
-    // LCU briefly reports `error`/`disconnected` while ChampSelect hands off
-    // to gameflow and Live Client Data. Keep polling so the retained roster
-    // can be replaced as soon as the in-game endpoint becomes available.
+    // 选人到游戏期间连接可能短暂异常，继续轮询以便及时接入游戏阵容。
     return !app.connection.phase || isVisibleGamePhase(app.connection.phase) ? 4000 : 12000;
-  }),
+  },
   retry: 1,
 });
-const selectedPlayer = ref<PlayerProfile | null>(null);
+const selectedIdentity = ref<Pick<PlayerProfile, "puuid" | "gameName" | "tagLine"> | null>(null);
+const selectedPlayer = computed(() => {
+  const identity = selectedIdentity.value;
+  if (!identity) return null;
+  return teams.value.flatMap((team) => team.players).find((player) => player.puuid === identity.puuid || player.rosterKey === identity.puuid
+    || (identity.tagLine && player.gameName === identity.gameName && player.tagLine === identity.tagLine)) ?? null;
+});
+const selectedEncounterRecords = ref<EncounterRecord[]>([]);
+const selectedEncounterTarget = ref("");
+const encounterModalOpen = ref(false);
+const selectedMatchId = ref<number | null>(null);
 const drawerOpen = ref(false);
 const sending = ref<string | null>(null);
 const lastSentLines = ref<string[]>([]);
@@ -65,6 +78,11 @@ let rosterGeneration = 0;
 const rosterOverlay = ref<LiveLobby | null>(null);
 const rosterOverlayRequestStartedAt = ref(0);
 const connectionPhaseChangedAt = ref(Date.now());
+watch(() => app.config.providers.rankedOnly, () => {
+  rosterGeneration += 1;
+  rosterOverlay.value = null;
+  selectedMatchId.value = null;
+});
 
 const liveSnapshot = computed(() => {
   const base = lobby.data.value;
@@ -118,9 +136,7 @@ function orderedPlayers(players: PlayerProfile[]) {
 function shouldSortPlayers(value: LiveLobby, source: LiveTeam[]) {
   if (value.phase === "ChampSelect" || value.phase === "ReadyCheck") return false;
   const knownRoles = new Set(source.flatMap((team) => team.players).map((player) => playerRoleOrder(player)).filter((role) => role < 99));
-  // Two distinct role signals are enough to establish a classic lane order;
-  // one Smite in an otherwise role-less mode (for example ARAM variants)
-  // must not move a single player out of the original roster order.
+  // 至少确认两种位置才按分路排序，避免无分路模式仅因惩戒而改变顺序。
   return knownRoles.size >= 2;
 }
 const teams = computed<LiveTeam[]>(() => {
@@ -140,6 +156,18 @@ const enemyPlayers = computed(() => enemyTeam.value.players);
 const hasLobbyPlayers = computed(() => teams.value.some((team) => team.players.length > 0));
 const premadeTones = computed(() => assignPremadeTones(teams.value.map((team) => team.players)));
 const premadeTone = (player: PlayerProfile) => premadeTones.value.get(player);
+const localPlayer = computed(() => findLocalPlayer(allyTeam.value.players, app.connection.gameName, app.connection.tagLine));
+const encounterQuery = useEncounters(
+  "", () => Boolean(current.value && app.initialized),
+  () => Number(current.value?.id) || 0,
+  () => teams.value.flatMap((team) => team.players).map((player) => `${player.puuid}:${player.dataStatus?.fetchedAt}:${player.recentMatches.length}`).join("|"),
+);
+function selectEncounter(player: PlayerProfile, records: EncounterRecord[]) {
+  selectedEncounterTarget.value = player.puuid;
+  selectedEncounterRecords.value = records;
+  encounterModalOpen.value = true;
+}
+const isMyPartyMember = (player: PlayerProfile) => isLocalPartyMember(localPlayer.value, player, premadeTones.value);
 const dataSource = computed(() => {
   if (current.value?.phase === "Retained") return "上一局快照";
   const player = teams.value.flatMap((team) => team.players).find((item) => item.dataStatus);
@@ -182,7 +210,8 @@ const dangerPoints = computed(() => {
   return points;
 });
 
-function selectPlayer(player: PlayerProfile) { selectedPlayer.value = player; drawerOpen.value = true; }
+function selectPlayer(player: PlayerProfile) { selectedIdentity.value = { puuid: player.puuid, gameName: player.gameName, tagLine: player.tagLine }; selectedMatchId.value = null; drawerOpen.value = true; }
+function selectPlayerMatch(player: PlayerProfile, gameId: number) { selectedIdentity.value = { puuid: player.puuid, gameName: player.gameName, tagLine: player.tagLine }; selectedMatchId.value = gameId; drawerOpen.value = true; }
 function adjustRecentLimit(delta: number) {
   recentLimit.value = Math.min(MAX_RECENT_MATCHES, Math.max(1, recentLimit.value + delta));
   if (typeof localStorage !== "undefined") localStorage.setItem("lol-desktop-live-match-count", String(recentLimit.value));
@@ -209,8 +238,11 @@ async function refresh() {
   rosterGeneration += 1;
   rosterOverlay.value = null;
   rosterOverlayRequestStartedAt.value = 0;
-  await lobby.refetch();
-  message.success("对局数据已刷新");
+  forceNextLobby = true;
+  await refreshRosterImmediately();
+  const result = await lobby.refetch();
+  if (result.isError) message.error("对局刷新失败，请重试");
+  else message.success(result.data?.loading?.active ? "已开始刷新玩家资料" : "对局数据已刷新");
 }
 async function send(kind: "ally" | "enemy" | "premade") {
   sending.value = kind;
@@ -235,20 +267,20 @@ const rosterRefresh = createCoalescedAsyncRunner(async () => {
     }
   }
   catch {
-    // The regular enriched refresh below is authoritative; a transient fast
-    // roster failure should not replace a usable previous snapshot.
+    // 快速阵容失败时保留可用快照，后续仍由资料刷新恢复。
   }
 });
 function refreshRosterImmediately() {
   return rosterRefresh.run();
 }
 function updateRosterPolling(phase: string | null | undefined) {
-  const active = isTauri() && app.mode === "live" && (phase === "ChampSelect" || phase === "ReadyCheck");
-  if (active && !rosterPollTimer) {
-    rosterPollTimer = setInterval(() => void refreshRosterImmediately(), 750);
-  } else if (!active && rosterPollTimer) {
+  const active = isTauri() && app.mode === "live";
+  if (rosterPollTimer) {
     clearInterval(rosterPollTimer);
     rosterPollTimer = null;
+  }
+  if (active) {
+    rosterPollTimer = setInterval(() => void refreshRosterImmediately(), phase === "ChampSelect" || phase === "ReadyCheck" ? 750 : 1500);
   }
 }
 async function previewAssessments() {
@@ -279,13 +311,23 @@ function scheduleLobbyRefresh() {
   }, 900);
 }
 
-watch(() => `${app.connection.gameName ?? ""}#${app.connection.tagLine ?? ""}`, () => {
+let savedRankedOnly = app.config.providers.rankedOnly;
+watch(() => app.lastSavedAt, () => {
+  if (savedRankedOnly === app.config.providers.rankedOnly) return;
+  savedRankedOnly = app.config.providers.rankedOnly;
+  rosterGeneration += 1;
+  rosterOverlay.value = null;
+  scheduleLobbyRefresh();
+});
+
+watch(() => `${app.mode}/${app.connection.platformId ?? ""}/${app.connection.gameName ?? ""}#${app.connection.tagLine ?? ""}`, () => {
   rosterGeneration += 1;
   rosterOverlay.value = null;
   rosterOverlayRequestStartedAt.value = 0;
   lastSuccessfulLobbyRequestStartedAt.value = 0;
   connectionPhaseChangedAt.value = Date.now();
-  selectedPlayer.value = null;
+  selectedIdentity.value = null;
+  encounterModalOpen.value = false;
   drawerOpen.value = false;
   panelCleared.value = false;
   showRetainedSnapshot.value = false;
@@ -315,8 +357,7 @@ watch(() => [liveSnapshot.value?.id, liveSnapshot.value?.phase] as const, ([game
 });
 
 onMounted(() => {
-  // Show the lightweight roster while the enriched request performs the
-  // per-player rank/history lookups.
+  // 资料尚未返回时先展示轻量阵容。
   if (isTauri()) void refreshRosterImmediately().finally(() => { initialRosterReady.value = true; });
   if (!isTauri()) return;
   const onLcuEvent = (rawEvent: Event) => {
@@ -345,22 +386,22 @@ onBeforeUnmount(() => {
     <div v-else-if="panelHidden" class="empty-live"><NEmpty :description="hiddenPanelDescription"><template #extra><div class="empty-live__actions"><NButton type="primary" @click="showLastPanel"><template #icon><Eye :size="15" /></template>查看上一局</NButton><NButton secondary :loading="lobby.isFetching.value" @click="refresh"><template #icon><RefreshCw :size="15" /></template>刷新状态</NButton></div></template></NEmpty></div>
     <div v-else-if="lobby.isError.value && !current" class="empty-live"><NEmpty :description="lobbyError"><template #extra><NButton type="primary" @click="refresh">重新连接</NButton></template></NEmpty></div>
     <template v-else-if="current">
-      <section class="game-status-bar"><div class="game-status-bar__phase"><i class="pulse-dot" /><span>当前阶段</span><strong>{{ phaseLabel }}</strong></div><div class="game-status-bar__mode"><span>对局模式</span><strong>{{ gameModeLabel }}</strong></div><div class="game-status-bar__meta"><span><Info :size="14" />每队最多 5 人 · 玩家卡显示最近 {{ recentLimit }} 局</span><div class="game-history-stepper" aria-label="玩家战绩显示条数"><button type="button" title="减少显示条数" :disabled="recentLimit <= 1" @click="adjustRecentLimit(-1)"><Minus :size="12" /></button><strong>{{ recentLimit }} 局</strong><button type="button" title="增加显示条数" :disabled="recentLimit >= MAX_RECENT_MATCHES" @click="adjustRecentLimit(1)"><Plus :size="12" /></button></div><div class="segmented-control game-recent-column-switch" aria-label="每张玩家卡最近战绩列数"><button type="button" :class="{ active: recentColumns === 1 }" @click="setRecentColumns(1)">战绩单列</button><button type="button" :class="{ active: recentColumns === 2 }" @click="setRecentColumns(2)">战绩双列</button></div><NButton size="tiny" secondary @click="send('ally')"><template #icon><ClipboardCheck :size="14" /></template>发送我方评估</NButton></div></section>
+      <section class="game-status-bar"><div class="game-status-bar__phase"><i class="pulse-dot" /><span>当前阶段</span><strong>{{ phaseLabel }}</strong></div><div class="game-status-bar__mode"><span>对局模式</span><strong>{{ gameModeLabel }}</strong></div><div class="game-status-bar__meta"><span v-if="current.loading" data-testid="live-loading-progress"><Info :size="14" />{{ current.loading.active ? "加载中" : "已加载" }} {{ current.loading.completed }}/{{ current.loading.total }} 人 · {{ (current.loading.elapsedMs / 1000).toFixed(1) }} 秒<template v-if="current.loading.failed"> · {{ current.loading.failed }} 人待重试</template></span><div class="game-history-stepper" aria-label="玩家战绩显示条数"><button type="button" title="减少显示条数" :disabled="recentLimit <= 1" @click="adjustRecentLimit(-1)"><Minus :size="12" /></button><strong>{{ recentLimit }} 局</strong><button type="button" title="增加显示条数" :disabled="recentLimit >= MAX_RECENT_MATCHES" @click="adjustRecentLimit(1)"><Plus :size="12" /></button></div><div class="segmented-control game-recent-column-switch" aria-label="每张玩家卡最近战绩列数"><button type="button" :class="{ active: recentColumns === 1 }" @click="setRecentColumns(1)">战绩单列</button><button type="button" :class="{ active: recentColumns === 2 }" @click="setRecentColumns(2)">战绩双列</button></div><NButton size="tiny" secondary @click="send('ally')"><template #icon><ClipboardCheck :size="14" /></template>发送我方评估</NButton></div></section>
       <section v-if="lastSentLines.length" class="sent-message-preview" aria-live="polite"><div><span class="eyebrow">{{ lastSentLabel.includes("仅生成") ? "评估结果" : "最近发送" }}</span><strong>{{ lastSentLabel }} · {{ lastSentLines.length }} 条</strong></div><pre>{{ lastSentLines.join("\n") }}</pre><NButton size="tiny" quaternary @click="lastSentLines = []">清除</NButton></section>
       <section v-if="hasLobbyPlayers" class="game-board" :data-layout="current.layoutKind || 'classic'">
         <div v-if="classicLayout" class="game-teams">
           <header class="game-team-heading game-team-heading--ally"><div><span class="side-kicker ally">我方 · {{ allyTeam.players.length }} 人</span><h2>{{ allyTeam.label }}</h2></div><strong>{{ (allyTeam.summary?.score ?? current.allySummary.score).toFixed(1) }}<small> 队伍评分</small></strong></header>
-          <div class="game-player-row" :style="{ '--player-columns': playerColumnCount(allyTeam.players.length) }"><PlayerCard v-for="player in allyTeam.players" :key="player.puuid" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" data-side="ally" show-recent @select="selectPlayer" /></div>
+          <div class="game-player-row" :style="{ '--player-columns': playerColumnCount(allyTeam.players.length) }"><PlayerCard v-for="(player, index) in allyTeam.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :suppress-encounters="isMyPartyMember(player)" data-side="ally" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" /></div>
           <header class="game-team-heading game-team-heading--enemy"><div><span class="side-kicker enemy">敌方 · {{ enemyTeam.players.length }} 人</span><h2>{{ enemyTeam.label }}</h2></div><strong>{{ (enemyTeam.summary?.score ?? current.enemySummary.score).toFixed(1) }}<small> 队伍评分</small></strong></header>
-          <div class="game-player-row" :style="{ '--player-columns': playerColumnCount(enemyTeam.players.length) }"><PlayerCard v-for="player in enemyTeam.players" :key="player.puuid" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" data-side="enemy" show-recent @select="selectPlayer" /></div>
+          <div class="game-player-row" :style="{ '--player-columns': playerColumnCount(enemyTeam.players.length) }"><PlayerCard v-for="(player, index) in enemyTeam.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" data-side="enemy" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" /></div>
         </div>
         <div v-else class="game-teams game-teams--generic">
           <section v-for="team in teams" :key="team.id" class="game-team-group" :data-side="team.side">
             <header class="game-team-heading"><div><span class="side-kicker" :class="team.side">{{ team.side === 'enemy' ? '敌方' : '我方' }} · {{ team.players.length }} 人</span><h2>{{ team.label }}</h2></div><strong v-if="team.summary">{{ team.summary.score.toFixed(1) }}<small> 队伍评分</small></strong></header>
-            <div class="game-player-row" :class="{ 'game-player-row--sparse': team.players.length < 5 }" :style="{ '--player-columns': playerColumnCount(team.players.length) }"><PlayerCard v-for="player in team.players" :key="player.puuid" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :data-side="team.side" show-recent @select="selectPlayer" /></div>
+            <div class="game-player-row" :class="{ 'game-player-row--sparse': team.players.length < 5 }" :style="{ '--player-columns': playerColumnCount(team.players.length) }"><PlayerCard v-for="(player, index) in team.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :suppress-encounters="team.side === 'ally' && isMyPartyMember(player)" :data-side="team.side" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" /></div>
           </section>
         </div>
-        <aside class="game-summary-column"><div class="game-summary-column__head"><span class="eyebrow">实时概览</span><h2>本局总结</h2><p>{{ dangerPoints.length }} 条规则命中 · {{ teams.length }} 个队伍</p></div><template v-if="classicLayout"><div class="game-summary-team game-summary-team--ally"><strong>我方总结</strong><TeamSummaryCard :summary="current.allySummary" side="ally" /></div><div class="game-summary-team game-summary-team--enemy"><strong>敌方总结</strong><TeamSummaryCard :summary="current.enemySummary" side="enemy" /></div></template><template v-else><div v-for="team in teams.filter((item) => item.summary)" :key="`summary-${team.id}`" class="game-summary-team" :class="`game-summary-team--${team.side}`"><strong>{{ team.side === 'enemy' ? '敌方总结' : '我方总结' }}</strong><TeamSummaryCard :summary="team.summary!" :side="team.side === 'enemy' ? 'enemy' : 'ally'" /></div></template><div class="game-danger-list"><article v-for="(point, index) in dangerPoints" :key="point.title" :data-tone="point.tone"><b>0{{ index + 1 }}</b><div><strong>{{ point.title }}</strong><p>{{ point.detail }}</p></div></article></div><div class="game-summary-foot"><span>快捷键</span><strong>⌘ / Ctrl + Shift + G</strong><small>随时调出对局速看</small></div></aside>
+        <aside class="game-summary-column"><div class="game-summary-column__head"><span class="eyebrow">实时概览</span><h2>本局总结</h2><p>{{ dangerPoints.length }} 条规则命中 · {{ teams.length }} 个队伍</p></div><template v-if="classicLayout"><div class="game-summary-team game-summary-team--ally"><strong>我方总结</strong><TeamSummaryCard :summary="current.allySummary" side="ally" /></div><div class="game-summary-team game-summary-team--enemy"><strong>敌方总结</strong><TeamSummaryCard :summary="current.enemySummary" side="enemy" /></div></template><template v-else><div v-for="team in teams.filter((item) => item.summary)" :key="`summary-${team.id}`" class="game-summary-team" :class="`game-summary-team--${team.side}`"><strong>{{ team.side === 'enemy' ? '敌方总结' : '我方总结' }}</strong><TeamSummaryCard :summary="team.summary!" :side="team.side === 'enemy' ? 'enemy' : 'ally'" /></div></template><div class="game-danger-list"><article v-for="(point, index) in dangerPoints" :key="point.title" :data-tone="point.tone"><b>0{{ index + 1 }}</b><div><strong>{{ point.title }}</strong><p>{{ point.detail }}</p></div></article></div><div class="game-summary-foot"><span>快捷键</span><strong>Ctrl + F1</strong><small>随时调出对局速看</small></div></aside>
       </section>
       <section v-else class="game-history-panel">
         <header><div><span class="eyebrow">最近对局 / 回顾</span><h2>当前没有可读取的十人阵容</h2><p>{{ phaseLabel }} 阶段保留对局页；下面显示最近一局完整数据，可展开查看十人阵容与 BP。</p></div><NButton quaternary size="small" :loading="lobby.isFetching.value" @click="refresh"><template #icon><RefreshCw :size="14" /></template>刷新状态</NButton></header>
@@ -368,12 +409,14 @@ onBeforeUnmount(() => {
         <NEmpty v-else description="暂无可回看的历史对局" />
       </section>
     </template>
-    <PlayerDetailDrawer v-model:show="drawerOpen" :player="selectedPlayer" :lobby="current" />
+    <EncounterDetails v-model:show="encounterModalOpen" :records="selectedEncounterRecords" :target-puuid="selectedEncounterTarget" />
+    <PlayerDetailDrawer v-model:show="drawerOpen" :player="selectedPlayer" :lobby="current" :initial-match-id="selectedMatchId" :suppress-encounters="selectedPlayer ? isMyPartyMember(selectedPlayer) : false" />
   </div>
 </template>
 
 <style scoped>
 .game-page {
+  container: live-layout / inline-size;
   width: 100%;
   max-width: none;
   padding: 4px 10px 10px;
@@ -833,6 +876,11 @@ onBeforeUnmount(() => {
   .game-danger-list,
   .game-summary-foot {
     grid-column: 1;
+  }
+}
+@container live-layout (max-width: 1220px) {
+  .game-board {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 </style>

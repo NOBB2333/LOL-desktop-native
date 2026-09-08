@@ -5,7 +5,7 @@ function numericGameId(value: string) {
 }
 
 export function playerIdentity(player: PlayerProfile) {
-  if (player.puuid && !player.puuid.includes("-slot-")) return `puuid:${player.puuid}`;
+  if (playerIdQuality(player.puuid) > 0) return `puuid:${player.puuid.trim().toLowerCase()}`;
   const name = player.gameName.trim().toLocaleLowerCase();
   if (name && name !== "未知玩家") {
     return `name:${name}#${player.tagLine.trim().toLocaleLowerCase()}`;
@@ -15,8 +15,25 @@ export function playerIdentity(player: PlayerProfile) {
 
 function playerIdQuality(value: string) {
   const id = value.trim();
-  if (!id || id.includes("-slot-")) return 0;
+  if (!id || id === "0" || id === "00000000-0000-0000-0000-000000000000" || id.includes("-slot-")) return 0;
   return /^\d+$/.test(id) ? 1 : 2;
+}
+
+function samePlayer(left: PlayerProfile, right: PlayerProfile) {
+  if (playerIdQuality(left.puuid) === 2 && playerIdQuality(right.puuid) === 2) return left.puuid.toLowerCase() === right.puuid.toLowerCase();
+  if (hasKnownName(left) && hasKnownName(right)) return left.gameName.toLowerCase() === right.gameName.toLowerCase()
+    && (!left.tagLine || !right.tagLine || left.tagLine.toLowerCase() === right.tagLine.toLowerCase());
+  if (left.rosterKey && right.rosterKey) return left.rosterKey === right.rosterKey;
+  return Boolean(playerIdentity(left) && playerIdentity(left) === playerIdentity(right));
+}
+
+function namesConflict(left: PlayerProfile, right: PlayerProfile) {
+  return hasKnownName(left) && hasKnownName(right) && (left.gameName.toLowerCase() !== right.gameName.toLowerCase()
+    || Boolean(left.tagLine && right.tagLine && left.tagLine.toLowerCase() !== right.tagLine.toLowerCase()));
+}
+
+export function playerCardKey(player: PlayerProfile, index: number) {
+  return player.rosterKey || playerIdentity(player) || (player.puuid.includes("-slot-") ? player.puuid : `slot:${index}`);
 }
 
 function hasKnownName(player: PlayerProfile) {
@@ -71,10 +88,10 @@ export function mergeRosterPlayers(base: PlayerProfile[], fast: PlayerProfile[])
     return fast.map((dynamic, index) => {
       const identity = playerIdentity(dynamic);
       let baseIndex = identity
-        ? base.findIndex((candidate, candidateIndex) => !used.has(candidateIndex) && playerIdentity(candidate) === identity)
+        ? base.findIndex((candidate, candidateIndex) => !used.has(candidateIndex) && samePlayer(candidate, dynamic))
         : -1;
       const indexed = base[index];
-      if (baseIndex < 0 && indexed && !used.has(index) && (isUnresolvedPlayer(dynamic) || !playerIdentity(indexed))) baseIndex = index;
+      if (baseIndex < 0 && indexed && !used.has(index) && !namesConflict(dynamic, indexed) && (isUnresolvedPlayer(dynamic) || !playerIdentity(indexed))) baseIndex = index;
       if (baseIndex < 0) return dynamic;
       used.add(baseIndex);
       return mergePlayer(base[baseIndex], dynamic);
@@ -84,12 +101,12 @@ export function mergeRosterPlayers(base: PlayerProfile[], fast: PlayerProfile[])
   const merged = base.map((original, index) => {
     const identity = playerIdentity(original);
     let fastIndex = identity
-      ? fast.findIndex((candidate, candidateIndex) => !used.has(candidateIndex) && playerIdentity(candidate) === identity)
+      ? fast.findIndex((candidate, candidateIndex) => !used.has(candidateIndex) && samePlayer(candidate, original))
       : -1;
     const indexed = fast[index];
     if (fastIndex < 0 && indexed && !used.has(index)) {
       const indexedIdentity = playerIdentity(indexed);
-      if (!identity || !indexedIdentity || isUnresolvedPlayer(indexed)) fastIndex = index;
+      if (!namesConflict(original, indexed) && (!identity || !indexedIdentity || isUnresolvedPlayer(indexed))) fastIndex = index;
     }
     if (fastIndex < 0) return original;
     used.add(fastIndex);
@@ -157,7 +174,7 @@ export function enrichedRosterCoversOverlay(enriched: LiveLobby | undefined, ove
     return dynamic.every((player, index) => {
       const identity = playerIdentity(player);
       let completeIndex = identity
-        ? complete.findIndex((candidate, candidateIndex) => !used.has(candidateIndex) && playerIdentity(candidate) === identity)
+        ? complete.findIndex((candidate, candidateIndex) => !used.has(candidateIndex) && samePlayer(candidate, player))
         : -1;
       if (completeIndex < 0 && complete[index] && !used.has(index) && (isUnresolvedPlayer(player) || isUnresolvedPlayer(complete[index]))) {
         completeIndex = index;
