@@ -137,4 +137,26 @@ describe("live roster merging", () => {
     expect(merged.ally[0].isPremade).toBe(false);
     expect(merged.ally[0].premadeWith).toEqual([]);
   });
+
+  it("carries rank and score into another numeric game when the same player stays", () => {
+    const previous = lobby("1001", { puuid: "same", gameName: "甲", rankTier: "GOLD", score: { ...fixtureLobby.ally[0].score, total: 91 } });
+    const next = lobby("1002", { puuid: "same", gameName: "甲", rankTier: "UNRANKED", score: { ...fixtureLobby.ally[0].score, total: 0 }, championId: 0, championName: "等待选择" });
+    next.phase = "ChampSelect";
+    const merged = mergeRosterSnapshot(previous, next);
+    expect(merged.ally).toHaveLength(1);
+    expect(merged.ally[0].rankTier).toBe("GOLD");
+    expect(merged.ally[0].score.total).toBe(91);
+    // 拓扑字段同样只增不减：新快照还没锁定英雄时保留上一次的已选英雄。
+    expect(merged.ally[0].championId).toBe(fixtureLobby.ally[0].championId);
+  });
+
+  it("takes the locked champion from the newest overlay across a context change", () => {
+    const previous = lobby("1001", { puuid: "same", gameName: "甲", championId: 266, championName: "旧英雄", rankTier: "GOLD" });
+    const next = lobby("1002", { puuid: "same", gameName: "甲", championId: 112, championName: "新英雄" });
+    next.phase = "ChampSelect";
+    const merged = mergeRosterSnapshot(previous, next);
+    expect(merged.ally[0].championId).toBe(112);
+    expect(merged.ally[0].championName).toBe("新英雄");
+    expect(merged.ally[0].rankTier).toBe("GOLD");
+  });
 });

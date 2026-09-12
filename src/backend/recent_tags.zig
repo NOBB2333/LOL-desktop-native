@@ -14,11 +14,17 @@ pub fn championConcentration(json: []const u8) f64 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch return 0;
-    if (root != .array or root.array.items.len == 0) return 0;
+    if (root != .array) return 0;
+    return concentrationOf(root.array.items);
+}
+
+/// 与 `championConcentration` 相同，但接收已解析的战绩数组，避免重复解析。
+pub fn concentrationOf(matches: []const std.json.Value) f64 {
+    if (matches.len == 0) return 0;
     var champion_counts: [32]usize = .{0} ** 32;
     var champion_ids: [32]i64 = .{0} ** 32;
     var champion_len: usize = 0;
-    for (root.array.items) |match| {
+    for (matches) |match| {
         if (match != .object) continue;
         const id = jsonInt(match, "championId");
         var found: ?usize = null;
@@ -34,7 +40,7 @@ pub fn championConcentration(json: []const u8) f64 {
     }
     var best: usize = 0;
     for (champion_counts[0..champion_len]) |count| best = @max(best, count);
-    return @as(f64, @floatFromInt(best)) / @as(f64, @floatFromInt(root.array.items.len));
+    return @as(f64, @floatFromInt(best)) / @as(f64, @floatFromInt(matches.len));
 }
 
 pub fn write(writer: *std.Io.Writer, json: []const u8, assigned_position: []const u8, current_champion_id: i64, encounter: EncounterSummary) !void {
@@ -44,7 +50,16 @@ pub fn write(writer: *std.Io.Writer, json: []const u8, assigned_position: []cons
         try writeEncounterOnly(writer, encounter);
         return;
     };
-    if (root != .array or root.array.items.len == 0) {
+    if (root != .array) {
+        try writeEncounterOnly(writer, encounter);
+        return;
+    }
+    return writeMatches(writer, root.array.items, assigned_position, current_champion_id, encounter);
+}
+
+/// 与 `write` 相同，但接收已解析的战绩数组，避免重复解析。
+pub fn writeMatches(writer: *std.Io.Writer, matches: []const std.json.Value, assigned_position: []const u8, current_champion_id: i64, encounter: EncounterSummary) !void {
+    if (matches.len == 0) {
         try writeEncounterOnly(writer, encounter);
         return;
     }
@@ -62,7 +77,7 @@ pub fn write(writer: *std.Io.Writer, json: []const u8, assigned_position: []cons
     var role_games: usize = 0;
     var current_games: usize = 0;
     var current_wins: usize = 0;
-    for (root.array.items) |match| {
+    for (matches) |match| {
         if (match != .object or jsonInt(match, "durationMinutes") <= 0) continue;
         sample += 1;
         if (jsonBool(match, "win")) wins += 1;
@@ -167,7 +182,7 @@ pub fn write(writer: *std.Io.Writer, json: []const u8, assigned_position: []cons
         const text = try std.fmt.bufPrint(&evidence, "近期仅 {d} 场，不代表账号总熟练度", .{current_games});
         try writeTag(writer, &tag_count, "recentChampionSample", "近10场较少使用当前英雄", "info", text);
     }
-    if (championConcentration(json) >= 0.5) {
+    if (concentrationOf(matches) >= 0.5) {
         try writeTag(writer, &tag_count, "narrowPool", "英雄池集中", "info", "单一英雄占样本一半以上");
     }
     try writer.writeByte(']');

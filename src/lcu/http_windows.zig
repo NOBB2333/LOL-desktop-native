@@ -2,10 +2,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Control = @import("request_control.zig").Control;
 
-pub const Budget = enum { lcu, remote, roster, action };
-const budget_limits = [_]usize{ 6, 2, 1, 1 };
-var active_requests: [4]std.atomic.Value(usize) = .{std.atomic.Value(usize).init(0)} ** 4;
-var retry_after_ms: [4]std.atomic.Value(i64) = .{std.atomic.Value(i64).init(0)} ** 4;
+pub const Budget = enum { lcu, remote, roster, action, events };
+// 事件轮询一次要发 6~9 个请求，给它独立配额，避免挤掉阵容请求或资料富化。
+const budget_limits = [_]usize{ 6, 2, 1, 1, 2 };
+const budget_count = budget_limits.len;
+var active_requests: [budget_count]std.atomic.Value(usize) = .{std.atomic.Value(usize).init(0)} ** budget_count;
+var retry_after_ms: [budget_count]std.atomic.Value(i64) = .{std.atomic.Value(i64).init(0)} ** budget_count;
 
 pub const Options = struct {
     io: std.Io,

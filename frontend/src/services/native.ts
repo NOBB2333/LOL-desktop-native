@@ -50,11 +50,16 @@ export function createInvocationScheduler(maxConcurrency = NATIVE_INVOCATION_CON
 
 export function createCommandScheduler() {
   const state = createInvocationScheduler(2);
-  const roster = createInvocationScheduler(1);
+  // 后端已把事件轮询与连接刷新拆到各自的 lane，前端也不该再挤在同一条队列上。
+  const roster = createInvocationScheduler(2);
+  const events = createInvocationScheduler(1);
+  const connection = createInvocationScheduler(1);
   const query = createInvocationScheduler(2);
   const action = createInvocationScheduler(1);
   return function schedule<T>(name: string, task: () => Promise<T>): Promise<T> {
-    if (["lol.get_live_roster", "lol.refresh_connection", "lol.get_lcu_events"].includes(name)) return roster(task);
+    if (name === "lol.get_live_roster") return roster(task);
+    if (name === "lol.get_lcu_events") return events(task);
+    if (name === "lol.refresh_connection") return connection(task);
     if (["lol.send_shortcut", "lol.delete_friend", "lol.run_automation"].includes(name)) return action(task);
     if (["lol.get_config", "lol.save_config", "lol.set_shortcut_capture", "lol.set_data_mode", "lol.get_live_lobby", "lol.get_shortcut_events", "lol.open_game_view", "lol.validate_shortcut_template"].includes(name)) return state(task);
     return query(task);

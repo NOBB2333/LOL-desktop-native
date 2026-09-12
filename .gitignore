@@ -1,5 +1,8 @@
 # Dependencies
 frontend/node_modules/
+# Root-level node_modules holds @native-sdk/cli, which build.zig resolves as a
+# Zig module. It is an installed dependency, not source.
+node_modules/
 
 # Frontend build output
 frontend/dist/

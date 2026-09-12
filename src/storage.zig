@@ -43,7 +43,9 @@ pub const Store = struct {
         }
         errdefer _ = c.sqlite3_close(db.?);
         var store = Store{ .allocator = allocator, .db = db.?, .path = path_z };
-        try store.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=250;");
+        // 富化线程、阵容 lane、资料发布都会并发写这唯一一条连接；250ms 的
+        // 超时让大快照的写静默失败，放宽到 3s 让写真正排在锁上等。
+        try store.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=3000;");
         try store.exec("CREATE TABLE IF NOT EXISTS snapshots (kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(kind,key));");
         return store;
     }

@@ -69,6 +69,48 @@ test "慢查询期间状态可读取且切换模式后旧结果被拒绝" {
     try std.testing.expectEqual(error.AccountChanged, Slow.failure.?);
 }
 
+test "加载进度直接拼接进缓存阵容而不整体重新序列化" {
+    const state = try std.testing.allocator.create(Runtime);
+    defer std.testing.allocator.destroy(state);
+    state.* = Runtime.init();
+    state.mode = .live;
+    const lobby = "{\"id\":\"1\",\"phase\":\"ChampSelect\",\"ally\":[],\"enemy\":[]}";
+    cacheLiveLobby(state, lobby);
+    var output: [512]u8 = undefined;
+    // 没有进行中的批次时原样返回缓存内容，只多一个版本号。
+    const plain = try liveLoadingResponse(state, &output);
+    const plain_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, plain, .{});
+    defer plain_parsed.deinit();
+    try std.testing.expectEqualStrings("1", jsonField(plain_parsed.value, "id"));
+    // 版本号是内容哈希：内容不变就一直是同一个值。
+    const version = jsonInt(plain_parsed.value, "version");
+    try std.testing.expect(version != 0);
+    try std.testing.expect(plain_parsed.value.object.get("loading") == null);
+    // 版本号一致时只回进度，不再重复整份快照。
+    var expected: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        try std.fmt.bufPrint(&expected, "{{\"version\":{d},\"unchanged\":true}}", .{version}),
+        try liveProgressResponse(state, &output),
+    );
+    var batch = LiveLoadBatch{
+        .parent = state,
+        .snapshot = state,
+        .generation = state.live_generation,
+        .started_ms = 0,
+        .total = 10,
+        .queue = .{ .count = 0, .context = undefined, .execute = loadLivePlayer },
+    };
+    batch.queue.context = &batch;
+    state.live_load = &batch;
+    const with_progress = try liveLoadingResponse(state, &output);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, with_progress, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("1", jsonField(parsed.value, "id"));
+    const loading = parsed.value.object.get("loading").?;
+    try std.testing.expect(jsonBool(loading, "active"));
+    try std.testing.expectEqual(@as(i64, 10), jsonInt(loading, "total"));
+}
+
 test "换局取消玩家请求和排队动作而普通查询保留" {
     const state = try std.testing.allocator.create(Runtime);
     defer std.testing.allocator.destroy(state);
@@ -97,7 +139,9 @@ test "换局取消玩家请求和排队动作而普通查询保留" {
 test "展示评分等于分项之和且缺失阵容指标为空" {
     var output: [2048]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output);
-    try writeRecentScore(&writer, "[{\"win\":true,\"kills\":8,\"deaths\":3,\"assists\":5},{\"win\":false,\"kills\":1,\"deaths\":8,\"assists\":2},{\"win\":false,\"kills\":2,\"deaths\":7,\"assists\":1}]");
+    var recent_matches = RecentMatchesView.parse("[{\"win\":true,\"kills\":8,\"deaths\":3,\"assists\":5},{\"win\":false,\"kills\":1,\"deaths\":8,\"assists\":2},{\"win\":false,\"kills\":2,\"deaths\":7,\"assists\":1}]");
+    defer recent_matches.deinit();
+    try writeRecentScore(&writer, recent_matches.items);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
     defer parsed.deinit();
     var sum: f64 = 0;
@@ -145,6 +189,55 @@ pub fn errorMessage(err: anyerror) []const u8 {
 }
 const path_capacity = 2048;
 const live_lobby_capacity = 512 * 1024;
+/// 卡片最多保留二十场战绩，因此默认只拉取二十场：多取的部分在序列化前
+/// 就被丢弃，却要额外付出一次全量网络往返与 JSON 解析。只有当"仅统计排位"
+/// 打开时，过滤会吃掉大部分样本，才需要更大的取样窗口。
+const live_history_fetch_count = 20;
+const live_history_ranked_fetch_count = 50;
+/// 大快照落盘的最小间隔；内存副本不受影响，界面仍然逐人更新。
+const live_lobby_persist_interval_ms: i64 = 1000;
+/// 阵容版本号只保留低 53 位：既要能在 i64 里安全表示（std.json 才会解析成
+/// `integer`），又要落在 JS 的安全整数范围内（前端要把同一个值回传做比较）。
+const lobby_version_mask: u64 = (1 << 53) - 1;
+/// 最近一次落盘的内容来自哪块缓冲区。选人阶段的阵容与普通阵容分开缓存，
+/// 补写时必须取对应的那一份，否则会把旧阶段的快照写回磁盘。
+const LivePersistSource = enum { lobby, champ_select };
+/// 整批成功后的复查间隔。原先是 60s 一刀切，同局重连或中途加入的玩家
+/// 在这段时间里不会被补上；现在只用它控制「多久检查一次」，是否真的重跑
+/// 由 `livePlayerProfileFresh` 按每位玩家的缓存 TTL 决定。
+const live_recheck_interval_ms: i64 = 5_000;
+
+/// 快照落盘按时间节流。内存副本始终是最新的，SQLite 只用于冷启动恢复，
+/// 所以中间那些跳过的写入没有正确性代价；批次结束时由 `flushLiveLobbyPersist`
+/// 补写最后一次。`source` 记录内容来自哪块缓冲区（普通阵容 / 选人阵容），
+/// 补写时据此取正确的那一份。
+fn persistLiveLobbyThrottled(self: *Runtime, value: []const u8, source: LivePersistSource) void {
+    if (self.is_snapshot) return;
+    self.live_persist_source = source;
+    if (self.storage == null) return;
+    const now_ms = runtimeMonotonicMillis(self);
+    if (self.live_lobby_persisted_ms == 0 or now_ms - self.live_lobby_persisted_ms >= live_lobby_persist_interval_ms) {
+        self.live_lobby_persisted_ms = now_ms;
+        self.live_lobby_persist_pending = false;
+        if (self.storage) |*store| store.put("liveLobby", "current", value) catch {};
+    } else {
+        self.live_lobby_persist_pending = true;
+    }
+}
+
+/// 把节流期间跳过的快照补写一次，保证批次结束时磁盘上是最新状态。
+fn flushLiveLobbyPersist(self: *Runtime) void {
+    if (self.is_snapshot or !self.live_lobby_persist_pending) return;
+    const value = switch (self.live_persist_source) {
+        .lobby => self.live_lobby[0..self.live_lobby_len],
+        .champ_select => self.champ_select_lobby[0..self.champ_select_lobby_len],
+    };
+    if (value.len == 0) return;
+    const store = if (self.storage) |*slot| slot else return;
+    store.put("liveLobby", "current", value) catch return;
+    self.live_lobby_persisted_ms = runtimeMonotonicMillis(self);
+    self.live_lobby_persist_pending = false;
+}
 
 pub const command_names = [_][]const u8{
     "lol.get_bootstrap",
@@ -229,6 +322,15 @@ pub const Runtime = struct {
     connection_len: usize = 0,
     live_lobby: [live_lobby_capacity]u8 = undefined,
     live_lobby_len: usize = 0,
+    // 每次写入阵容快照时递增；前端带上一次收到的版本号，内容没变时只回进度。
+    live_lobby_version: u64 = 0,
+    // 每个玩家发布一次就写一次 244KB 的 SQLite 行既慢又和富化线程抢同一把
+    // 连接锁，因此按时间节流，批次结束时再补写一次最新快照。
+    live_lobby_persisted_ms: i64 = 0,
+    live_lobby_persist_pending: bool = false,
+    // 最近一次写入来自哪块缓冲区，供批次结束时的补写选择正确内容。
+    live_persist_source: LivePersistSource = .lobby,
+    bp_snapshot_fingerprint: u64 = 0,
     // Champ-select disappears during the hand-off to the game client. Keep
     // that higher-quality roster separately so a transient gameflow/live
     // client response cannot make the live page empty.
@@ -520,9 +622,11 @@ pub fn validateActionTicket(self: *Runtime, ticket: ActionTicket) !void {
 }
 
 pub fn commandLane(name: []const u8) CommandLane {
-    for ([_][]const u8{ "lol.get_live_roster", "lol.refresh_connection", "lol.get_lcu_events" }) |item| {
-        if (std.mem.eql(u8, name, item)) return .roster;
-    }
+    if (std.mem.eql(u8, name, "lol.get_live_roster")) return .roster;
+    // 事件轮询每 750ms 发 6~9 个 LCU 请求，和阵容查询挤在一条 lane 上时，
+    // 阵容结果要排在它后面才能执行。
+    if (std.mem.eql(u8, name, "lol.get_lcu_events")) return .events;
+    if (std.mem.eql(u8, name, "lol.refresh_connection")) return .connection;
     for ([_][]const u8{ "lol.send_shortcut", "lol.delete_friend", "lol.run_automation" }) |item| {
         if (std.mem.eql(u8, name, item)) return .action;
     }
@@ -536,7 +640,7 @@ fn querySnapshot(self: *Runtime) !*Runtime {
     const snapshot = try std.heap.page_allocator.create(Runtime);
     snapshot.* = Runtime.init();
     // 数据缓冲区独占，数据库连接由父运行时保管，所有工作线程退出后才能关闭。
-    inline for (.{ "mode", "config", "config_len", "io", "env_map", "storage", "connection", "connection_len", "live_lobby", "live_lobby_len", "champ_select_lobby", "champ_select_lobby_len", "champ_select_game_id", "last_live_phase", "last_live_phase_len", "champ_select_handoff_active", "live_roster_hash", "live_lobby_enriched", "live_owner_puuid", "live_owner_puuid_len", "event_state", "request_generation", "data_dir_path", "data_dir_path_len", "config_path_buffer", "config_path_len", "database_path_buffer", "database_path_len", "bp_history_path_buffer", "bp_history_path_len", "force_profile_refresh" }) |field| {
+    inline for (.{ "mode", "config", "config_len", "io", "env_map", "storage", "connection", "connection_len", "live_lobby", "live_lobby_len", "champ_select_lobby", "champ_select_lobby_len", "champ_select_game_id", "last_live_phase", "last_live_phase_len", "champ_select_handoff_active", "live_roster_hash", "live_lobby_enriched", "live_owner_puuid", "live_owner_puuid_len", "event_state", "request_generation", "data_dir_path", "data_dir_path_len", "config_path_buffer", "config_path_len", "database_path_buffer", "database_path_len", "bp_history_path_buffer", "bp_history_path_len", "force_profile_refresh", "bp_snapshot_fingerprint" }) |field| {
         @field(snapshot, field) = @field(self, field);
     }
     snapshot.is_snapshot = true;
@@ -633,7 +737,9 @@ pub fn invokeQueued(self: *Runtime, handler: native_sdk.bridge.Handler, invocati
     lockBackendMutex(&self.command_mutex);
     defer self.command_mutex.unlock();
     if (generation != self.request_generation or self.mode != snapshot.mode) return error.AccountChanged;
-    if (commandLane(handler.name) == .roster) {
+    // 事件轮询与连接刷新虽然已经分到各自的 lane，提交结果的逻辑和阵容一致。
+    const lane = commandLane(handler.name);
+    if (lane == .roster or lane == .events or lane == .connection) {
         if (std.mem.eql(u8, handler.name, "lol.refresh_connection")) {
             const owner_changed = cacheOwnerChanged(self, snapshot);
             if (owner_changed) {
@@ -683,7 +789,17 @@ pub fn invokeQueued(self: *Runtime, handler: native_sdk.bridge.Handler, invocati
 }
 
 fn lockBackendMutex(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    var spins: usize = 0;
+    while (!mutex.tryLock()) {
+        if (spins < 64) {
+            std.atomic.spinLoopHint();
+            spins += 1;
+        } else {
+            // 资料发布与状态查询都会持有这把锁做 JSON 重建，纯自旋会让五个
+            // 富化线程空烧 CPU；抢不到就让出时间片。
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+    }
 }
 
 fn isAutomationClientFailure(err: anyerror) bool {
@@ -1053,7 +1169,7 @@ fn connectionErrorDto(self: *Runtime, output: []u8, status: []const u8, err: any
 
 fn getLiveLobby(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
-    const payload_json = parsePayload(struct { force: bool = false }, invocation.request.payload) catch return error.InvalidRequest;
+    const payload_json = parsePayload(struct { force: bool = false, sinceVersion: u64 = 0 }, invocation.request.payload) catch return error.InvalidRequest;
     defer payload_json.deinit();
     const payload = payload_json.value;
     if (payload.force) {
@@ -1064,6 +1180,11 @@ fn getLiveLobby(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
     if (self.mode != .live) return getLiveLobbyInternal(context, invocation, output, false);
     if (self.live_lobby_len == 0) return error.LobbyLoading;
     if (!self.is_snapshot) try startLiveLoading(self);
+    // 加载期间前端每 750ms 问一次进度，但十个人里往往只有一两个刚完成。
+    // 快照内容没变就只回版本号和进度，避免反复传输并重建整份 244KB 阵容。
+    if (!payload.force and payload.sinceVersion != 0 and payload.sinceVersion == self.live_lobby_version) {
+        return liveProgressResponse(self, output);
+    }
     return liveLoadingResponse(self, output);
 }
 
@@ -1074,6 +1195,9 @@ const LiveLoadBatch = struct {
     snapshot: *Runtime,
     generation: u64,
     queue: live_loading.Queue,
+    // 结算交接等场景要求忽略本地缓存重新拉取；快照里的 `force_profile_refresh`
+    // 会在批次启动后被清掉，所以显式记在批次上。
+    force: bool = false,
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
     jobs: []LiveProfileJob = &.{},
@@ -1129,15 +1253,23 @@ fn startLiveLoading(self: *Runtime) !void {
     const lobby = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.live_lobby[0..self.live_lobby_len], .{});
     const phase = jsonField(lobby, "phase");
     if (!isChampSelectPhase(phase) and !isActiveLivePhase(phase) and !std.mem.eql(u8, phase, "EndOfGame")) return;
+    // 全部玩家都还在缓存有效期内时不要启动批次：否则每次复查都要白白
+    // 发现一次客户端、读一次召唤师、起五个线程。
+    if (!self.force_profile_refresh and !liveRosterNeedsReload(self, lobby)) {
+        self.live_next_load_ms = runtimeMonotonicMillis(self) + live_recheck_interval_ms;
+        return;
+    }
     const snapshot = try querySnapshot(self);
     errdefer std.heap.page_allocator.destroy(snapshot);
     snapshot.snapshot_live_generation = self.live_generation;
+    const force = self.force_profile_refresh;
     const batch = try std.heap.page_allocator.create(LiveLoadBatch);
     errdefer std.heap.page_allocator.destroy(batch);
     batch.* = .{
         .parent = self,
         .snapshot = snapshot,
         .generation = self.live_generation,
+        .force = force,
         .queue = .{ .count = 0, .context = batch, .execute = loadLivePlayer },
         .started_ms = runtimeMonotonicMillis(self),
         .total = lobbyRosterCount(self.live_lobby[0..self.live_lobby_len]),
@@ -1157,9 +1289,12 @@ fn runLiveLoadBatch(batch: *LiveLoadBatch) void {
     lockBackendMutex(&batch.parent.command_mutex);
     batch.finished_ms = runtimeMonotonicMillis(batch.snapshot);
     if (batch.generation == batch.parent.live_generation and !batch.queue.cancelled.load(.acquire)) {
-        batch.parent.live_next_load_ms = batch.finished_ms.? + @as(i64, if (batch.failed > 0) 10_000 else 60_000);
+        // 失败仍需按 10s 重试；成功时不再整批封 60s，只留一个复查间隔，
+        // 这样同局重连或新加入的玩家能被及时补上，是否真正重跑由每位玩家的缓存决定。
+        batch.parent.live_next_load_ms = batch.finished_ms.? + @as(i64, if (batch.failed > 0) 10_000 else live_recheck_interval_ms);
         batch.parent.live_lobby_enriched = batch.failed == 0;
     }
+    flushLiveLobbyPersist(batch.parent);
     batch.parent.command_mutex.unlock();
     batch.done.store(true, .release);
 }
@@ -1192,7 +1327,16 @@ fn runLiveLoadJobs(batch: *LiveLoadBatch, client: lcu.Client, current: std.json.
     defer arena.deinit();
     const allocator = arena.allocator();
     const lobby = try std.json.parseFromSliceLeaky(std.json.Value, allocator, self.live_lobby[0..self.live_lobby_len], .{});
-    var shared_sgp = SharedLiveSgpContext{ .runtime_value = self, .client = client, .allocator = allocator };
+    // 备用源在 worker 线程上分配，必须用独立 arena：批次 arena 不是线程安全的，
+    // 跨线程并发分配是未定义行为。
+    var sgp_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sgp_arena.deinit();
+    var shared_sgp = SharedLiveSgpContext{ .runtime_value = self, .client = client, .allocator = sgp_arena.allocator() };
+    // 十名玩家的相遇输入集合几乎完全相同，整批只建一次索引。
+    var shared_encounter = buildLiveEncounterIndex(self, lobby, allocator);
+    defer {
+        if (shared_encounter) |*value| value.index.deinit();
+    }
     var jobs: std.array_list.Managed(LiveProfileJob) = .init(allocator);
     // 双方交错入队，敌方第一名不必等待我方整队完成。
     const max_players = @max(profileArrayLen(lobby, "ally"), profileArrayLen(lobby, "enemy"));
@@ -1200,14 +1344,21 @@ fn runLiveLoadJobs(batch: *LiveLoadBatch, client: lcu.Client, current: std.json.
         const players = if (lobby == .object) lobby.object.get(side) else null;
         if (players) |list| if (list == .array and index < list.array.items.len) {
             const player = list.array.items[index];
+            // 资料已完整且缓存未过期的玩家不入队，避免复查时十个人全部重跑。
+            if (!batch.force and livePlayerProfileFresh(self, player)) continue;
             var job = liveProfileJob(self, client, null, player, side, index, current, catalog, null);
             job.shared_sgp = &shared_sgp;
+            job.shared_encounter = if (shared_encounter) |*value| value else null;
             job.output = try allocator.alloc(u8, live_profile_output_capacity);
             try jobs.append(job);
         };
     };
     batch.jobs = jobs.items;
     batch.queue.count = jobs.items.len;
+    // 进度按实际入队人数汇报，跳过的不计入分母。
+    lockBackendMutex(&batch.parent.command_mutex);
+    batch.total = jobs.items.len;
+    batch.parent.command_mutex.unlock();
     batch.queue.run();
     batch.jobs = &.{};
 }
@@ -1244,9 +1395,7 @@ pub fn verifyLiveProfilePipeline(io: std.Io, port: u16) !void {
     const client = lcu.Client{ .allocator = std.heap.page_allocator, .io = io, .credentials = .{ .port = port, .protocol = "http", .token = "验证凭据" } };
     var raw_players = std.json.Array.init(allocator);
     for (0..10) |index| {
-        const json = try std.fmt.allocPrint(allocator,
-            "{{\"puuid\":\"00000000-0000-0000-0000-000000000000\",\"riotIdGameName\":\"{s}{d}\",\"riotIdTagLine\":\"测试\",\"team\":\"{s}\",\"championId\":{d}}}",
-            .{ if (index < 5) "我方" else "敌方", index % 5, if (index < 5) "ORDER" else "CHAOS", index + 1 });
+        const json = try std.fmt.allocPrint(allocator, "{{\"puuid\":\"00000000-0000-0000-0000-000000000000\",\"riotIdGameName\":\"{s}{d}\",\"riotIdTagLine\":\"测试\",\"team\":\"{s}\",\"championId\":{d}}}", .{ if (index < 5) "我方" else "敌方", index % 5, if (index < 5) "ORDER" else "CHAOS", index + 1 });
         try raw_players.append(try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{}));
     }
     const players_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .array = raw_players }, .{});
@@ -1286,19 +1435,22 @@ fn publishLiveProfile(self: *Runtime, original: std.json.Value, profile: std.jso
     const allocator = arena.allocator();
     var root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, self.live_lobby[0..self.live_lobby_len], .{ .allocate = .alloc_always });
     if (root != .object) return;
+    // 两处结构（根级 ally/enemy 与 teams[]）用的是同一批玩家，摘要只算一次：
+    // 每次计算都要把整队重新序列化再解析回来，是发布路径上最贵的一步。
+    var shared_summary: ?std.json.Value = null;
     for ([_][]const u8{ "ally", "enemy" }) |side| {
         if (!std.mem.eql(u8, side, target_side)) continue;
         if (root.object.getPtr(side)) |list| {
             try updateLiveProfileArray(allocator, list, original, profile, target_index);
-            const summary = try liveSummaryValue(allocator, side, list.*);
-            try root.object.put(allocator, if (std.mem.eql(u8, side, "ally")) "allySummary" else "enemySummary", summary);
+            shared_summary = try liveSummaryValue(allocator, side, list.*);
+            try root.object.put(allocator, if (std.mem.eql(u8, side, "ally")) "allySummary" else "enemySummary", shared_summary.?);
         }
     }
     if (root.object.getPtr("teams")) |teams| if (teams.* == .array) for (teams.array.items) |*team| {
         if (!std.mem.eql(u8, jsonField(team.*, "side"), target_side)) continue;
         if (team.* == .object) if (team.object.getPtr("players")) |players| {
             try updateLiveProfileArray(allocator, players, original, profile, target_index);
-            const summary = try liveSummaryValue(allocator, jsonField(team.*, "side"), players.*);
+            const summary = shared_summary orelse try liveSummaryValue(allocator, jsonField(team.*, "side"), players.*);
             try team.object.put(allocator, "summary", summary);
         };
     };
@@ -1347,28 +1499,56 @@ fn liveSummaryValue(allocator: std.mem.Allocator, side: []const u8, players: std
 }
 
 fn liveLoadingResponse(self: *Runtime, output: []u8) ![]const u8 {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, self.live_lobby[0..self.live_lobby_len], .{});
-    if (root != .object) return error.LcuInvalidResponse;
-    if (self.live_load) |batch| {
-        const current_batch = batch.generation == self.live_generation and !batch.queue.cancelled.load(.acquire);
-        const progress = .{
-            .active = !batch.done.load(.acquire) or !current_batch,
-            .completed = if (current_batch) batch.completed else 0,
-            .total = if (current_batch) batch.total else lobbyRosterCount(self.live_lobby[0..self.live_lobby_len]),
-            .failed = if (current_batch) batch.failed else 0,
-            .elapsedMs = if (current_batch) (batch.finished_ms orelse runtimeMonotonicMillis(self)) - batch.started_ms else 0,
-            .firstPlayerMs = if (current_batch) batch.first_player_ms else null,
-        };
-        const json = try std.json.Stringify.valueAlloc(allocator, progress, .{});
-        try root.object.put(allocator, "loading", try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{}));
-    }
+    const lobby = self.live_lobby[0..self.live_lobby_len];
+    if (lobby.len == 0) return error.LobbyLoading;
+    // 这个函数在 state lane 上调用，全程持有 command_mutex。原先要先把整个
+    // 阵容解析成对象、插入进度、再整体重新序列化——一次轮询就是 244KB 的解析
+    // 加 244KB 的序列化，把五个发布线程一起堵住。进度只是挂在根对象上的一个
+    // 字段，直接拼接到最前面即可，剩下的只有一次内存拷贝。
+    if (lobby.len < 2 or lobby[0] != '{' or lobby[lobby.len - 1] != '}') return error.LcuInvalidResponse;
+    const inner = lobby[1 .. lobby.len - 1];
     var writer = std.Io.Writer.fixed(output);
-    var stringify = std.json.Stringify{ .writer = &writer, .options = .{} };
-    try stringify.write(root);
+    try writer.writeByte('{');
+    try writer.print("\"version\":{d}", .{self.live_lobby_version});
+    // `writeLiveProgress` 自带前置逗号（`,"loading":{...}`）。
+    _ = try writeLiveProgress(self, &writer);
+    if (inner.len > 0) {
+        try writer.writeByte(',');
+        try writer.writeAll(inner);
+    }
+    try writer.writeByte('}');
     return writer.buffered();
+}
+
+/// 阵容内容没变时只回版本号和加载进度，省掉整份快照的传输与前端重建。
+fn liveProgressResponse(self: *Runtime, output: []u8) ![]const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    try writer.print("{{\"version\":{d},\"unchanged\":true", .{self.live_lobby_version});
+    _ = try writeLiveProgress(self, &writer);
+    try writer.writeByte('}');
+    return writer.buffered();
+}
+
+/// 写入 `,"loading":{...}`；没有进行中的批次时不写任何内容并返回 false。
+///
+/// 前置逗号由本函数负责：`loading` 永远紧跟在 `version` 之后，调用方如果
+/// 自己再补一个逗号，就会得到 `<...>"loading":{...},,<...>` 这种缺一个逗号、
+/// 多一个逗号的非法 JSON。
+fn writeLiveProgress(self: *Runtime, writer: *std.Io.Writer) !bool {
+    const batch = self.live_load orelse return false;
+    const current_batch = batch.generation == self.live_generation and !batch.queue.cancelled.load(.acquire);
+    const progress = .{
+        .active = !batch.done.load(.acquire) or !current_batch,
+        .completed = if (current_batch) batch.completed else 0,
+        .total = if (current_batch) batch.total else lobbyRosterCount(self.live_lobby[0..self.live_lobby_len]),
+        .failed = if (current_batch) batch.failed else 0,
+        .elapsedMs = if (current_batch) (batch.finished_ms orelse runtimeMonotonicMillis(self)) - batch.started_ms else 0,
+        .firstPlayerMs = if (current_batch) batch.first_player_ms else null,
+    };
+    try writer.writeAll(",\"loading\":");
+    var stringify = std.json.Stringify{ .writer = writer, .options = .{} };
+    try stringify.write(progress);
+    return true;
 }
 
 fn cachedGameAsset(self: *Runtime, client: lcu.Client, key: []const u8, path: []const u8) ![]u8 {
@@ -1852,7 +2032,7 @@ fn profileNamesConflict(left: std.json.Value, right: std.json.Value) bool {
     if (!profileHasKnownName(left) or !profileHasKnownName(right)) return false;
     return !std.ascii.eqlIgnoreCase(jsonField(left, "gameName"), jsonField(right, "gameName")) or
         (jsonField(left, "tagLine").len > 0 and jsonField(right, "tagLine").len > 0 and
-        !std.ascii.eqlIgnoreCase(jsonField(left, "tagLine"), jsonField(right, "tagLine")));
+            !std.ascii.eqlIgnoreCase(jsonField(left, "tagLine"), jsonField(right, "tagLine")));
 }
 
 /// Merge a fresh topology with the last same-game profile snapshot. Fast
@@ -1922,7 +2102,11 @@ fn mergeWithBestLiveCache(self: *const Runtime, candidate: []const u8, dynamic_e
 }
 
 fn cacheLiveLobby(self: *Runtime, value: []const u8) void {
-    if (value.len > self.live_lobby.len) return;
+    if (value.len > self.live_lobby.len) {
+        // 多队伍模式（斗魂竞技场、大乱斗）阵容更大，静默丢弃会让界面卡在旧数据上。
+        std.log.err("实时阵容快照 {d} 字节超出 {d} 字节缓冲区，已丢弃本次更新", .{ value.len, self.live_lobby.len });
+        return;
+    }
     // Never let an empty or sparse transition response replace a useful
     // snapshot. The frontend can render the previous snapshot while LCU is
     // changing phases.
@@ -1933,8 +2117,17 @@ fn cacheLiveLobby(self: *Runtime, value: []const u8) void {
     }
     @memcpy(self.live_lobby[0..value.len], value);
     self.live_lobby_len = value.len;
+    // 版本号取内容哈希而不是自增计数：快速阵容每 1.2s 就会重写一次这块缓冲区，
+    // 自增会让前端永远拿不到「内容没变」的答复。
+    //
+    // 只用低 53 位有两个必须的理由：
+    // ① 前端是 JS，超过 2^53 的整数在 JSON 往返里会丢精度，回传的 sinceVersion
+    //    永远对不上，版本门控就静默失效；
+    // ② 超过 i64 上限的值会被 std.json 归为 number_string 而不是 integer，
+    //    `jsonInt` 读出来是 0。
+    self.live_lobby_version = @max(std.hash.Wyhash.hash(0, value) & lobby_version_mask, 1);
     if (!self.is_snapshot) if (self.storage) |*store| {
-        store.put("liveLobby", "current", value) catch {};
+        persistLiveLobbyThrottled(self, value, .lobby);
         store.put("liveLobby", "profilePolicy", if (runtimeRankedOnly(self)) "v2:ranked" else "v2:all") catch {};
         if (self.live_owner_puuid_len > 0) store.put("liveLobby", "ownerPuuid", self.live_owner_puuid[0..self.live_owner_puuid_len]) catch {};
     };
@@ -1946,13 +2139,18 @@ fn cacheLiveLobby(self: *Runtime, value: []const u8) void {
 }
 
 fn cacheChampSelectLobby(self: *Runtime, value: []const u8) void {
-    if (value.len > self.champ_select_lobby.len) return;
+    if (value.len > self.champ_select_lobby.len) {
+        std.log.err("选人阵容快照 {d} 字节超出 {d} 字节缓冲区，已丢弃本次更新", .{ value.len, self.champ_select_lobby.len });
+        return;
+    }
     if (self.champ_select_lobby_len > 0 and lobbyRosterCount(value) < lobbyRosterCount(self.champ_select_lobby[0..self.champ_select_lobby_len])) return;
     @memcpy(self.champ_select_lobby[0..value.len], value);
     self.champ_select_lobby_len = value.len;
     self.champ_select_game_id = lobbyGameId(value);
     if (!self.is_snapshot) if (self.storage) |*store| {
-        store.put("liveLobby", "current", value) catch {};
+        // 选人阶段每完成一名玩家都会走到这里，原来是无条件写 244KB。
+        // 十个人就是十次大写入，正好落在用户报告症状的阶段，因此同样走节流。
+        persistLiveLobbyThrottled(self, value, .champ_select);
         if (self.live_owner_puuid_len > 0) store.put("liveLobby", "ownerPuuid", self.live_owner_puuid[0..self.live_owner_puuid_len]) catch {};
     };
 }
@@ -2486,28 +2684,8 @@ fn cachedEncounterResponse(self: *Runtime, target_puuid: []const u8, max_games: 
     defer arena.deinit();
     var histories: std.array_list.Managed([]const u8) = .init(arena.allocator());
     defer for (histories.items) |value| std.heap.page_allocator.free(value);
-    var seen = std.StringHashMap(void).init(arena.allocator());
-    if (saved_owner != null and samePuuid(saved_owner.?, owner)) {
-        if (try store.get("matches", "current")) |history| {
-            histories.append(history) catch |err| {
-                std.heap.page_allocator.free(history);
-                return err;
-            };
-        }
-    }
-    try appendEncounterHistory(store, owner, &seen, &histories);
-    if (target_puuid.len > 0) {
-        try appendEncounterHistory(store, target_puuid, &seen, &histories);
-    }
-    if (self.live_lobby_len > 0) {
-        const lobby = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.live_lobby[0..self.live_lobby_len], .{});
-        for ([_][]const u8{ "ally", "enemy" }) |side| {
-            const players = if (lobby == .object) lobby.object.get(side) else null;
-            if (players) |list| if (list == .array) for (list.array.items) |player| {
-                try appendEncounterHistory(store, jsonField(player, "puuid"), &seen, &histories);
-            };
-        }
-    }
+    const lobby = if (self.live_lobby_len > 0) std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.live_lobby[0..self.live_lobby_len], .{}) catch null else null;
+    try appendEncounterHistories(store, saved_owner, owner, target_puuid, lobby, arena.allocator(), &histories);
     const catalog = try store.get("cache", "champions");
     defer if (catalog) |value| std.heap.page_allocator.free(value);
     // 桥接缓冲区不足时减少完整对局数量，不截断单局记录。
@@ -2519,6 +2697,78 @@ fn cachedEncounterResponse(self: *Runtime, target_puuid: []const u8, max_games: 
             continue;
         };
     }
+}
+
+/// 收集参与相遇计算的所有战绩：本人、目标以及当前阵容里的每个人。
+fn appendEncounterHistories(
+    store: *storage.Store,
+    saved_owner: ?[]const u8,
+    owner: []const u8,
+    target_puuid: []const u8,
+    lobby: ?std.json.Value,
+    arena_allocator: std.mem.Allocator,
+    histories: *std.array_list.Managed([]const u8),
+) !void {
+    var seen = std.StringHashMap(void).init(arena_allocator);
+    if (saved_owner != null and samePuuid(saved_owner.?, owner)) {
+        if (try store.get("matches", "current")) |history| {
+            histories.append(history) catch |err| {
+                std.heap.page_allocator.free(history);
+                return err;
+            };
+        }
+    }
+    try appendEncounterHistory(store, owner, &seen, histories);
+    if (target_puuid.len > 0) {
+        try appendEncounterHistory(store, target_puuid, &seen, histories);
+    }
+    if (lobby) |value| for ([_][]const u8{ "ally", "enemy" }) |side| {
+        const players = if (value == .object) value.object.get(side) else null;
+        if (players) |list| if (list == .array) for (list.array.items) |player| {
+            try appendEncounterHistory(store, jsonField(player, "puuid"), &seen, histories);
+        };
+    };
+}
+
+/// 整批玩家共用一份相遇索引。历史集合对十个人几乎相同，逐个重建会把
+/// 4MB 分配与全量解析重复十次。
+const LiveEncounterIndex = struct {
+    index: encounter_service.EncounterIndex,
+    owner: []const u8,
+    excluded_game_id: i64,
+
+    fn summary(self: *const LiveEncounterIndex, puuid: []const u8) EncounterSummary {
+        var summary_value = EncounterSummary{};
+        if (puuid.len == 0) return summary_value;
+        const stat = self.index.encounterWith(self.owner, puuid, self.excluded_game_id);
+        summary_value.count = stat.count;
+        if (stat.latest.len > 0 and stat.latest.len <= summary_value.latest.len) {
+            @memcpy(summary_value.latest[0..stat.latest.len], stat.latest);
+            summary_value.latest_len = stat.latest.len;
+        }
+        return summary_value;
+    }
+};
+
+fn buildLiveEncounterIndex(self: *Runtime, lobby: std.json.Value, allocator: std.mem.Allocator) ?LiveEncounterIndex {
+    const store = if (self.storage) |*value| value else return null;
+    const saved_owner = store.get("matches", "currentPuuid") catch null;
+    defer if (saved_owner) |value| std.heap.page_allocator.free(value);
+    const owner_source = if (self.live_owner_puuid_len > 0) self.live_owner_puuid[0..self.live_owner_puuid_len] else saved_owner orelse return null;
+    if (owner_source.len == 0) return null;
+    const owner = allocator.dupe(u8, owner_source) catch return null;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var histories: std.array_list.Managed([]const u8) = .init(arena.allocator());
+    defer for (histories.items) |value| std.heap.page_allocator.free(value);
+    appendEncounterHistories(store, saved_owner, owner, "", lobby, arena.allocator(), &histories) catch return null;
+    if (histories.items.len == 0) return null;
+    const catalog = store.get("cache", "champions") catch null;
+    defer if (catalog) |value| std.heap.page_allocator.free(value);
+    const excluded_game_id = lobbyGameId(self.live_lobby[0..self.live_lobby_len]);
+    const index = encounter_service.buildIndex(histories.items, owner, catalog orelse "[]", excluded_game_id) catch return null;
+    return .{ .index = index, .owner = owner, .excluded_game_id = excluded_game_id };
 }
 
 fn appendEncounterHistory(store: *storage.Store, puuid: []const u8, seen: *std.StringHashMap(void), histories: *std.array_list.Managed([]const u8)) !void {
@@ -2846,6 +3096,10 @@ fn persistBpSnapshot(self: *Runtime, session_json: []const u8, catalog_json: []c
     const session = std.json.parseFromSliceLeaky(std.json.Value, allocator, session_json, .{}) catch return;
     const catalog = std.json.parseFromSliceLeaky(std.json.Value, allocator, catalog_json, .{}) catch std.json.Value{ .null = {} };
     if (session != .object) return;
+    // 选人阶段每 750ms 都会走到这里，而大部分 tick 的阵容并没有变化。
+    // 按内容指纹去重，避免反复读全量、重序列化、写全量。
+    const fingerprint = bpSnapshotFingerprint(session);
+    if (fingerprint != 0 and fingerprint == self.bp_snapshot_fingerprint) return;
     var record: [16 * 1024]u8 = undefined;
     var record_writer = std.Io.Writer.fixed(&record);
     const now_millis: i64 = if (self.io) |io| @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms)) else 0;
@@ -2871,6 +3125,26 @@ fn persistBpSnapshot(self: *Runtime, session_json: []const u8, catalog_json: []c
     }
     writer.writeByte(']') catch return;
     store.put("history", "bp", writer.buffered()) catch {};
+    self.bp_snapshot_fingerprint = fingerprint;
+}
+
+/// 阵容状态指纹：只包含对局编号与双方已选英雄，不含每次都会变化的 createdAt。
+fn bpSnapshotFingerprint(session: std.json.Value) u64 {
+    if (session != .object) return 0;
+    var hash = std.hash.Wyhash.init(0);
+    const game_data = nestedObject(session, "gameData") orelse std.json.Value{ .null = {} };
+    const game_id = if (jsonInt(session, "gameId") > 0) jsonInt(session, "gameId") else jsonInt(game_data, "gameId");
+    hash.update(std.mem.asBytes(&game_id));
+    for ([_][]const u8{ "myTeam", "theirTeam" }) |field| {
+        const team = session.object.get(field) orelse continue;
+        if (team != .array) continue;
+        for (team.array.items) |participant| {
+            if (participant != .object) continue;
+            const id = selectedChampionId(participant);
+            hash.update(std.mem.asBytes(&id));
+        }
+    }
+    return hash.final();
 }
 
 fn tryRecord(writer: *std.Io.Writer, session: std.json.Value, catalog: std.json.Value, now_millis: i64) !bool {
@@ -4952,7 +5226,7 @@ fn writeLiveClientProfiles(self: *Runtime, client: lcu.Client, sgp_context: ?Jun
         if (same_team != ally) continue;
         if (!first) try writer.writeByte(',');
         first = false;
-        try writeLiveClientProfile(self, client, sgp_context, writer, player, if (ally) "ally" else "enemy", side_index, current, catalog, enrich, players, null);
+        try writeLiveClientProfile(self, client, sgp_context, writer, player, if (ally) "ally" else "enemy", side_index, current, catalog, enrich, players, null, null);
         side_index += 1;
     }
     try writer.writeByte(']');
@@ -5006,9 +5280,13 @@ const SharedLiveSgpContext = struct {
     value: ?JungleSgpContext = null,
 
     fn get(self: *@This()) ?JungleSgpContext {
+        var waited_ms: i64 = 0;
         while (!self.mutex.tryLock()) {
             self.client.control.check() catch return null;
-            std.Io.sleep(self.client.io, .fromMilliseconds(5), .awake) catch return null;
+            // 首个进入者要发一次网络请求换取凭据；退避等待，别让五个线程
+            // 以固定 5ms 的节奏一起空转。
+            waited_ms = @min(waited_ms + 1, 10);
+            std.Io.sleep(self.client.io, .fromMilliseconds(waited_ms), .awake) catch return null;
         }
         defer self.mutex.unlock();
         // 只有主源缺失时才准备备用源，同批次共用一次认证结果。
@@ -5022,6 +5300,7 @@ const SharedLiveSgpContext = struct {
 
 const LiveProfileJob = struct {
     shared_sgp: ?*SharedLiveSgpContext = null,
+    shared_encounter: ?*LiveEncounterIndex = null,
     runtime_value: *Runtime,
     client: lcu.Client,
     sgp_context: ?JungleSgpContext,
@@ -5051,12 +5330,13 @@ fn runPlayerRankRequest(job: *PlayerRankRequestJob) void {
 const PlayerLcuHistoryRequestJob = struct {
     client: lcu.Client,
     puuid: []const u8,
+    end_index: usize = live_history_fetch_count - 1,
     result: ?[]u8 = null,
 };
 
 fn runPlayerLcuHistoryRequest(job: *PlayerLcuHistoryRequestJob) void {
     var path_buffer: [768]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buffer, "/lol-match-history/v1/products/lol/{s}/matches?begIndex=0&endIndex=49", .{job.puuid}) catch return;
+    const path = std.fmt.bufPrint(&path_buffer, "/lol-match-history/v1/products/lol/{s}/matches?begIndex=0&endIndex={d}", .{ job.puuid, job.end_index }) catch return;
     job.result = job.client.get(path) catch null;
 }
 
@@ -5087,7 +5367,7 @@ fn liveProfileJob(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpCon
 
 fn runLiveProfileJob(job: *LiveProfileJob) void {
     var writer = std.Io.Writer.fixed(job.output.?);
-    writeLiveClientProfile(job.runtime_value, job.client, job.sgp_context, &writer, job.player, job.side, job.index, job.current, job.catalog, true, job.group_members, job.shared_sgp) catch |err| {
+    writeLiveClientProfile(job.runtime_value, job.client, job.sgp_context, &writer, job.player, job.side, job.index, job.current, job.catalog, true, job.group_members, job.shared_sgp, job.shared_encounter) catch |err| {
         job.failure = err;
         return;
     };
@@ -5120,7 +5400,7 @@ fn writeLiveProfileJobs(writer: *std.Io.Writer, jobs: []LiveProfileJob) !void {
     try writer.writeByte(']');
 }
 
-fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, writer: *std.Io.Writer, player: std.json.Value, side: []const u8, index: usize, current: std.json.Value, catalog: std.json.Value, enrich: bool, group_members: ?std.json.Value, shared_sgp: ?*SharedLiveSgpContext) !void {
+fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, writer: *std.Io.Writer, player: std.json.Value, side: []const u8, index: usize, current: std.json.Value, catalog: std.json.Value, enrich: bool, group_members: ?std.json.Value, shared_sgp: ?*SharedLiveSgpContext, shared_encounter: ?*LiveEncounterIndex) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -5188,6 +5468,8 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     const raw_champion_name = if (jsonField(player, "championName").len > 0) jsonField(player, "championName") else jsonField(player, "rawChampionName");
     const champion_name = if (champion_id > 0) catalogChampionName(catalog, champion_id, raw_champion_name) else championDisplayName(raw_champion_name, "已选择");
     const position = if (playerPosition(player).len > 0) playerPosition(player) else "NONE";
+    // 配置每个玩家都要读一次，解析一次即可，后续过滤复用同一个判定。
+    const ranked_only = runtimeRankedOnly(self);
 
     var rank_owned = if (enrich and !self.force_profile_refresh and !is_bot and puuid.len > 0) cachedSnapshot(self, "playerRank", puuid, player_profile_cache_ttl_seconds) else null;
     defer if (rank_owned) |value| std.heap.page_allocator.free(value);
@@ -5205,17 +5487,16 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
             if (rank_thread == null) runPlayerRankRequest(&rank_job);
         }
         if (history_owned == null) {
-            var job = PlayerLcuHistoryRequestJob{ .client = enrichment_client, .puuid = puuid };
+            const fetch_count: usize = if (ranked_only) live_history_ranked_fetch_count else live_history_fetch_count;
+            var job = PlayerLcuHistoryRequestJob{ .client = enrichment_client, .puuid = puuid, .end_index = fetch_count - 1 };
             runPlayerLcuHistoryRequest(&job);
             history_owned = job.result;
             // 主源有数据就直接使用；只有缺失或为空时才在同一并发配额内查询备选源。
             if (history_owned == null or !historyHasGames(history_owned.?)) {
                 const fallback_context = if (shared_sgp) |shared| shared.get() else sgp_context;
                 sgp_history_owned = if (fallback_context) |context|
-                    fetchSgpHistoryWithContext(enrichment_client, context, puuid, 0, 50) catch null
-                else if (shared_sgp != null) null
-                else
-                    fetchSgpHistory(enrichment_client, current, history_owned orelse "{}", puuid, 0, 50) catch null;
+                    fetchSgpHistoryWithContext(enrichment_client, context, puuid, 0, fetch_count) catch null
+                else if (shared_sgp != null) null else fetchSgpHistory(enrichment_client, current, history_owned orelse "{}", puuid, 0, fetch_count) catch null;
                 if (sgp_history_owned) |value| {
                     if (historyHasGames(value)) {
                         history_source = "sgp";
@@ -5252,7 +5533,7 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
         if (recent_owned) |buffer| {
             var recent_writer = std.Io.Writer.fixed(buffer);
             // 卡片最多保留二十场，快捷消息按自己的场数设置统计。
-            recent_count = writeRecentMatchesFiltered(&recent_writer, history, catalog, puuid, 20, runtimeRankedOnly(self)) catch 0;
+            recent_count = writeRecentMatchesFiltered(&recent_writer, history, catalog, puuid, live_history_fetch_count, ranked_only) catch 0;
             recent_json = recent_writer.buffered();
         }
     }
@@ -5267,6 +5548,11 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
             }
         }
     }
+
+    // 下面九个统计函数共用这一份已解析结果，不再各自解析一次。
+    var recent_matches = RecentMatchesView.parse(recent_json);
+    defer recent_matches.deinit();
+    const recent_items = recent_matches.items;
 
     try writer.writeAll("{\"puuid\":");
     if (puuid.len > 0) try jsonString(writer, puuid) else if (numeric_identity > 0) {
@@ -5301,18 +5587,18 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     try writer.writeAll(",\"recentMatches\":");
     try writer.writeAll(recent_json);
     try writer.writeAll(",\"topChampions\":");
-    try writeRecentChampionUsage(writer, recent_json);
+    try writeRecentChampionUsage(writer, recent_items);
     try writer.writeAll(",\"score\":");
-    try writeRecentScore(writer, recent_json);
-    const encounter = encounterProfileSummary(self, puuid);
+    try writeRecentScore(writer, recent_items);
+    const encounter = if (shared_encounter) |shared| shared.summary(puuid) else encounterProfileSummary(self, puuid);
     try writer.writeAll(",\"tags\":");
-    try writeRecentTags(writer, recent_json, position, champion_id, encounter);
+    try writeRecentTags(writer, recent_items, position, champion_id, encounter);
     try writer.writeAll(",\"junglePreference\":");
-    try writeJunglePreference(writer, recent_json, champion_id);
+    try writeJunglePreference(writer, recent_items, champion_id);
     try writeEncounterProfileFields(writer, encounter);
     try writePremadeFields(writer, player, group_members);
     try writer.writeAll(",\"positionGames\":");
-    try writer.print("{d},\"positionWinRate\":{d:.4},\"currentChampionGames\":{d},\"currentChampionWinRate\":{d:.4},\"championPoolConcentration\":{d:.4},\"dataComplete\":", .{ recentPositionGames(recent_json, position), recentPositionWinRate(recent_json, position), recentChampionGames(recent_json, champion_id), recentChampionWinRate(recent_json, champion_id), recentChampionConcentration(recent_json) });
+    try writer.print("{d},\"positionWinRate\":{d:.4},\"currentChampionGames\":{d},\"currentChampionWinRate\":{d:.4},\"championPoolConcentration\":{d:.4},\"dataComplete\":", .{ recentPositionGames(recent_items, position), recentPositionWinRate(recent_items, position), recentChampionGames(recent_items, champion_id), recentChampionWinRate(recent_items, champion_id), recentChampionConcentration(recent_items) });
     const complete = is_bot or (history_ready and ranked != .null);
     try writer.writeAll(if (complete) "true" else "false");
     try writer.writeAll(",\"unavailableSources\":[");
@@ -5347,20 +5633,40 @@ fn cachedPlayerHistory(self: *Runtime, puuid: []const u8, is_current: bool) ?[]u
 }
 
 fn cachedSnapshot(self: *Runtime, kind: []const u8, key: []const u8, ttl_seconds: i64) ?[]u8 {
+    if (!cacheEntryFresh(self, kind, key, ttl_seconds)) return null;
     const store = if (self.storage) |*value| value else return null;
-    const value = (store.get(kind, key) catch return null) orelse return null;
+    return store.get(kind, key) catch null;
+}
+
+/// 只判断缓存是否还新鲜，不读取也不分配内容。
+fn cacheEntryFresh(self: *Runtime, kind: []const u8, key: []const u8, ttl_seconds: i64) bool {
+    const store = if (self.storage) |*value| value else return false;
+    const updated_at = (store.getUpdatedAt(kind, key) catch null) orelse return false;
     const now_ms = runtimeNowMillis(self);
-    if (now_ms == 0) return value;
-    const updated_at = (store.getUpdatedAt(kind, key) catch null) orelse {
-        std.heap.page_allocator.free(value);
-        return null;
-    };
-    const now_seconds = @divTrunc(now_ms, std.time.ms_per_s);
-    if (now_seconds - updated_at >= ttl_seconds) {
-        std.heap.page_allocator.free(value);
-        return null;
+    if (now_ms == 0) return true;
+    return @divTrunc(now_ms, std.time.ms_per_s) - updated_at < ttl_seconds;
+}
+
+/// 该玩家的资料已经加载完整，且战绩缓存还没过期。
+/// 整批节流改成按玩家判断后，靠这个避免每次复查都把十个人重跑一遍。
+/// 只以战绩（60s）为准：段位缓存只有 20s，若按它判断整局会三倍频繁地重跑。
+fn livePlayerProfileFresh(self: *Runtime, player: std.json.Value) bool {
+    const puuid = jsonField(player, "puuid");
+    if (puuid.len == 0) return false;
+    if (!jsonBool(player, "dataComplete")) return false;
+    if (jsonBool(player, "isBot")) return true;
+    return cacheEntryFresh(self, "playerHistory", puuid, player_history_cache_ttl_seconds);
+}
+
+/// 只要还有一位玩家缺资料或缓存已过期，本批就值得跑。
+fn liveRosterNeedsReload(self: *Runtime, lobby: std.json.Value) bool {
+    if (lobby != .object) return true;
+    for ([_][]const u8{ "ally", "enemy" }) |side| {
+        const players = lobby.object.get(side) orelse continue;
+        if (players != .array) continue;
+        for (players.array.items) |player| if (!livePlayerProfileFresh(self, player)) return true;
     }
-    return value;
+    return false;
 }
 
 const EncounterSummary = recent_tags.EncounterSummary;
@@ -5632,13 +5938,28 @@ fn isHiddenHistoryGame(game: std.json.Value) bool {
 
 const RecentStats = struct { count: usize = 0, wins: usize = 0, kda_total: f64 = 0 };
 
-fn recentStats(json: []const u8) RecentStats {
+/// 近期战机会被九个统计函数各解析一次（20 场约 30~60KB，9 次接近半 MB，
+/// ×10 人 ×5 线程）。这里解析一次后整段复用。解析失败时 `items` 为空，
+/// 与各函数原本 `catch` 之后的默认输出一致。
+const RecentMatchesView = struct {
+    arena: std.heap.ArenaAllocator,
+    items: []const std.json.Value = &.{},
+
+    fn parse(json: []const u8) RecentMatchesView {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        const allocator = arena.allocator();
+        const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{}) catch return .{ .arena = arena, .items = &.{} };
+        return .{ .arena = arena, .items = if (root == .array) root.array.items else &.{} };
+    }
+
+    fn deinit(self: *RecentMatchesView) void {
+        self.arena.deinit();
+    }
+};
+
+fn recentStats(matches: []const std.json.Value) RecentStats {
     var stats = RecentStats{};
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch return stats;
-    if (root != .array) return stats;
-    for (root.array.items) |match| {
+    for (matches) |match| {
         if (match != .object) continue;
         stats.count += 1;
         if (jsonBool(match, "win")) stats.wins += 1;
@@ -5655,14 +5976,8 @@ const JungleChampion = struct {
     wins: usize = 0,
 };
 
-fn writeJunglePreference(writer: *std.Io.Writer, json: []const u8, current_champion_id: i64) !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch {
-        try writer.writeAll("null");
-        return;
-    };
-    if (root != .array) {
+fn writeJunglePreference(writer: *std.Io.Writer, matches: []const std.json.Value, current_champion_id: i64) !void {
+    if (matches.len == 0) {
         try writer.writeAll("null");
         return;
     }
@@ -5682,7 +5997,7 @@ fn writeJunglePreference(writer: *std.Io.Writer, json: []const u8, current_champ
     var champions: [20]JungleChampion = [_]JungleChampion{.{}} ** 20;
     var champion_count: usize = 0;
 
-    for (root.array.items) |match| {
+    for (matches) |match| {
         if (match != .object or jsonInt(match, "durationMinutes") <= 0 or !isJunglePosition(jsonField(match, "position"))) continue;
         sample_size += 1;
         const won = jsonBool(match, "win");
@@ -5825,14 +6140,10 @@ fn writeOptionalFloat(writer: *std.Io.Writer, value: ?f64) !void {
     if (value) |number| try writer.print("{d:.1}", .{number}) else try writer.writeAll("null");
 }
 
-fn recentPositionGames(json: []const u8, position: []const u8) usize {
+fn recentPositionGames(matches: []const std.json.Value, position: []const u8) usize {
     if (position.len == 0) return 0;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch return 0;
-    if (root != .array) return 0;
     var count: usize = 0;
-    for (root.array.items) |match| {
+    for (matches) |match| {
         if (match == .object and std.ascii.eqlIgnoreCase(jsonField(match, "position"), position)) {
             count += 1;
         }
@@ -5840,14 +6151,10 @@ fn recentPositionGames(json: []const u8, position: []const u8) usize {
     return count;
 }
 
-fn recentPositionWinRate(json: []const u8, position: []const u8) f64 {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch return 0;
-    if (root != .array) return 0;
+fn recentPositionWinRate(matches: []const std.json.Value, position: []const u8) f64 {
     var games: usize = 0;
     var wins: usize = 0;
-    for (root.array.items) |match| {
+    for (matches) |match| {
         if (match != .object or position.len == 0 or !std.ascii.eqlIgnoreCase(jsonField(match, "position"), position)) continue;
         games += 1;
         if (jsonBool(match, "win")) wins += 1;
@@ -5856,14 +6163,10 @@ fn recentPositionWinRate(json: []const u8, position: []const u8) f64 {
     return @as(f64, @floatFromInt(wins)) / @as(f64, @floatFromInt(games));
 }
 
-fn recentChampionGames(json: []const u8, champion_id: i64) usize {
+fn recentChampionGames(matches: []const std.json.Value, champion_id: i64) usize {
     if (champion_id <= 0) return 0;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch return 0;
-    if (root != .array) return 0;
     var count: usize = 0;
-    for (root.array.items) |match| {
+    for (matches) |match| {
         if (match == .object and jsonInt(match, "championId") == champion_id) {
             count += 1;
         }
@@ -5871,15 +6174,11 @@ fn recentChampionGames(json: []const u8, champion_id: i64) usize {
     return count;
 }
 
-fn recentChampionWinRate(json: []const u8, champion_id: i64) f64 {
+fn recentChampionWinRate(matches: []const std.json.Value, champion_id: i64) f64 {
     if (champion_id <= 0) return 0;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch return 0;
-    if (root != .array) return 0;
     var games: usize = 0;
     var wins: usize = 0;
-    for (root.array.items) |match| {
+    for (matches) |match| {
         if (match != .object or jsonInt(match, "championId") != champion_id) continue;
         games += 1;
         if (jsonBool(match, "win")) wins += 1;
@@ -5888,18 +6187,12 @@ fn recentChampionWinRate(json: []const u8, champion_id: i64) f64 {
     return @as(f64, @floatFromInt(wins)) / @as(f64, @floatFromInt(games));
 }
 
-fn recentChampionConcentration(json: []const u8) f64 {
-    return recent_tags.championConcentration(json);
+fn recentChampionConcentration(matches: []const std.json.Value) f64 {
+    return recent_tags.concentrationOf(matches);
 }
 
-fn writeRecentChampionUsage(writer: *std.Io.Writer, json: []const u8) !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch {
-        try writer.writeAll("[]");
-        return;
-    };
-    if (root != .array) {
+fn writeRecentChampionUsage(writer: *std.Io.Writer, matches: []const std.json.Value) !void {
+    if (matches.len == 0) {
         try writer.writeAll("[]");
         return;
     }
@@ -5908,7 +6201,7 @@ fn writeRecentChampionUsage(writer: *std.Io.Writer, json: []const u8) !void {
     var games: [32]usize = .{0} ** 32;
     var wins: [32]usize = .{0} ** 32;
     var length: usize = 0;
-    for (root.array.items) |match| {
+    for (matches) |match| {
         if (match != .object) continue;
         const id = jsonInt(match, "championId");
         var index: ?usize = null;
@@ -5943,8 +6236,8 @@ fn writeRecentChampionUsage(writer: *std.Io.Writer, json: []const u8) !void {
     try writer.writeByte(']');
 }
 
-fn writeRecentScore(writer: *std.Io.Writer, json: []const u8) !void {
-    const stats = recentStats(json);
+fn writeRecentScore(writer: *std.Io.Writer, matches: []const std.json.Value) !void {
+    const stats = recentStats(matches);
     if (stats.count == 0) {
         try writer.writeAll("{\"total\":0,\"confidence\":0,\"components\":[]}");
         return;
@@ -5957,8 +6250,8 @@ fn writeRecentScore(writer: *std.Io.Writer, json: []const u8) !void {
     try writer.print("{{\"total\":{d:.1},\"confidence\":{d:.1},\"components\":[{{\"key\":\"base\",\"label\":\"基础分\",\"score\":35,\"maxScore\":35,\"evidence\":\"有效近期样本的基础分\"}},{{\"key\":\"recent\",\"label\":\"近期战绩\",\"score\":{d:.1},\"maxScore\":45,\"evidence\":\"近{d}场胜率 {d:.0}%\"}},{{\"key\":\"kda\",\"label\":\"击杀助攻比\",\"score\":{d:.1},\"maxScore\":20,\"evidence\":\"平均击杀助攻比 {d:.2}\"}}]}}", .{ total, @min(100.0, @as(f64, @floatFromInt(stats.count * 10))), recent_score, stats.count, win_rate * 100.0, kda_score, average_kda });
 }
 
-fn writeRecentTags(writer: *std.Io.Writer, json: []const u8, assigned_position: []const u8, current_champion_id: i64, encounter: EncounterSummary) !void {
-    return recent_tags.write(writer, json, assigned_position, current_champion_id, encounter);
+fn writeRecentTags(writer: *std.Io.Writer, matches: []const std.json.Value, assigned_position: []const u8, current_champion_id: i64, encounter: EncounterSummary) !void {
+    return recent_tags.writeMatches(writer, matches, assigned_position, current_champion_id, encounter);
 }
 
 fn liveSessionEnvelopePhase(session_json: []const u8, phase: []const u8, current_json: ?[]const u8, output: []u8) ![]const u8 {
@@ -6708,21 +7001,16 @@ test "敌方资料乱序发布只更新自身槽位且不会改变后续批次" 
     const allocator = arena.allocator();
     var players = std.json.Array.init(allocator);
     for (0..5) |index| {
-        const json = try std.fmt.allocPrint(allocator,
-            "{{\"puuid\":\"enemy-slot-{d}\",\"gameName\":\"敌方{d}\",\"tagLine\":\"测试\",\"championId\":{d},\"recentMatches\":[],\"score\":{{\"total\":0}}}}",
-            .{ index, index, index + 1 });
+        const json = try std.fmt.allocPrint(allocator, "{{\"puuid\":\"enemy-slot-{d}\",\"gameName\":\"敌方{d}\",\"tagLine\":\"测试\",\"championId\":{d},\"recentMatches\":[],\"score\":{{\"total\":0}}}}", .{ index, index, index + 1 });
         try players.append(try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{}));
     }
     const team_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .array = players }, .{});
-    cacheLiveLobby(&state, try std.fmt.allocPrint(allocator,
-        "{{\"id\":\"789\",\"phase\":\"InProgress\",\"ally\":[],\"enemy\":{s},\"teams\":[{{\"side\":\"enemy\",\"players\":{s}}}]}}", .{ team_json, team_json }));
+    cacheLiveLobby(&state, try std.fmt.allocPrint(allocator, "{{\"id\":\"789\",\"phase\":\"InProgress\",\"ally\":[],\"enemy\":{s},\"teams\":[{{\"side\":\"enemy\",\"players\":{s}}}]}}", .{ team_json, team_json }));
     refreshLiveGeneration(&state);
     const generation = state.live_generation;
     var completed = [_]bool{false} ** 5;
     for ([_]usize{ 3, 1, 4, 0, 2 }) |index| {
-        const profile_json = try std.fmt.allocPrint(allocator,
-            "{{\"puuid\":\"已解析{d}\",\"rosterKey\":\"enemy-slot-{d}\",\"gameName\":\"敌方{d}\",\"championId\":999,\"recentMatches\":[{{\"gameId\":{d}}}],\"score\":{{\"total\":{d}}},\"dataComplete\":true}}",
-            .{ index, index, index, 100 + index, 60 + index });
+        const profile_json = try std.fmt.allocPrint(allocator, "{{\"puuid\":\"已解析{d}\",\"rosterKey\":\"enemy-slot-{d}\",\"gameName\":\"敌方{d}\",\"championId\":999,\"recentMatches\":[{{\"gameId\":{d}}}],\"score\":{{\"total\":{d}}},\"dataComplete\":true}}", .{ index, index, index, 100 + index, 60 + index });
         const profile = try std.json.parseFromSliceLeaky(std.json.Value, allocator, profile_json, .{});
         try publishLiveProfile(&state, players.items[index], profile, "enemy", index);
         completed[index] = true;
@@ -6860,7 +7148,9 @@ test "recent analysis emits solo threat from exact timeline data" {
         "]";
     var output: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output);
-    try writeRecentTags(&writer, recent, "MIDDLE", 103, .{});
+    var recent_matches = RecentMatchesView.parse(recent);
+    defer recent_matches.deinit();
+    try writeRecentTags(&writer, recent_matches.items, "MIDDLE", 103, .{});
     const tags = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, tags, "\"key\":\"soloThreat\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tags, "\"label\":\"单杀威胁\"") != null);
@@ -6871,7 +7161,9 @@ test "recent analysis caps aggregate evidence at five tags" {
     const recent = "[" ++ match ++ "," ++ match ++ "," ++ match ++ "," ++ match ++ "," ++ match ++ "]";
     var output: [8192]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output);
-    try writeRecentTags(&writer, recent, "MIDDLE", 103, .{});
+    var recent_matches = RecentMatchesView.parse(recent);
+    defer recent_matches.deinit();
+    try writeRecentTags(&writer, recent_matches.items, "MIDDLE", 103, .{});
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 5), parsed.value.array.items.len);
@@ -7429,7 +7721,9 @@ test "builds evidence-backed jungle preference from recent match DTOs" {
     const matches = "[{\"championId\":64,\"championName\":\"盲僧\",\"position\":\"JUNGLE\",\"kills\":8,\"deaths\":2,\"assists\":10,\"durationMinutes\":30,\"cs\":180,\"killParticipation\":0.7,\"takedownsFirstXMinutes\":3,\"dragonTakedowns\":2,\"baronTakedowns\":1,\"riftHeraldTakedowns\":1,\"enemyJungleMonsterKills\":4,\"win\":true},{\"championId\":64,\"championName\":\"盲僧\",\"position\":\"JUNGLE\",\"kills\":4,\"deaths\":4,\"assists\":8,\"durationMinutes\":24,\"cs\":144,\"killParticipation\":0.6,\"takedownsFirstXMinutes\":2,\"dragonTakedowns\":1,\"baronTakedowns\":0,\"riftHeraldTakedowns\":1,\"enemyJungleMonsterKills\":2,\"win\":false}]";
     var output: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output);
-    try writeJunglePreference(&writer, matches, 64);
+    var recent_matches = RecentMatchesView.parse(matches);
+    defer recent_matches.deinit();
+    try writeJunglePreference(&writer, recent_matches.items, 64);
     const result = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, result, "\"sampleSize\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"style\":\"tempo\"") != null);
@@ -7480,7 +7774,9 @@ test "writes encounter evidence before LeagueAkari gank labels" {
     encounter.latest_len = latest.len;
     var output: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output);
-    try writeRecentTags(&writer, matches, "TOP", 0, encounter);
+    var recent_matches = RecentMatchesView.parse(matches);
+    defer recent_matches.deinit();
+    try writeRecentTags(&writer, recent_matches.items, "TOP", 0, encounter);
     const result = writer.buffered();
     const met_index = std.mem.indexOf(u8, result, "遇到过") orelse return error.TestUnexpectedResult;
     const gank_index = std.mem.indexOf(u8, result, "非常好抓") orelse return error.TestUnexpectedResult;
@@ -7504,7 +7800,9 @@ test "matches LeagueAkari easy-gank thresholds" {
     for (cases) |case| {
         var output: [4096]u8 = undefined;
         var writer = std.Io.Writer.fixed(&output);
-        try writeRecentTags(&writer, case.matches, case.position, 0, .{});
+        var recent_matches = RecentMatchesView.parse(case.matches);
+        defer recent_matches.deinit();
+        try writeRecentTags(&writer, recent_matches.items, case.position, 0, .{});
         if (case.expected) |label| {
             try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), label) != null);
         } else {
@@ -7521,7 +7819,9 @@ test "keeps encounter label when recent match history is unavailable" {
     encounter.latest_len = latest.len;
     var output: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output);
-    try writeRecentTags(&writer, "[]", "TOP", 0, encounter);
+    var recent_matches = RecentMatchesView.parse("[]");
+    defer recent_matches.deinit();
+    try writeRecentTags(&writer, recent_matches.items, "TOP", 0, encounter);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);

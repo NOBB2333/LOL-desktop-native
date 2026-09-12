@@ -56,12 +56,11 @@ pub fn queryArchive(json: []const u8, owner_puuid: []const u8, target_puuid: []c
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch return error.InvalidEncounterArchive;
-    return queryRecords(root, owner_puuid, target_puuid, cutoff_iso, max_games, 0, output);
+    if (root != .array) return std.fmt.bufPrint(output, "[]", .{});
+    return queryRecords(root.array.items, owner_puuid, target_puuid, cutoff_iso, max_games, 0, output);
 }
 
-fn queryRecords(root: std.json.Value, owner_puuid: []const u8, target_puuid: []const u8, cutoff_iso: []const u8, max_games: usize, excluded_game_id: i64, output: []u8) ![]const u8 {
-    if (root != .array) return std.fmt.bufPrint(output, "[]", .{});
-
+fn queryRecords(records: []const std.json.Value, owner_puuid: []const u8, target_puuid: []const u8, cutoff_iso: []const u8, max_games: usize, excluded_game_id: i64, output: []u8) ![]const u8 {
     const SelectedGame = struct {
         id: i64,
         encountered_at: []const u8,
@@ -70,7 +69,7 @@ fn queryRecords(root: std.json.Value, owner_puuid: []const u8, target_puuid: []c
     var selected_len: usize = 0;
     const limit = @min(@max(max_games, 1), selected.len);
 
-    for (root.array.items) |record| {
+    for (records) |record| {
         if (!recordInScope(record, owner_puuid, cutoff_iso)) continue;
         if (target_puuid.len > 0 and !sameIdentity(jsonField(record, "puuid"), target_puuid)) continue;
         const game_id = jsonInt(record, "gameId");
@@ -102,7 +101,7 @@ fn queryRecords(root: std.json.Value, owner_puuid: []const u8, target_puuid: []c
     var writer = std.Io.Writer.fixed(output);
     try writer.writeByte('[');
     var emitted = false;
-    for (selected[0..selected_len]) |game| for (root.array.items) |record| {
+    for (selected[0..selected_len]) |game| for (records) |record| {
         if (!recordInScope(record, owner_puuid, cutoff_iso) or jsonInt(record, "gameId") != game.id) continue;
         if (emitted) try writer.writeByte(',');
         emitted = true;
@@ -113,15 +112,60 @@ fn queryRecords(root: std.json.Value, owner_puuid: []const u8, target_puuid: []c
     return writer.buffered();
 }
 
-/// 仅使用已加载的战绩派生共同对局，不建立长期相遇档案。
-pub fn fromHistories(histories: []const []const u8, self_puuid: []const u8, target_puuid: []const u8, catalog_json: []const u8, max_games: usize, excluded_game_id: i64, output: []u8) ![]const u8 {
-    if (self_puuid.len == 0) return std.fmt.bufPrint(output, "[]", .{});
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
+/// 一次构建的相遇记录索引。
+///
+/// 加载十名玩家时，每人的输入历史集合几乎完全相同（本人 + 当前阵容），
+/// 只有目标的 puuid 不同。旧实现为每个玩家各跑一次 `fromHistories`，
+/// 也就是各分配 4MB 并把十几份战绩重新解析一遍，代价随人数平方增长。
+/// 索引只构建一次，之后每次查询只是对已解析记录的线性扫描。
+pub const EncounterIndex = struct {
+    arena: *std.heap.ArenaAllocator,
+    records: std.array_list.Managed(std.json.Value),
+
+    /// 记录里的所有 JSON 值都活在自己的 arena 里，一次释放干净，调用方
+    /// 不需要再为索引准备一个活得够久的 allocator。
+    pub fn deinit(self: *EncounterIndex) void {
+        self.arena.deinit();
+        std.heap.page_allocator.destroy(self.arena);
+    }
+
+    pub fn query(self: *const EncounterIndex, owner_puuid: []const u8, target_puuid: []const u8, max_games: usize, excluded_game_id: i64, output: []u8) ![]const u8 {
+        return queryRecords(self.records.items, owner_puuid, target_puuid, "", @min(max_games, 40), excluded_game_id, output);
+    }
+
+    /// 直接统计某个对手的相遇次数与最近时间，不再经过 JSON 序列化与解析。
+    /// 返回的 `latest` 借用索引内部字符串，索引存活期间有效。
+    pub fn encounterWith(self: *const EncounterIndex, owner_puuid: []const u8, target_puuid: []const u8, excluded_game_id: i64) EncounterStat {
+        var stat = EncounterStat{};
+        if (target_puuid.len == 0) return stat;
+        for (self.records.items) |record| {
+            if (!recordInScope(record, owner_puuid, "")) continue;
+            if (!sameIdentity(jsonField(record, "puuid"), target_puuid)) continue;
+            if (jsonInt(record, "gameId") == excluded_game_id) continue;
+            stat.count += 1;
+            const stamp = jsonField(record, "encounteredAt");
+            if (stamp.len > 0 and (stat.latest.len == 0 or std.mem.order(u8, stamp, stat.latest) == .gt)) stat.latest = stamp;
+        }
+        return stat;
+    }
+};
+
+pub const EncounterStat = struct {
+    count: usize = 0,
+    latest: []const u8 = "",
+};
+
+/// 把若干份战绩展开成去重后的相遇记录集合。索引自带 arena，`deinit` 一次性释放。
+pub fn buildIndex(histories: []const []const u8, self_puuid: []const u8, catalog_json: []const u8, excluded_game_id: i64) !EncounterIndex {
+    const arena = try std.heap.page_allocator.create(std.heap.ArenaAllocator);
+    errdefer std.heap.page_allocator.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    errdefer arena.deinit();
     const allocator = arena.allocator();
+    var records: std.array_list.Managed(std.json.Value) = .init(allocator);
+    if (self_puuid.len == 0) return .{ .arena = arena, .records = records };
     const buffer = try std.heap.page_allocator.alloc(u8, 4 * 1024 * 1024);
     defer std.heap.page_allocator.free(buffer);
-    var records: std.array_list.Managed(std.json.Value) = .init(allocator);
     var seen = std.AutoHashMap(EncounterKey, usize).init(allocator);
     for (histories) |history| {
         const json = fromHistory(history, self_puuid, catalog_json, buffer) catch continue;
@@ -141,7 +185,15 @@ pub fn fromHistories(histories: []const []const u8, self_puuid: []const u8, targ
             }
         }
     }
-    return queryRecords(.{ .array = records }, self_puuid, target_puuid, "", @min(max_games, 40), excluded_game_id, output);
+    return .{ .arena = arena, .records = records };
+}
+
+/// 仅使用已加载的战绩派生共同对局，不建立长期相遇档案。
+pub fn fromHistories(histories: []const []const u8, self_puuid: []const u8, target_puuid: []const u8, catalog_json: []const u8, max_games: usize, excluded_game_id: i64, output: []u8) ![]const u8 {
+    var index = try buildIndex(histories, self_puuid, catalog_json, excluded_game_id);
+    defer index.deinit();
+    if (self_puuid.len == 0) return std.fmt.bufPrint(output, "[]", .{});
+    return index.query(self_puuid, target_puuid, max_games, excluded_game_id, output);
 }
 
 fn recordInScope(record: std.json.Value, owner_puuid: []const u8, cutoff_iso: []const u8) bool {

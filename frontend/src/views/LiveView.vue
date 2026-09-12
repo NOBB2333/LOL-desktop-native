@@ -28,12 +28,31 @@ const MAX_RECENT_MATCHES = 20;
 const initialRosterReady = ref(!isTauri());
 const lastSuccessfulLobbyRequestStartedAt = ref(0);
 let forceNextLobby = false;
+// 没有原生推送通道（native_sdk 只提供 request/response），改用版本号 +
+// 自适应轮询：连续多次收到 unchanged 时把轮询间隔拉长，避免原地空转。
+// 进度推进到下一名玩家（后端 live_lobby_version 自增）时立刻收回正常节奏。
+const LOADING_POLL_BACKOFF_MS = [750, 1500, 2500, 4000, 6000] as const;
+let unchangedStreak = 0;
+let lastObservedVersion: number | null = null;
+function nextLoadingInterval() {
+  const index = Math.min(unchangedStreak, LOADING_POLL_BACKOFF_MS.length - 1);
+  return LOADING_POLL_BACKOFF_MS[index];
+}
 async function fetchLobby() {
   const startedAt = Date.now();
   const force = forceNextLobby;
   forceNextLobby = false;
   const snapshot = await backend.lobby(force);
   lastSuccessfulLobbyRequestStartedAt.value = startedAt;
+  const snapshotVersion = (snapshot as { version?: number }).version ?? null;
+  const wasUnchanged = (snapshot as { unchanged?: boolean }).unchanged === true;
+  if (snapshotVersion !== null) {
+    // 版本号变化说明有人刚刚完成加载，立刻收回节奏，避免错过下一名玩家的推送窗口。
+    if (lastObservedVersion !== null && snapshotVersion !== lastObservedVersion) unchangedStreak = 0;
+    lastObservedVersion = snapshotVersion;
+  }
+  if (snapshot.loading?.active) unchangedStreak = wasUnchanged ? unchangedStreak + 1 : 0;
+  else unchangedStreak = 0;
   return snapshot;
 }
 const lobby = useQuery({
@@ -42,7 +61,7 @@ const lobby = useQuery({
   enabled: computed(() => app.initialized && initialRosterReady.value),
   staleTime: 2000,
   refetchInterval: (query) => {
-    if (query.state.data?.loading?.active) return 750;
+    if (query.state.data?.loading?.active) return nextLoadingInterval();
     if (!app.initialized || app.mode !== "live") return false;
     // 选人到游戏期间连接可能短暂异常，继续轮询以便及时接入游戏阵容。
     return !app.connection.phase || isVisibleGamePhase(app.connection.phase) ? 4000 : 12000;
@@ -82,6 +101,8 @@ watch(() => app.config.providers.rankedOnly, () => {
   rosterGeneration += 1;
   rosterOverlay.value = null;
   selectedMatchId.value = null;
+  unchangedStreak = 0;
+  lastObservedVersion = null;
 });
 
 const liveSnapshot = computed(() => {
@@ -238,6 +259,8 @@ async function refresh() {
   rosterGeneration += 1;
   rosterOverlay.value = null;
   rosterOverlayRequestStartedAt.value = 0;
+  unchangedStreak = 0;
+  lastObservedVersion = null;
   forceNextLobby = true;
   await refreshRosterImmediately();
   const result = await lobby.refetch();
@@ -280,7 +303,9 @@ function updateRosterPolling(phase: string | null | undefined) {
     rosterPollTimer = null;
   }
   if (active) {
-    rosterPollTimer = setInterval(() => void refreshRosterImmediately(), phase === "ChampSelect" || phase === "ReadyCheck" ? 750 : 1500);
+    // 选人阶段的拓扑没有 750ms 那么频繁；1200ms 足以覆盖换人与锁定的变化，
+    // 同时把 roster 通道的占用直接降下来，避免轮询把自己排到队尾。
+    rosterPollTimer = setInterval(() => void refreshRosterImmediately(), phase === "ChampSelect" || phase === "ReadyCheck" ? 1200 : 1500);
   }
 }
 async function previewAssessments() {
@@ -331,6 +356,8 @@ watch(() => `${app.mode}/${app.connection.platformId ?? ""}/${app.connection.gam
   drawerOpen.value = false;
   panelCleared.value = false;
   showRetainedSnapshot.value = false;
+  unchangedStreak = 0;
+  lastObservedVersion = null;
 });
 
 watch(() => app.connection.phase, (phase, previous) => {
@@ -357,8 +384,14 @@ watch(() => [liveSnapshot.value?.id, liveSnapshot.value?.phase] as const, ([game
 });
 
 onMounted(() => {
-  // 资料尚未返回时先展示轻量阵容。
-  if (isTauri()) void refreshRosterImmediately().finally(() => { initialRosterReady.value = true; });
+  // 资料尚未返回时先展示轻量阵容。首次阵容请求抢不到通道时不该一直挡住
+  // 资料查询，超时就放行，界面继续渲染已有数据。
+  if (isTauri()) {
+    void Promise.race([
+      refreshRosterImmediately(),
+      new Promise((resolve) => { setTimeout(resolve, 1500); }),
+    ]).finally(() => { initialRosterReady.value = true; });
+  }
   if (!isTauri()) return;
   const onLcuEvent = (rawEvent: Event) => {
     const event = (rawEvent as CustomEvent<{ uri: string }>).detail;

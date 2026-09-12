@@ -3,7 +3,10 @@ const builtin = @import("builtin");
 const windows_http = @import("lcu/http_windows.zig");
 pub const transport = windows_http;
 pub const RequestControl = @import("lcu/request_control.zig").Control;
-pub const RequestLane = enum(u8) { state, roster, query, action };
+/// 每条 lane 由 bridge 的一个独立 worker 线程消费。事件轮询与连接刷新原本挤在
+/// roster lane 上，会推迟阵容结果的到达时间，因此各自独立成 lane。
+pub const RequestLane = enum(u8) { state, roster, query, action, events, connection };
+pub const lane_count = @typeInfo(RequestLane).@"enum".fields.len;
 
 test {
     std.testing.refAllDecls(windows_http);
@@ -199,6 +202,7 @@ pub const Client = struct {
         return switch (self.lane) {
             .roster => .roster,
             .action => .action,
+            .events => .events,
             else => .lcu,
         };
     }

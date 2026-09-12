@@ -53,6 +53,9 @@ function rememberLobby(lobby: LiveLobby) {
   return lobby;
 }
 
+let lastLobbyVersion = 0;
+let lastLobby: LiveLobby | null = null;
+
 async function command<T>(name: string, args?: Record<string, unknown>): Promise<T> {
   if (!isNative()) throw new Error("浏览器预览不支持此操作");
   if (name === "send_shortcut") {
@@ -119,7 +122,14 @@ export const backend = {
   },
   async lobby(force = false): Promise<LiveLobby> {
     if (usesFixtureData()) return lobbyFixture();
-    return rememberLobby(await command<LiveLobby>("get_live_lobby", { force }));
+    // 加载期间界面每 750ms 问一次进度，但十个人里往往只有一两个刚完成。
+    // 带上一次收到的版本号，快照内容没变时后端只回进度，省掉整份阵容的
+    // 传输与前端重建。
+    const response = await command<LiveLobby & { version?: number; unchanged?: boolean }>("get_live_lobby", { force, sinceVersion: lastLobbyVersion });
+    if (typeof response.version === "number") lastLobbyVersion = response.version;
+    const merged = response.unchanged && lastLobby ? { ...lastLobby, loading: response.loading } : response;
+    lastLobby = merged;
+    return rememberLobby(merged);
   },
   async lobbyRoster(): Promise<LiveLobby> {
     if (usesFixtureData()) return lobbyFixture();

@@ -57,32 +57,56 @@ export function isDifferentRosterContext(base: LiveLobby, fast: LiveLobby) {
   return fast.phase === "ChampSelect" && base.phase !== "ChampSelect";
 }
 
+function mergePlayer(original: PlayerProfile, dynamic: PlayerProfile) {
+  const hasChampion = dynamic.championId > 0;
+  const puuid = playerIdQuality(dynamic.puuid) >= playerIdQuality(original.puuid) ? dynamic.puuid : original.puuid;
+  const premadeWith = [...original.premadeWith];
+  for (const teammate of dynamic.premadeWith) {
+    if (!premadeWith.some((name) => name.toLocaleLowerCase() === teammate.toLocaleLowerCase())) premadeWith.push(teammate);
+  }
+  const isPremade = original.isPremade === true || dynamic.isPremade === true
+    ? true
+    : dynamic.isPremade ?? original.isPremade;
+  // 富化字段（段位、战绩、评分、标签）只来自 original；overlay 只负责拓扑。
+  return {
+    ...original,
+    puuid,
+    gameName: hasKnownName(dynamic) ? dynamic.gameName : original.gameName,
+    tagLine: dynamic.tagLine || original.tagLine,
+    isBot: original.isBot || dynamic.isBot,
+    championId: hasChampion ? dynamic.championId : original.championId,
+    championName: hasChampion ? dynamic.championName : original.championName,
+    profileIconId: dynamic.profileIconId || original.profileIconId,
+    assignedPosition: knownPosition(dynamic.assignedPosition) ? dynamic.assignedPosition : original.assignedPosition,
+    isPremade,
+    premadeWith,
+  };
+}
+
+/// 上下文切换（换局、进入选人）时按身份把已加载的富化字段带到新拓扑上，
+/// 避免整块数据被未富化的快速快照覆盖后界面"闪一下又没了"。
+function carryEnrichedPlayers(base: PlayerProfile[], fast: PlayerProfile[]) {
+  if (!base.length || !fast.length) return fast;
+  const pool = base.map((player) => ({ player, used: false }));
+  return fast.map((dynamic, index) => {
+    const identity = playerIdentity(dynamic);
+    let match = identity ? pool.findIndex((entry) => !entry.used && samePlayer(entry.player, dynamic)) : -1;
+    if (match < 0 && index < pool.length && !pool[index].used) {
+      // 槽位兜底同样要确认身份不冲突，否则会把上一位玩家的段位和战绩搬过来。
+      const candidate = pool[index].player;
+      const candidateIdentity = playerIdentity(candidate);
+      if (!namesConflict(candidate, dynamic) && (!identity || !candidateIdentity || isUnresolvedPlayer(candidate))) match = index;
+    }
+    if (match < 0) return dynamic;
+    pool[match].used = true;
+    const merged = mergePlayer(pool[match].player, dynamic);
+    // 组队是「这一局」的关系，换局后必须采用新快照的判断，不能沿用上一局。
+    return { ...merged, isPremade: dynamic.isPremade ?? false, premadeWith: [...dynamic.premadeWith] };
+  });
+}
+
 export function mergeRosterPlayers(base: PlayerProfile[], fast: PlayerProfile[]) {
   if (!base.length) return fast;
-  const mergePlayer = (original: PlayerProfile, dynamic: PlayerProfile) => {
-    const hasChampion = dynamic.championId > 0;
-    const puuid = playerIdQuality(dynamic.puuid) >= playerIdQuality(original.puuid) ? dynamic.puuid : original.puuid;
-    const premadeWith = [...original.premadeWith];
-    for (const teammate of dynamic.premadeWith) {
-      if (!premadeWith.some((name) => name.toLocaleLowerCase() === teammate.toLocaleLowerCase())) premadeWith.push(teammate);
-    }
-    const isPremade = original.isPremade === true || dynamic.isPremade === true
-      ? true
-      : dynamic.isPremade ?? original.isPremade;
-    return {
-      ...original,
-      puuid,
-      gameName: hasKnownName(dynamic) ? dynamic.gameName : original.gameName,
-      tagLine: dynamic.tagLine || original.tagLine,
-      isBot: original.isBot || dynamic.isBot,
-      championId: hasChampion ? dynamic.championId : original.championId,
-      championName: hasChampion ? dynamic.championName : original.championName,
-      profileIconId: dynamic.profileIconId || original.profileIconId,
-      assignedPosition: knownPosition(dynamic.assignedPosition) ? dynamic.assignedPosition : original.assignedPosition,
-      isPremade,
-      premadeWith,
-    };
-  };
   if (fast.length >= base.length) {
     const used = new Set<number>();
     return fast.map((dynamic, index) => {
@@ -123,7 +147,21 @@ function rosterTopology(players: PlayerProfile[]) {
 }
 
 export function mergeRosterSnapshot(base: LiveLobby | undefined, fast: LiveLobby) {
-  if (!base || isDifferentRosterContext(base, fast)) return fast;
+  if (!base) return fast;
+  // 上下文切换（换局或进入选人）时不能整体退回未富化的快速快照：已加载的
+  // 段位和战绩按身份带过去，只让拓扑字段以最新阵容为准。
+  if (isDifferentRosterContext(base, fast)) {
+    const ally = carryEnrichedPlayers(base.ally, fast.ally);
+    const enemy = carryEnrichedPlayers(base.enemy, fast.enemy);
+    const teams = (fast.teams?.length ? fast.teams : [
+      { id: "ally", label: "我方阵容", side: "ally", players: fast.ally, summary: fast.allySummary },
+      { id: "enemy", label: "敌方阵容", side: "enemy", players: fast.enemy, summary: fast.enemySummary },
+    ]).map((team) => ({
+      ...team,
+      players: team.side === "ally" ? ally : team.side === "enemy" ? enemy : team.players,
+    }));
+    return { ...fast, ally, enemy, teams };
+  }
   const ally = mergeRosterPlayers(base.ally, fast.ally);
   const enemy = mergeRosterPlayers(base.enemy, fast.enemy);
   const topologyChanged = rosterTopology(base.ally) !== rosterTopology(fast.ally)
