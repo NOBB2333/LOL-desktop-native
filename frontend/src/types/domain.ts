@@ -18,6 +18,8 @@ export interface ConnectionState {
   summonerName: string | null;
   gameName: string | null;
   tagLine: string | null;
+  /** 当前登录账号的 puuid。区分「账号归属」与「行内视角」时用它，不要靠昵称猜。 */
+  puuid: string | null;
   summonerLevel: number | null;
   profileIconId: number | null;
   platformId: string | null;

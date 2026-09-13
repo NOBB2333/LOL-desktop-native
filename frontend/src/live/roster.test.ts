@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { fixtureLobby } from "../fixtures/data";
 import type { LiveLobby, PlayerProfile } from "../types/domain";
-import { enrichedRosterCoversOverlay, mergeRosterSnapshot, playerCardKey, playerIdentity } from "./liveRoster";
+import { enrichedRosterCoversOverlay, mergeRosterSnapshot, playerCardKey, playerIdentity } from "./roster";
 
 it("五名敌方从空身份乱序补全后保留各自战绩和稳定卡片键", () => {
   const fast = structuredClone(fixtureLobby);

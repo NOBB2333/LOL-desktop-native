@@ -15,6 +15,10 @@ const jungle_analysis = @import("backend/jungle_analysis.zig");
 const player_signals = @import("backend/player_signals.zig");
 const player_tag_service = @import("backend/player_tags.zig");
 const live_loading = @import("backend/live_loading.zig");
+const events_ipc = @import("backend/events_ipc.zig");
+const player_tags_ipc = @import("backend/player_tags_ipc.zig");
+const friends_ipc = @import("backend/friends_ipc.zig");
+const assets_ipc = @import("backend/assets_ipc.zig");
 
 const fallback_data_dir = std.fmt.comptimePrint(".{s}", .{build_options.data_dir_name});
 
@@ -282,10 +286,10 @@ const default_config =
     "\"ai\":{\"enabled\":false,\"provider\":\"deepseek\",\"protocol\":\"openai\",\"baseUrl\":\"https://api.deepseek.com\",\"model\":\"deepseek-v4-flash\",\"apiKey\":\"\",\"automaticPregameAnalysis\":false}}";
 
 const fixture_connection =
-    "{\"status\":\"disconnected\",\"phase\":\"Fixture\",\"summonerName\":\"Native 预览\",\"gameName\":\"Native 预览\",\"tagLine\":\"NATIVE\",\"summonerLevel\":null,\"profileIconId\":null,\"platformId\":null,\"region\":null,\"presence\":\"online\",\"soloRank\":null,\"flexRank\":null,\"queueLabel\":null,\"message\":\"Native SDK Fixture：尚未连接 LCU\",\"checkedAt\":\"1970-01-01T00:00:00.000Z\"}";
+    "{\"status\":\"disconnected\",\"phase\":\"Fixture\",\"summonerName\":\"Native 预览\",\"gameName\":\"Native 预览\",\"tagLine\":\"NATIVE\",\"puuid\":null,\"summonerLevel\":null,\"profileIconId\":null,\"platformId\":null,\"region\":null,\"presence\":\"online\",\"soloRank\":null,\"flexRank\":null,\"queueLabel\":null,\"message\":\"Native SDK Fixture：尚未连接 LCU\",\"checkedAt\":\"1970-01-01T00:00:00.000Z\"}";
 
 const disconnected_connection =
-    "{\"status\":\"disconnected\",\"phase\":null,\"summonerName\":null,\"gameName\":null,\"tagLine\":null,\"summonerLevel\":null,\"profileIconId\":null,\"platformId\":null,\"region\":null,\"presence\":\"offline\",\"soloRank\":null,\"flexRank\":null,\"queueLabel\":null,\"message\":\"未检测到 League Client\",\"checkedAt\":\"1970-01-01T00:00:00.000Z\"}";
+    "{\"status\":\"disconnected\",\"phase\":null,\"summonerName\":null,\"gameName\":null,\"tagLine\":null,\"puuid\":null,\"summonerLevel\":null,\"profileIconId\":null,\"platformId\":null,\"region\":null,\"presence\":\"offline\",\"soloRank\":null,\"flexRank\":null,\"queueLabel\":null,\"message\":\"未检测到 League Client\",\"checkedAt\":\"1970-01-01T00:00:00.000Z\"}";
 
 const empty_summary = "{\"side\":\"ally\",\"score\":0,\"title\":\"暂无实时数据\",\"focusPlayerPuuid\":null,\"strengths\":[],\"risks\":[],\"composition\":null}";
 const empty_enemy_summary = "{\"side\":\"enemy\",\"score\":0,\"title\":\"暂无实时数据\",\"focusPlayerPuuid\":null,\"strengths\":[],\"risks\":[],\"composition\":null}";
@@ -588,12 +592,12 @@ pub const Runtime = struct {
             .{ .name = "lol.get_live_roster", .context = self, .invoke_fn = getLiveRoster },
             .{ .name = "lol.get_match_history", .context = self, .invoke_fn = getMatches },
             .{ .name = "lol.get_match_detail", .context = self, .invoke_fn = getMatchDetail },
-            .{ .name = "lol.get_champions", .context = self, .invoke_fn = getChampions },
-            .{ .name = "lol.get_asset", .context = self, .invoke_fn = getAsset },
+            .{ .name = "lol.get_champions", .context = self, .invoke_fn = assets_ipc.getChampions },
+            .{ .name = "lol.get_asset", .context = self, .invoke_fn = assets_ipc.getAsset },
             .{ .name = "lol.get_encounters", .context = self, .invoke_fn = getEncounters },
-            .{ .name = "lol.get_friends", .context = self, .invoke_fn = getFriends },
-            .{ .name = "lol.get_friend_last_game", .context = self, .invoke_fn = getFriendLastGame },
-            .{ .name = "lol.delete_friend", .context = self, .invoke_fn = deleteFriend },
+            .{ .name = "lol.get_friends", .context = self, .invoke_fn = friends_ipc.getFriends },
+            .{ .name = "lol.get_friend_last_game", .context = self, .invoke_fn = friends_ipc.getFriendLastGame },
+            .{ .name = "lol.delete_friend", .context = self, .invoke_fn = friends_ipc.deleteFriend },
             .{ .name = "lol.get_bp_history", .context = self, .invoke_fn = getBpHistory },
             .{ .name = "lol.save_match_export", .context = self, .invoke_fn = saveMatchExport },
             .{ .name = "lol.send_shortcut", .context = self, .invoke_fn = sendShortcut },
@@ -602,15 +606,16 @@ pub const Runtime = struct {
             .{ .name = "lol.validate_shortcut_template", .context = self, .invoke_fn = validateShortcut },
             .{ .name = "lol.check_update", .context = self, .invoke_fn = checkUpdate },
             .{ .name = "lol.open_game_view", .context = self, .invoke_fn = openGameView },
-            .{ .name = "lol.get_lcu_events", .context = self, .invoke_fn = getLcuEvents },
-            .{ .name = "lol.get_shortcut_events", .context = self, .invoke_fn = getShortcutEvents },
-            .{ .name = "lol.get_player_tags", .context = self, .invoke_fn = getPlayerTags },
-            .{ .name = "lol.update_player_tag", .context = self, .invoke_fn = updatePlayerTag },
+            .{ .name = "lol.get_lcu_events", .context = self, .invoke_fn = events_ipc.getLcuEvents },
+            .{ .name = "lol.get_shortcut_events", .context = self, .invoke_fn = events_ipc.getShortcutEvents },
+            .{ .name = "lol.get_player_tags", .context = self, .invoke_fn = player_tags_ipc.getPlayerTags },
+            .{ .name = "lol.update_player_tag", .context = self, .invoke_fn = player_tags_ipc.updatePlayerTag },
         };
     }
 };
 
-fn runtime(context: *anyopaque) *Runtime {
+/// feature 模块通过它拿回 Runtime：handler 的 `context` 就是 `*Runtime`。
+pub fn runtime(context: *anyopaque) *Runtime {
     return @ptrCast(@alignCast(context));
 }
 
@@ -686,7 +691,7 @@ const AutomationGuard = struct {
     }
 };
 
-fn verifyActionAccount(self: *Runtime, client: lcu.Client) !void {
+pub fn verifyActionAccount(self: *Runtime, client: lcu.Client) !void {
     try snapshotControl(self).check();
     if (self.live_owner_puuid_len == 0 or self.cache_platform_len == 0) return error.CacheScopeUnavailable;
     const current_json = try client.get("/lol-summoner/v1/current-summoner");
@@ -815,7 +820,7 @@ fn isAutomationClientFailure(err: anyerror) bool {
         err == error.LcuNotRunning or err == error.InputSimulationFailed;
 }
 
-fn discoverClient(self: *const Runtime, io: std.Io) !lcu.Client {
+pub fn discoverClient(self: *const Runtime, io: std.Io) !lcu.Client {
     return discoverClientWithConfig(self, io, self.config[0..self.config_len]);
 }
 
@@ -877,7 +882,7 @@ fn requestTimeoutMsFromConfig(config: std.json.Value) u32 {
     return @intCast(@min(@as(i64, 30_000), @max(@as(i64, 1_000), seconds * 1_000)));
 }
 
-fn runtimeCacheTtlMillis(self: *const Runtime) i64 {
+pub fn runtimeCacheTtlMillis(self: *const Runtime) i64 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const config = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.config[0..self.config_len], .{}) catch return 120 * std.time.ms_per_min;
@@ -894,7 +899,7 @@ fn runtimeHideUnfinishedMatches(self: *const Runtime) bool {
     return jsonBool(providers, "hideUnfinishedMatches");
 }
 
-fn runtimeNowMillis(self: *const Runtime) i64 {
+pub fn runtimeNowMillis(self: *const Runtime) i64 {
     const io = self.io orelse return 0;
     return @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
 }
@@ -953,7 +958,7 @@ const SavePayload = struct { value: std.json.Value };
 const ModePayload = struct { mode: []const u8 };
 const TemplatePayload = struct { template: []const u8 };
 
-fn parsePayload(comptime T: type, payload: []const u8) !std.json.Parsed(T) {
+pub fn parsePayload(comptime T: type, payload: []const u8) !std.json.Parsed(T) {
     return std.json.parseFromSlice(T, std.heap.page_allocator, payload, .{ .ignore_unknown_fields = true });
 }
 
@@ -1163,7 +1168,7 @@ fn connectionErrorDto(self: *Runtime, output: []u8, status: []const u8, err: any
     var writer = std.Io.Writer.fixed(output);
     writer.writeAll("{\"status\":") catch return output[0..0];
     jsonString(&writer, status) catch return output[0..0];
-    writer.writeAll(",\"phase\":null,\"summonerName\":null,\"gameName\":null,\"tagLine\":null,\"summonerLevel\":null,\"profileIconId\":null,\"platformId\":null,\"region\":null,\"presence\":\"offline\",\"soloRank\":null,\"flexRank\":null,\"queueLabel\":null,\"message\":") catch return output[0..0];
+    writer.writeAll(",\"phase\":null,\"summonerName\":null,\"gameName\":null,\"tagLine\":null,\"puuid\":null,\"summonerLevel\":null,\"profileIconId\":null,\"platformId\":null,\"region\":null,\"presence\":\"offline\",\"soloRank\":null,\"flexRank\":null,\"queueLabel\":null,\"message\":") catch return output[0..0];
     var message: [256]u8 = undefined;
     const text = std.fmt.bufPrint(&message, "客户端连接失败：{s}", .{errorMessage(err)}) catch "客户端连接失败";
     jsonString(&writer, text) catch return output[0..0];
@@ -2478,7 +2483,7 @@ fn fetchSgpHistoryWithContext(client: lcu.Client, context: JungleSgpContext, tar
     return client.getBearerUrl(url, context.token, sgp_user_agent);
 }
 
-fn fetchSgpHistory(client: lcu.Client, current: std.json.Value, lcu_history_json: []const u8, target_puuid: []const u8, start: usize, count: usize) ![]u8 {
+pub fn fetchSgpHistory(client: lcu.Client, current: std.json.Value, lcu_history_json: []const u8, target_puuid: []const u8, start: usize, count: usize) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2510,175 +2515,6 @@ fn sgpHost(platform_id: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(normalized, "TJ101")) return "tj101-sgp.lol.qq.com:21019";
     if (std.ascii.eqlIgnoreCase(normalized, "BGP2")) return "bgp2-k8s-sgp.lol.qq.com:21019";
     return null;
-}
-
-fn getChampions(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = runtime(context);
-    _ = invocation;
-    if (self.mode == .live) {
-        if (self.io) |io| {
-            var client = discoverClient(self, io) catch {
-                if (self.storage) |*store| if (store.get("cache", "champions") catch null) |cached| {
-                    defer std.heap.page_allocator.free(cached);
-                    const stats = store.get("cache", "opgg-ranked-emerald-plus") catch null;
-                    defer if (stats) |value| std.heap.page_allocator.free(value);
-                    const updated_seconds = store.getUpdatedAt("cache", "opgg-ranked-emerald-plus") catch null;
-                    const fetched_at = (updated_seconds orelse 0) * std.time.ms_per_s;
-                    const expires_at = fetched_at + runtimeCacheTtlMillis(self);
-                    const stale = stats != null and runtimeNowMillis(self) > expires_at;
-                    return champion_mapper.dtoWithStats(cached, stats, .{
-                        .source = if (stale) "sqlite-stale" else "sqlite-fresh",
-                        .stats_source = if (stats != null) "sqlite" else "unavailable",
-                        .fetched_at_millis = fetched_at,
-                        .expires_at_millis = if (stats != null) expires_at else null,
-                        .is_stale = stale,
-                        .error_message = "LCU 未连接，已使用本地英雄快照",
-                    }, output);
-                };
-                return error.LcuNotRunning;
-            };
-            defer client.deinit();
-            const champions = client.get("/lol-game-data/assets/v1/champion-summary.json") catch blk: {
-                if (self.storage) |*store| if (store.get("cache", "champions") catch null) |cached| break :blk cached;
-                return error.LcuRequestFailed;
-            };
-            defer std.heap.page_allocator.free(champions);
-            if (self.storage) |*store| store.put("cache", "champions", champions) catch {};
-            var cached_stats: ?[]u8 = null;
-            defer if (cached_stats) |value| std.heap.page_allocator.free(value);
-            var cached_at: i64 = 0;
-            if (self.storage) |*store| {
-                cached_stats = store.get("cache", "opgg-ranked-emerald-plus") catch null;
-                cached_at = ((store.getUpdatedAt("cache", "opgg-ranked-emerald-plus") catch null) orelse 0) * std.time.ms_per_s;
-            }
-            if (cached_stats) |value| if (!champion_mapper.hasRankedStats(value)) {
-                std.heap.page_allocator.free(value);
-                cached_stats = null;
-                cached_at = 0;
-            };
-            const now = runtimeNowMillis(self);
-            const ttl = runtimeCacheTtlMillis(self);
-            const cache_fresh = cached_stats != null and cached_at > 0 and now <= cached_at + ttl;
-            var fetched_stats: ?[]u8 = null;
-            defer if (fetched_stats) |value| std.heap.page_allocator.free(value);
-            var fetch_failed = false;
-            if (!cache_fresh) {
-                fetched_stats = client.getPublicUrl("https://lol-api-champion.op.gg/api/global/champions/ranked?tier=emerald_plus", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) lol-desktop-native/2.0") catch blk: {
-                    fetch_failed = true;
-                    break :blk null;
-                };
-                if (fetched_stats) |stats| {
-                    if (champion_mapper.hasRankedStats(stats)) {
-                        if (self.storage) |*store| store.put("cache", "opgg-ranked-emerald-plus", stats) catch {};
-                    } else {
-                        std.heap.page_allocator.free(stats);
-                        fetched_stats = null;
-                        fetch_failed = true;
-                    }
-                }
-            }
-            const stats = fetched_stats orelse cached_stats;
-            const fetched_at = if (fetched_stats != null) now else cached_at;
-            const stale = stats != null and !cache_fresh and fetched_stats == null;
-            return champion_mapper.dtoWithStats(champions, stats, .{
-                .source = if (fetched_stats != null) "opgg" else if (stale) "sqlite-stale" else if (cache_fresh) "sqlite-fresh" else "lcu",
-                .stats_source = if (fetched_stats != null) "opgg" else if (stats != null) "sqlite" else "unavailable",
-                .fetched_at_millis = fetched_at,
-                .expires_at_millis = if (stats != null and fetched_at > 0) fetched_at + ttl else null,
-                .is_stale = stale,
-                .error_message = if (stale)
-                    "OP.GG 刷新失败，已回退旧缓存"
-                else if (fetch_failed and stats == null)
-                    "OP.GG 刷新失败，当前仅显示 LCU 基础资料"
-                else
-                    null,
-            }, output);
-        }
-        return error.LcuNotRunning;
-    }
-    return std.fmt.bufPrint(output, "[]", .{});
-}
-
-fn getAsset(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = runtime(context);
-    const payload_json = parsePayload(struct { kind: []const u8 = "", id: i64 = 0 }, invocation.request.payload) catch return error.InvalidAsset;
-    defer payload_json.deinit();
-    const payload = payload_json.value;
-    if (payload.id <= 0) return error.InvalidAsset;
-    const kind = assetKind(payload.kind) orelse return error.InvalidAsset;
-    if (self.io) |io| {
-        var client = discoverClient(self, io) catch return communityDragonAsset(kind, payload.id, output);
-        defer client.deinit();
-        const bytes = fetchLcuAsset(client, kind, payload.id) catch return communityDragonAsset(kind, payload.id, output);
-        defer std.heap.page_allocator.free(bytes);
-        return assetDataDto(kind, payload.id, bytes, output);
-    }
-    return communityDragonAsset(kind, payload.id, output);
-}
-
-const AssetKind = enum { champion, item, spell, perk, profile };
-
-fn assetKind(value: []const u8) ?AssetKind {
-    return std.meta.stringToEnum(AssetKind, value);
-}
-
-fn fetchLcuAsset(client: lcu.Client, kind: AssetKind, id: i64) ![]u8 {
-    var direct_path_buffer: [256]u8 = undefined;
-    if (kind == .profile) {
-        const path = try std.fmt.bufPrint(&direct_path_buffer, "/lol-game-data/assets/v1/profile-icons/{d}.jpg", .{id});
-        return client.get(path);
-    }
-    if (kind == .champion) {
-        const path = try std.fmt.bufPrint(&direct_path_buffer, "/lol-game-data/assets/v1/champion-icons/{d}.png", .{id});
-        return client.get(path);
-    }
-
-    const endpoint = switch (kind) {
-        .item => "/lol-game-data/assets/v1/items.json",
-        .spell => "/lol-game-data/assets/v1/summoner-spells.json",
-        .perk => "/lol-game-data/assets/v1/perks.json",
-        else => unreachable,
-    };
-    const catalog_json = try client.get(endpoint);
-    defer std.heap.page_allocator.free(catalog_json);
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const catalog = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), catalog_json, .{}) catch return error.LcuInvalidResponse;
-    if (catalog != .array) return error.LcuInvalidResponse;
-    for (catalog.array.items) |entry| {
-        if (entry != .object or jsonInt(entry, "id") != id) continue;
-        const icon_path = jsonField(entry, "iconPath");
-        if (icon_path.len == 0 or !std.mem.startsWith(u8, icon_path, "/")) return error.AssetNotFound;
-        return client.get(icon_path);
-    }
-    return error.AssetNotFound;
-}
-
-fn assetDataDto(kind: AssetKind, id: i64, bytes: []const u8, output: []u8) ![]const u8 {
-    const is_jpeg = bytes.len >= 3 and bytes[0] == 0xff and bytes[1] == 0xd8 and bytes[2] == 0xff;
-    const is_png = bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n");
-    if (!is_jpeg and !is_png) return error.AssetNotFound;
-    const mime = if (is_jpeg) "image/jpeg" else "image/png";
-    const prefix = try std.fmt.bufPrint(output, "{{\"kind\":\"{s}\",\"id\":{d},\"mimeType\":\"{s}\",\"dataUrl\":\"data:{s};base64,", .{ @tagName(kind), id, mime, mime });
-    const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
-    const suffix = "\",\"source\":\"lcu\"}";
-    if (prefix.len + encoded_len + suffix.len > output.len) return error.ResponseTooLarge;
-    _ = std.base64.standard.Encoder.encode(output[prefix.len..][0..encoded_len], bytes);
-    @memcpy(output[prefix.len + encoded_len ..][0..suffix.len], suffix);
-    return output[0 .. prefix.len + encoded_len + suffix.len];
-}
-
-fn communityDragonAsset(kind: AssetKind, id: i64, output: []u8) ![]const u8 {
-    const folder = switch (kind) {
-        .champion => "champion-icons",
-        .profile => "profile-icons",
-        .item => "items",
-        .spell => "summoner-spells",
-        .perk => "perk-images/Styles",
-    };
-    const extension = if (kind == .profile) "jpg" else "png";
-    const mime = if (kind == .profile) "image/jpeg" else "image/png";
-    return std.fmt.bufPrint(output, "{{\"kind\":\"{s}\",\"id\":{d},\"mimeType\":\"{s}\",\"dataUrl\":\"https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/v1/{s}/{d}.{s}\",\"source\":\"communitydragon\"}}", .{ @tagName(kind), id, mime, folder, id, extension });
 }
 
 fn cachedEncounterResponse(self: *Runtime, target_puuid: []const u8, max_games: usize, excluded_game_id: i64, output: []u8) ![]const u8 {
@@ -2791,13 +2627,32 @@ fn appendEncounterHistory(store: *storage.Store, puuid: []const u8, seen: *std.S
     }
 }
 
+/// 一局的完整十人详情。
+///
+/// 三个 puuid 参数各管一件事，不要混用：
+/// - `selfPuuid`：**账号归属**。必须等于当前登录账号（`AccountChanged` 校验），
+///   否则拒绝——防止切换账号后把上一账号的战绩当成当前账号的。
+/// - `targetPuuid`：这局里**必须出现**的玩家（可选）。用于确认这局确实是他打过的。
+/// - `subjectPuuid`：行内数据（KDA / 装备 / 所属阵营）取谁的视角，缺省等于 `selfPuuid`。
+///
+/// 为什么必须拆开：抽屉里看「敌方某个人的某一局」，那局通常**没有我**。
+/// 旧签名让 `selfPuuid` 同时承担账号校验和行内视角，于是 `singleMatchDto` 要求
+/// owner 与 target 双方都在局内，这种查询必然失败——展开后只剩列表接口给的
+/// 那一条 participants（LCU 列表接口每局只返回查询者本人）。
 fn getMatchDetail(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
-    const payload_json = parsePayload(struct { gameId: i64 = 0, platformId: []const u8 = "", selfPuuid: []const u8 = "", targetPuuid: []const u8 = "" }, invocation.request.payload) catch return error.InvalidRequest;
+    const payload_json = parsePayload(struct {
+        gameId: i64 = 0,
+        platformId: []const u8 = "",
+        selfPuuid: []const u8 = "",
+        targetPuuid: []const u8 = "",
+        subjectPuuid: []const u8 = "",
+    }, invocation.request.payload) catch return error.InvalidRequest;
     defer payload_json.deinit();
     const payload = payload_json.value;
     if (payload.gameId <= 0 or payload.selfPuuid.len == 0) return error.InvalidRequest;
     if (self.live_owner_puuid_len > 0 and !samePuuid(payload.selfPuuid, self.live_owner_puuid[0..self.live_owner_puuid_len])) return error.AccountChanged;
+    const subject = if (payload.subjectPuuid.len > 0) payload.subjectPuuid else payload.selfPuuid;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2807,18 +2662,18 @@ fn getMatchDetail(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     const catalog = if (self.storage) |*store| try store.get("cache", "champions") else null;
     defer if (catalog) |value| std.heap.page_allocator.free(value);
     if (self.storage) |*store| {
-        for ([_][]const u8{ payload.selfPuuid, payload.targetPuuid }) |puuid| {
+        for ([_][]const u8{ subject, payload.targetPuuid }) |puuid| {
             if (puuid.len == 0) continue;
             if (try store.get("playerHistory", puuid)) |history| {
                 defer std.heap.page_allocator.free(history);
-                if (cachedSingleMatch(history, payload.gameId, payload.selfPuuid, payload.targetPuuid, catalog orelse "[]", output)) |result| return result else |_| {}
+                if (cachedSingleMatch(history, payload.gameId, subject, payload.targetPuuid, catalog orelse "[]", output)) |result| return result else |_| {}
             }
         }
         const owner = try store.get("matches", "currentPuuid");
         defer if (owner) |value| std.heap.page_allocator.free(value);
-        if (owner != null and samePuuid(owner.?, payload.selfPuuid)) if (try store.get("matches", "current")) |history| {
+        if (owner != null and samePuuid(owner.?, subject)) if (try store.get("matches", "current")) |history| {
             defer std.heap.page_allocator.free(history);
-            if (cachedSingleMatch(history, payload.gameId, payload.selfPuuid, payload.targetPuuid, catalog orelse "[]", output)) |result| return result else |_| {}
+            if (cachedSingleMatch(history, payload.gameId, subject, payload.targetPuuid, catalog orelse "[]", output)) |result| return result else |_| {}
         };
     }
     if (self.mode != .live) return error.MatchDetailUnavailable;
@@ -2830,7 +2685,7 @@ fn getMatchDetail(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     if (client.get(path)) |json| {
         defer std.heap.page_allocator.free(json);
         const game = std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{}) catch std.json.Value{ .null = {} };
-        if (singleMatchDto(game, payload.gameId, payload.selfPuuid, payload.targetPuuid, catalog orelse "[]", "lcu", output)) |result| return result else |_| {}
+        if (singleMatchDto(game, payload.gameId, subject, payload.targetPuuid, catalog orelse "[]", "lcu", output)) |result| return result else |_| {}
     } else |_| {}
     if (prepareJungleSgpContext(self, client, allocator)) |sgp| {
         if (payload.platformId.len > 0 and !std.ascii.eqlIgnoreCase(payload.platformId, sgp.platform_id)) return error.PlatformMismatch;
@@ -2840,37 +2695,39 @@ fn getMatchDetail(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
         defer std.heap.page_allocator.free(json);
         const value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
         const game = unwrapHistoryGame(allocator, value) orelse return error.MatchDetailUnavailable;
-        return singleMatchDto(game, payload.gameId, payload.selfPuuid, payload.targetPuuid, catalog orelse "[]", "sgp", output);
+        return singleMatchDto(game, payload.gameId, subject, payload.targetPuuid, catalog orelse "[]", "sgp", output);
     }
     return error.MatchDetailUnavailable;
 }
 
-fn cachedSingleMatch(json: []const u8, game_id: i64, owner: []const u8, target: []const u8, catalog: []const u8, output: []u8) ![]const u8 {
+fn cachedSingleMatch(json: []const u8, game_id: i64, subject: []const u8, target: []const u8, catalog: []const u8, output: []u8) ![]const u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{});
     const games = historyGames(root) orelse return error.MatchDetailUnavailable;
     for (games.array.items) |entry| {
         const game = unwrapHistoryGame(arena.allocator(), entry) orelse continue;
-        if (jsonInt(game, "gameId") == game_id) return singleMatchDto(game, game_id, owner, target, catalog, "sqlite-fresh", output);
+        if (jsonInt(game, "gameId") == game_id) return singleMatchDto(game, game_id, subject, target, catalog, "sqlite-fresh", output);
     }
     return error.MatchDetailUnavailable;
 }
 
-fn singleMatchDto(game: std.json.Value, game_id: i64, owner: []const u8, target: []const u8, catalog: []const u8, source: []const u8, output: []u8) ![]const u8 {
+/// `subject` = 行内数据取谁的视角，必须真在这局里；`target` 给了就必须也在。
+/// 注意：**不要求**「我」在这局里——抽屉看的是别人的历史，那局常常没有我。
+fn singleMatchDto(game: std.json.Value, game_id: i64, subject: []const u8, target: []const u8, catalog: []const u8, source: []const u8, output: []u8) ![]const u8 {
     if (game != .object or jsonInt(game, "gameId") != game_id) return error.MatchDetailUnavailable;
     const participants = game.object.get("participants") orelse return error.MatchDetailUnavailable;
     if (participants != .array or participants.array.items.len < 2) return error.MatchDetailUnavailable;
-    var has_owner = false;
+    var has_subject = false;
     var has_target = target.len == 0;
     for (participants.array.items) |participant| {
         const identity = participantIdentityForId(game, jsonInt(participant, "participantId"));
         const player = if (identity) |value| nestedObject(value, "player") orelse value else std.json.Value{ .null = {} };
         const puuid = if (jsonField(participant, "puuid").len > 0) jsonField(participant, "puuid") else if (jsonField(participant, "playerPuuid").len > 0) jsonField(participant, "playerPuuid") else jsonField(player, "puuid");
-        if (samePuuid(puuid, owner)) has_owner = true;
-        if (samePuuid(puuid, target)) has_target = true;
+        if (samePuuid(puuid, subject)) has_subject = true;
+        if (target.len > 0 and samePuuid(puuid, target)) has_target = true;
     }
-    if (!has_owner or !has_target) return error.MatchDetailUnavailable;
+    if (!has_subject or !has_target) return error.MatchDetailUnavailable;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2878,7 +2735,9 @@ fn singleMatchDto(game: std.json.Value, game_id: i64, owner: []const u8, target:
     try list.append(game);
     const history = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .array = list }, .{});
     const dto_buffer = try allocator.alloc(u8, live_lobby_capacity);
-    const dto = try matchHistoryDtoPage(history, catalog, owner, 0, 1, dto_buffer);
+    // 行内视角：这一局是「subject 的战绩」，所以高亮/self 标记取 subject，
+    // 而不是当前账号 owner —— 抽屉里看别人的历史时那局常常没有「我」。
+    const dto = try matchHistoryDtoPage(history, catalog, subject, 0, 1, dto_buffer);
     const mapped = try std.json.parseFromSliceLeaky(std.json.Value, allocator, dto, .{});
     if (mapped != .array or mapped.array.items.len != 1) return error.MatchDetailUnavailable;
     var result = mapped.array.items[0];
@@ -2900,247 +2759,7 @@ fn getEncounters(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
     return cachedEncounterResponse(self, payload.puuid orelse "", limit, payload.excludeGameId, output);
 }
 
-const PlayerTagQueryPayload = struct {
-    puuids: []const []const u8 = &.{},
-    selfPuuid: ?[]const u8 = null,
-};
-
-const PlayerTagUpdatePayload = struct {
-    puuid: []const u8,
-    notes: []const []const u8 = &.{},
-    selfPuuid: ?[]const u8 = null,
-};
-
-/// 备注的「写入者」：优先用请求里带的 puuid（快照模式与测试没有登录账号），
-/// 否则退回当前客户端登录账号。
-fn playerTagOwner(self: *Runtime, provided: ?[]const u8) []const u8 {
-    if (provided) |puuid| {
-        if (puuid.len > 0) return puuid;
-    }
-    return self.live_owner_puuid[0..self.live_owner_puuid_len];
-}
-
-fn writePlayerTagNotes(
-    writer: *std.Io.Writer,
-    allocator: std.mem.Allocator,
-    self: *Runtime,
-    owner: []const u8,
-    puuid: []const u8,
-) !void {
-    const notes: []const []const u8 = if (self.storage) |*store|
-        try player_tag_service.read(store, allocator, owner, puuid)
-    else
-        &.{};
-    try writer.writeByte('[');
-    for (notes, 0..) |note, index| {
-        if (index > 0) try writer.writeByte(',');
-        try jsonString(writer, note);
-    }
-    try writer.writeByte(']');
-}
-
-/// 批量读取本局十人的备注，返回 `{"tags":{"<puuid>":["备注"]}}`。
-fn getPlayerTags(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = runtime(context);
-    const payload_json = parsePayload(PlayerTagQueryPayload, invocation.request.payload) catch return error.InvalidRequest;
-    defer payload_json.deinit();
-
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const owner = playerTagOwner(self, payload_json.value.selfPuuid);
-
-    var writer = std.Io.Writer.fixed(output);
-    try writer.writeAll("{\"tags\":{");
-    var first = true;
-    for (payload_json.value.puuids) |puuid| {
-        if (puuid.len == 0) continue;
-        if (!first) try writer.writeByte(',');
-        first = false;
-        try jsonString(&writer, puuid);
-        try writer.writeByte(':');
-        try writePlayerTagNotes(&writer, allocator, self, owner, puuid);
-    }
-    try writer.writeAll("}}");
-    return writer.buffered();
-}
-
-/// 覆盖写入某位玩家的备注，返回清洗后的结果与更新时间。
-fn updatePlayerTag(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = runtime(context);
-    const payload_json = parsePayload(PlayerTagUpdatePayload, invocation.request.payload) catch return error.InvalidRequest;
-    defer payload_json.deinit();
-    const payload = payload_json.value;
-    if (payload.puuid.len == 0) return error.InvalidRequest;
-
-    const owner = playerTagOwner(self, payload.selfPuuid);
-    if (owner.len == 0) return error.PlayerTagUnavailable;
-    const store = if (self.storage) |*slot| slot else return error.PlayerTagUnavailable;
-
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const saved = try player_tag_service.write(store, allocator, owner, payload.puuid, payload.notes);
-    const updated_at = try player_tag_service.updatedAt(store, allocator, owner, payload.puuid);
-
-    var writer = std.Io.Writer.fixed(output);
-    try writer.writeAll("{\"puuid\":");
-    try jsonString(&writer, payload.puuid);
-    try writer.writeAll(",\"notes\":[");
-    for (saved, 0..) |note, index| {
-        if (index > 0) try writer.writeByte(',');
-        try jsonString(&writer, note);
-    }
-    try writer.print("],\"updatedAt\":{d}}}", .{updated_at});
-    return writer.buffered();
-}
-
-fn getFriends(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = runtime(context);
-    _ = invocation;
-    if (self.mode != .live) return std.fmt.bufPrint(output, "{{\"groups\":[],\"friends\":[]}}", .{});
-    const io = self.io orelse return error.LcuNotRunning;
-    var client = discoverClient(self, io) catch return error.LcuNotRunning;
-    defer client.deinit();
-    const groups_json = client.get("/lol-chat/v1/friend-groups") catch return error.LcuRequestFailed;
-    defer std.heap.page_allocator.free(groups_json);
-    const friends_json = client.get("/lol-chat/v1/friends") catch return error.LcuRequestFailed;
-    defer std.heap.page_allocator.free(friends_json);
-    const giftable_json = client.get("/lol-store/v1/giftablefriends") catch null;
-    defer if (giftable_json) |value| std.heap.page_allocator.free(value);
-    return friendToolsDto(self, groups_json, friends_json, giftable_json orelse "[]", output);
-}
-
-fn friendToolsDto(self: *Runtime, groups_json: []const u8, friends_json: []const u8, giftable_json: []const u8, output: []u8) ![]const u8 {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const groups = std.json.parseFromSliceLeaky(std.json.Value, allocator, groups_json, .{}) catch return error.LcuInvalidResponse;
-    const friends = std.json.parseFromSliceLeaky(std.json.Value, allocator, friends_json, .{}) catch return error.LcuInvalidResponse;
-    const giftable = std.json.parseFromSliceLeaky(std.json.Value, allocator, giftable_json, .{}) catch std.json.Value{ .null = {} };
-    if (groups != .array or friends != .array) return error.LcuInvalidResponse;
-    var writer = std.Io.Writer.fixed(output);
-    try writer.writeAll("{\"groups\":[");
-    var first = true;
-    for (groups.array.items) |group| {
-        if (group != .object) continue;
-        if (!first) try writer.writeByte(',');
-        first = false;
-        try writer.print("{{\"id\":{d},\"name\":", .{jsonInt(group, "id")});
-        try jsonString(&writer, jsonField(group, "name"));
-        try writer.print(",\"priority\":{d}}}", .{jsonInt(group, "priority")});
-    }
-    try writer.writeAll("],\"friends\":[");
-    first = true;
-    for (friends.array.items) |friend| {
-        if (friend != .object) continue;
-        const id = jsonField(friend, "id");
-        const puuid = jsonField(friend, "puuid");
-        if (id.len == 0 or puuid.len == 0) continue;
-        if (!first) try writer.writeByte(',');
-        first = false;
-        try writer.writeAll("{\"id\":");
-        try jsonString(&writer, id);
-        try writer.writeAll(",\"puuid\":");
-        try jsonString(&writer, puuid);
-        try writer.print(",\"summonerId\":{d},\"gameName\":", .{jsonInt(friend, "summonerId")});
-        try jsonString(&writer, if (jsonField(friend, "gameName").len > 0) jsonField(friend, "gameName") else jsonField(friend, "name"));
-        try writer.writeAll(",\"gameTag\":");
-        try jsonString(&writer, jsonField(friend, "gameTag"));
-        try writer.print(",\"icon\":{d},\"groupId\":{d},\"availability\":", .{ jsonInt(friend, "icon"), jsonInt(friend, "groupId") });
-        try jsonString(&writer, jsonField(friend, "availability"));
-        try writer.writeAll(",\"friendsSince\":");
-        if (giftableFriendSince(giftable, jsonInt(friend, "summonerId"))) |since| try jsonString(&writer, since) else try writer.writeAll("null");
-        try writer.writeAll(",\"lastGameAt\":");
-        if (cachedFriendLastGame(self, puuid)) |cached| {
-            defer std.heap.page_allocator.free(cached);
-            const cached_value = std.json.parseFromSliceLeaky(std.json.Value, allocator, cached, .{}) catch std.json.Value{ .null = {} };
-            const last_game = jsonField(cached_value, "lastGameAt");
-            if (last_game.len > 0) try jsonString(&writer, last_game) else try writer.writeAll("null");
-        } else try writer.writeAll("null");
-        try writer.writeByte('}');
-    }
-    try writer.writeAll("]}");
-    return writer.buffered();
-}
-
-fn giftableFriendSince(giftable: std.json.Value, summoner_id: i64) ?[]const u8 {
-    if (giftable != .array or summoner_id <= 0) return null;
-    for (giftable.array.items) |friend| if (jsonInt(friend, "summonerId") == summoner_id) {
-        const value = jsonField(friend, "friendsSince");
-        if (value.len > 0) return value;
-    };
-    return null;
-}
-
-fn cachedFriendLastGame(self: *Runtime, puuid: []const u8) ?[]u8 {
-    const store = if (self.storage) |*value| value else return null;
-    return store.get("friendLastGame", puuid) catch null;
-}
-
-fn getFriendLastGame(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = runtime(context);
-    const payload_json = parsePayload(struct { puuid: []const u8 = "", force: bool = false }, invocation.request.payload) catch return error.InvalidRequest;
-    defer payload_json.deinit();
-    const payload = payload_json.value;
-    if (payload.puuid.len == 0) return error.InvalidRequest;
-    if (!payload.force) if (self.storage) |*store| {
-        const updated_at = store.getUpdatedAt("friendLastGame", payload.puuid) catch null;
-        const now_seconds = @divTrunc(runtimeNowMillis(self), std.time.ms_per_s);
-        if (updated_at != null and now_seconds - updated_at.? < 6 * std.time.s_per_hour) if (cachedFriendLastGame(self, payload.puuid)) |cached| {
-            defer std.heap.page_allocator.free(cached);
-            return copyJson(cached, output);
-        };
-    };
-    if (self.mode != .live) return friendLastGameDto(payload.puuid, "[]", output);
-    const io = self.io orelse return error.LcuNotRunning;
-    var client = discoverClient(self, io) catch return error.LcuNotRunning;
-    defer client.deinit();
-    var path_buffer: [768]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buffer, "/lol-match-history/v1/products/lol/{s}/matches?begIndex=0&endIndex=0", .{payload.puuid}) catch return error.InvalidRequest;
-    const lcu_history = client.get(path) catch null;
-    defer if (lcu_history) |value| std.heap.page_allocator.free(value);
-    var history = lcu_history orelse "{}";
-    var sgp_history: ?[]u8 = null;
-    defer if (sgp_history) |value| std.heap.page_allocator.free(value);
-    if (!historyHasGames(history)) {
-        const current_json = client.get("/lol-summoner/v1/current-summoner") catch null;
-        defer if (current_json) |value| std.heap.page_allocator.free(value);
-        if (current_json) |value| {
-            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            defer arena.deinit();
-            const current = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), value, .{}) catch std.json.Value{ .null = {} };
-            sgp_history = fetchSgpHistory(client, current, history, payload.puuid, 0, 1) catch null;
-            if (sgp_history) |sgp| {
-                if (historyHasGames(sgp)) history = sgp;
-            }
-        }
-    }
-    const result = try friendLastGameDto(payload.puuid, history, output);
-    if (self.storage) |*store| store.put("friendLastGame", payload.puuid, result) catch {};
-    return result;
-}
-
-fn friendLastGameDto(puuid: []const u8, history_json: []const u8, output: []u8) ![]const u8 {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), history_json, .{}) catch std.json.Value{ .null = {} };
-    const list = historyGames(root);
-    var timestamp: i64 = 0;
-    if (list) |games| if (games.array.items.len > 0) {
-        const game = unwrapHistoryGame(arena.allocator(), games.array.items[0]) orelse std.json.Value{ .null = {} };
-        timestamp = if (jsonInt(game, "gameCreation") > 0) jsonInt(game, "gameCreation") else jsonInt(game, "gameStartTimestamp");
-    };
-    var writer = std.Io.Writer.fixed(output);
-    try writer.writeAll("{\"puuid\":");
-    try jsonString(&writer, puuid);
-    try writer.writeAll(",\"lastGameAt\":");
-    if (timestamp > 0) try writeIsoTimestamp(&writer, timestamp) else try writer.writeAll("null");
-    try writer.writeByte('}');
-    return writer.buffered();
-}
-
-fn historyGames(root: std.json.Value) ?std.json.Value {
+pub fn historyGames(root: std.json.Value) ?std.json.Value {
     if (root == .array) return root;
     if (root != .object) return null;
     const games = root.object.get("games") orelse return null;
@@ -3152,7 +2771,7 @@ fn historyGames(root: std.json.Value) ?std.json.Value {
     return null;
 }
 
-fn unwrapHistoryGame(allocator: std.mem.Allocator, entry: std.json.Value) ?std.json.Value {
+pub fn unwrapHistoryGame(allocator: std.mem.Allocator, entry: std.json.Value) ?std.json.Value {
     if (entry != .object) return null;
     const payload = entry.object.get("json") orelse return entry;
     return switch (payload) {
@@ -3160,23 +2779,6 @@ fn unwrapHistoryGame(allocator: std.mem.Allocator, entry: std.json.Value) ?std.j
         .string => |encoded| std.json.parseFromSliceLeaky(std.json.Value, allocator, encoded, .{}) catch null,
         else => entry,
     };
-}
-
-fn deleteFriend(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    const self = runtime(context);
-    const payload_json = parsePayload(struct { id: []const u8 = "" }, invocation.request.payload) catch return error.InvalidRequest;
-    defer payload_json.deinit();
-    const payload = payload_json.value;
-    if (self.mode != .live or payload.id.len == 0 or std.mem.indexOfScalar(u8, payload.id, '/') != null) return error.InvalidRequest;
-    const io = self.io orelse return error.LcuNotRunning;
-    var client = discoverClient(self, io) catch return error.LcuNotRunning;
-    defer client.deinit();
-    var path_buffer: [512]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buffer, "/lol-chat/v1/friends/{s}", .{payload.id}) catch return error.InvalidRequest;
-    try verifyActionAccount(self, client);
-    const response = try client.delete(path);
-    defer std.heap.page_allocator.free(response);
-    return std.fmt.bufPrint(output, "{{\"deleted\":true}}", .{});
 }
 
 fn cachedEncountersFromMatches(self: *Runtime, output: []u8) ?[]const u8 {
@@ -3991,25 +3593,7 @@ fn numericVersionPart(value: []const u8) u32 {
     return std.fmt.parseInt(u32, value[0..end], 10) catch 0;
 }
 
-fn getLcuEvents(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    _ = invocation;
-    const self = runtime(context);
-    if (self.mode != .live) return std.fmt.bufPrint(output, "[]", .{});
-    if (self.io) |io| {
-        var client = discoverClient(self, io) catch return error.LcuNotRunning;
-        defer client.deinit();
-        return lcu_events.poll(&self.event_state, client, output);
-    }
-    return error.LcuNotRunning;
-}
-
-fn getShortcutEvents(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
-    _ = context;
-    _ = invocation;
-    return hotkey_service.drainJson(output);
-}
-
-fn copyJson(value: []const u8, output: []u8) ![]const u8 {
+pub fn copyJson(value: []const u8, output: []u8) ![]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, value, .{}) catch return error.LcuInvalidResponse;
     defer parsed.deinit();
     if (value.len > output.len) return error.ResponseTooLarge;
@@ -4473,7 +4057,7 @@ fn matchHistoryDto(json: []const u8, output: []u8) ![]const u8 {
     return matchHistoryDtoPage(json, "[]", "", 0, std.math.maxInt(usize), output);
 }
 
-fn historyHasGames(json: []const u8) bool {
+pub fn historyHasGames(json: []const u8) bool {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch return false;
@@ -4669,7 +4253,7 @@ fn catalogChampionName(catalog: std.json.Value, champion_id: i64, fallback: []co
     return "未知英雄";
 }
 
-fn writeIsoTimestamp(writer: *std.Io.Writer, epoch_millis: i64) !void {
+pub fn writeIsoTimestamp(writer: *std.Io.Writer, epoch_millis: i64) !void {
     if (epoch_millis <= 0) return writer.writeAll("\"1970-01-01T00:00:00.000Z\"");
     const seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(@divTrunc(epoch_millis, 1000)) };
     const day = seconds.getEpochDay().calculateYearDay();
@@ -4722,12 +4306,12 @@ fn findConversationId(value: std.json.Value, conversation_type: []const u8) ?[]c
     return null;
 }
 
-fn jsonString(writer: *std.Io.Writer, value: []const u8) !void {
+pub fn jsonString(writer: *std.Io.Writer, value: []const u8) !void {
     var stringify = std.json.Stringify{ .writer = writer, .options = .{} };
     try stringify.write(value);
 }
 
-fn jsonField(value: std.json.Value, name: []const u8) []const u8 {
+pub fn jsonField(value: std.json.Value, name: []const u8) []const u8 {
     if (value != .object) return "";
     const item = value.object.get(name) orelse return "";
     return if (item == .string) item.string else "";
@@ -4994,7 +4578,7 @@ fn queueNameFromCatalog(catalog: std.json.Value, queue_id: i64, mode: []const u8
     return queueName(queue_id, mode);
 }
 
-fn jsonInt(value: std.json.Value, name: []const u8) i64 {
+pub fn jsonInt(value: std.json.Value, name: []const u8) i64 {
     if (value != .object) return 0;
     const item = value.object.get(name) orelse return 0;
     return switch (item) {
@@ -5048,6 +4632,11 @@ fn connectionDtoDetailedAt(summoner_json: []const u8, phase_json: []const u8, ch
     try jsonString(&writer, identity.name);
     try writer.writeAll(",\"tagLine\":");
     try jsonString(&writer, identity.tag);
+    // 当前登录账号的 puuid。前端要在「看别人的某一局」时区分「账号归属」与
+    // 「行内视角」（见 getMatchDetail），没有这个字段就只能靠昵称猜。
+    try writer.writeAll(",\"puuid\":");
+    const owner_puuid = identityPuuid(summoner);
+    if (owner_puuid.len == 0) try writer.writeAll("null") else try jsonString(&writer, owner_puuid);
     try writer.writeAll(",\"summonerLevel\":");
     try writeNullableInt(&writer, summoner, "summonerLevel");
     try writer.writeAll(",\"profileIconId\":");
@@ -7017,18 +6606,30 @@ test "相遇读取核验缓存归属且不改写旧归档" {
     try std.testing.expectEqualStrings("[]", try cachedEncounterResponse(&state, "乙", 40, 321, &output));
 }
 
-test "单局详情严格匹配对局编号及双方身份" {
+test "单局详情严格匹配对局编号及视角玩家身份" {
     const history =
         \\{"games":{"games":[{"gameId":456,"gameCreation":1700000000000,"gameDuration":1800,"queueId":420,"participants":[{"participantId":1,"puuid":"本人","teamId":100,"championId":1,"stats":{"win":true,"kills":3,"deaths":1,"assists":5}},{"participantId":2,"puuid":"目标","teamId":200,"championId":2,"stats":{"win":false,"kills":1,"deaths":3,"assists":2}}]}]}}
     ;
     var output: [128 * 1024]u8 = undefined;
     const result = try cachedSingleMatch(history, 456, "本人", "目标", "[]", &output);
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
-    defer parsed.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), result, .{});
     try std.testing.expectEqual(@as(i64, 456), jsonInt(parsed.value, "gameId"));
     try std.testing.expectError(error.MatchDetailUnavailable, cachedSingleMatch(history, 457, "本人", "目标", "[]", &output));
     try std.testing.expectError(error.MatchDetailUnavailable, cachedSingleMatch(history, 456, "他人", "目标", "[]", &output));
     try std.testing.expectError(error.MatchDetailUnavailable, cachedSingleMatch(history, 456, "本人", "他人", "[]", &output));
+
+    // 行内视角取「目标」而不是「我」时也要能出结果：抽屉里看敌方某个人的
+    // 某一局就是这样——那一局通常没有我。selfPuuid 的账号校验在
+    // getMatchDetail 里单独做，不再混进这里的身份校验。
+    const as_target = try cachedSingleMatch(history, 456, "目标", "目标", "[]", &output);
+    const target_view = try std.json.parseFromSlice(std.json.Value, arena.allocator(), as_target, .{});
+    try std.testing.expectEqual(@as(i64, 456), jsonInt(target_view.value, "gameId"));
+    // 行内 KDA 取的是「目标」的（1/3/2），不是「本人」的（3/1/5）。
+    try std.testing.expectEqual(@as(i64, 1), jsonInt(target_view.value, "kills"));
+    try std.testing.expectEqual(@as(i64, 3), jsonInt(target_view.value, "deaths"));
+    try std.testing.expectEqual(@as(usize, 2), target_view.value.object.get("participants").?.array.items.len);
 }
 
 test "资料发布更新双方视图和队伍摘要并保留当前英雄" {
@@ -7480,20 +7081,6 @@ test "maps Tencent platform ids to SGP hosts" {
     try std.testing.expect(sgpHost("UNKNOWN") == null);
 }
 
-test "asset DTO embeds LCU images and uses the profile jpeg fallback" {
-    const png = "\x89PNG\r\n\x1a\ncontent";
-    var output: [1024]u8 = undefined;
-    const result = try assetDataDto(.item, 3031, png, &output);
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
-    defer parsed.deinit();
-    try std.testing.expect(std.mem.indexOf(u8, result, "data:image/png;base64,") != null);
-
-    const fallback = try communityDragonAsset(.profile, 3494, &output);
-    const fallback_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, fallback, .{});
-    defer fallback_parsed.deinit();
-    try std.testing.expect(std.mem.endsWith(u8, fallback_parsed.value.object.get("dataUrl").?.string, "3494.jpg"));
-}
-
 test "maps champ select teams into lobby profiles" {
     const input = "{\"queueId\":490,\"myTeam\":[{\"puuid\":\"ally-1\",\"gameName\":\"Ally\",\"tagLine\":\"ONE\",\"championId\":103,\"assignedPosition\":\"MIDDLE\"}],\"theirTeam\":[]}";
     var output: [8192]u8 = undefined;
@@ -7845,32 +7432,6 @@ test "merges encounter archive with deduplication and retention cutoff" {
     try std.testing.expect(std.mem.indexOf(u8, result, "stale-name") == null);
     try std.testing.expect(std.mem.indexOf(u8, result, "latest-name") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "kept-player") != null);
-}
-
-test "normalizes friend groups and friend-since dates" {
-    var state = Runtime.init();
-    const groups = "[{\"id\":7,\"name\":\"双排\",\"priority\":2}]";
-    const friends = "[{\"id\":\"friend-id\",\"puuid\":\"friend-puuid\",\"summonerId\":42,\"gameName\":\"好友\",\"gameTag\":\"CN1\",\"icon\":12,\"groupId\":7,\"availability\":\"chat\"}]";
-    const giftable = "[{\"summonerId\":42,\"friendsSince\":\"2025-08-29T10:00:00.000Z\"}]";
-    var output: [4096]u8 = undefined;
-    const result = try friendToolsDto(&state, groups, friends, giftable, &output);
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("groups").?.array.items.len);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("friends").?.array.items.len);
-    const friend = parsed.value.object.get("friends").?.array.items[0];
-    try std.testing.expectEqualStrings("好友", friend.object.get("gameName").?.string);
-    try std.testing.expectEqual(@as(i64, 7), friend.object.get("groupId").?.integer);
-    try std.testing.expectEqualStrings("2025-08-29T10:00:00.000Z", friend.object.get("friendsSince").?.string);
-}
-
-test "extracts the latest friend match timestamp" {
-    var output: [1024]u8 = undefined;
-    const result = try friendLastGameDto("friend-puuid", "{\"games\":[{\"gameCreation\":1625159473123}]}", &output);
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("friend-puuid", parsed.value.object.get("puuid").?.string);
-    try std.testing.expectEqualStrings("2021-07-01T17:11:13.123Z", parsed.value.object.get("lastGameAt").?.string);
 }
 
 test "derives encounters from SGP object payloads" {

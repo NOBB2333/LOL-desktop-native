@@ -12,8 +12,9 @@ import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { MatchSummary } from "../types/domain";
 import { championImage, roleName, shortDate } from "../utils/format";
-import { visibleMatches } from "../utils/matchFilters";
-import { matchHistoryQueryKey } from "../utils/matchHistoryQuery";
+import { visibleMatches } from "../matches/filters";
+import { matchHistoryQueryKey } from "../matches/query";
+import { useMatchDetail } from "../composables/useMatchDetail";
 import { useRoute, useRouter } from "vue-router";
 
 const app = useAppStore();
@@ -72,6 +73,19 @@ function setViewMode(mode: "detail" | "index") {
   if (typeof localStorage !== "undefined") localStorage.setItem("lol-desktop-match-view", mode);
 }
 function toggleExpanded(gameId: number) { expandedId.value = expandedId.value === gameId ? null : gameId; }
+/**
+ * 展开的那一行同样要单独拉完整十人数据：列表接口每局只返回查询者本人，
+ * 直接用它渲染「十人阵容与 BP」只会显示一个人。
+ * 行内视角取这一行自带的那个选手（列表里唯一的那条 participants 就是被查询的人）。
+ */
+const expandedMatchDetail = useMatchDetail({
+  gameId: expandedId,
+  subjectPuuid: computed(() => {
+    const row = rows.value.find((match) => match.gameId === expandedId.value);
+    return row?.participants[0]?.puuid ?? app.connection.puuid ?? "";
+  }),
+  selfPuuid: computed(() => app.connection.puuid ?? ""),
+});
 async function searchSummoner() {
   activeSummoner.value = summonerQuery.value.trim();
   page.value = 0;
@@ -114,7 +128,7 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
     <LoadingState v-if="matches.isLoading.value" label="正在刷新完整战绩" />
     <template v-else>
       <section class="matches-summary"><div><span>最近 10 局</span><strong>{{ summaryRows.length }} <small>场</small></strong></div><div><span>胜率</span><strong>{{ completedRows.length ? Math.round(wins / completedRows.length * 100) : 0 }}<small>%</small></strong></div><div><span>平均 KDA</span><strong>{{ averageKda }}</strong></div><div><span>平均伤害</span><strong>{{ averageDamage }}<small>k</small></strong></div><div class="matches-summary__result"><Filter :size="14" /><span>{{ viewMode === "detail" ? "当前 10 局聚合 · 点击箭头展开十人阵容" : "最近 10 局聚合 · 详情随左侧选中对局更新" }}</span></div></section>
-      <section v-if="viewMode === 'detail'" class="match-table-shell"><header class="match-table-heading"><div><span class="eyebrow">RECENT GAMES / DETAIL ROW</span><h2>完整对局</h2></div><span class="match-table-heading__hint">保留完整信息；点击右侧箭头展开十人阵容与 BP</span></header><div class="match-list match-list--full"><MatchDetailCard v-for="match in filtered" :key="match.gameId" :match="match" :expanded="expandedId === match.gameId" @toggle="toggleExpanded(match.gameId)" /><div v-if="!filtered.length" class="empty-state">没有匹配的对局</div></div></section>
+      <section v-if="viewMode === 'detail'" class="match-table-shell"><header class="match-table-heading"><div><span class="eyebrow">RECENT GAMES / DETAIL ROW</span><h2>完整对局</h2></div><span class="match-table-heading__hint">保留完整信息；点击右侧箭头展开十人阵容与 BP</span></header><div class="match-list match-list--full"><MatchDetailCard v-for="match in filtered" :key="match.gameId" :match="expandedMatchDetail.matchForRow(match)" :expanded="expandedId === match.gameId" :detail-loading="expandedId === match.gameId && expandedMatchDetail.loading.value" :detail-error="expandedId === match.gameId ? expandedMatchDetail.error.value : ''" @toggle="toggleExpanded(match.gameId)" /><div v-if="!filtered.length" class="empty-state">没有匹配的对局</div></div></section>
       <section v-else class="matches-workspace">
         <aside class="matches-index" aria-label="最近对局列表">
           <header class="matches-index__header"><div><span class="eyebrow">RECENT GAMES</span><h2>最近对局</h2></div><span>{{ filtered.length }} / {{ rows.length }}</span></header>

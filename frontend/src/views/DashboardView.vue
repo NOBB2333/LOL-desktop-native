@@ -10,8 +10,8 @@ import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { RankQueueSummary } from "../types/domain";
 import { championImage, percent, platformRegionGuide, platformRegionName, platformRegionOverview, rankName, relativeTime } from "../utils/format";
-import { visibleMatches } from "../utils/matchFilters";
-import { matchHistoryQueryKey } from "../utils/matchHistoryQuery";
+import { visibleMatches } from "../matches/filters";
+import { matchHistoryQueryKey } from "../matches/query";
 
 const app = useAppStore();
 const message = useMessage();

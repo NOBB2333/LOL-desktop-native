@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { fixtureEncounters, fixtureLobby } from "../fixtures/data";
-import { encounterGames, encounterKda, encounterLabel } from "./encounters";
+import { encounterGames, encounterKda, encounterLabel } from "./records";
 
 describe("共同对局", () => {
   const record = fixtureEncounters.find((item) => item.puuid === fixtureLobby.ally[2].puuid)!;

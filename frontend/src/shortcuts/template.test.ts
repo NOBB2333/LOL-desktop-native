@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { renderShortcutTemplateExample } from "./shortcutTemplate";
+import { renderShortcutTemplateExample } from "./template";
 
 describe("shortcut template examples", () => {
   it("shows the complete output shape for enemy assessment fields", () => {

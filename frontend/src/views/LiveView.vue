@@ -21,9 +21,9 @@ import { POOL_CONCENTRATION_LABEL, POOL_CONCENTRATION_THRESHOLD } from "../tags/
 import { deriveTagFacts } from "../tags/facts";
 import { createCoalescedAsyncRunner } from "../utils/coalescedAsync";
 import { roleName } from "../utils/format";
-import { enrichedRosterCoversOverlay, mergeRosterSnapshot, playerCardKey } from "../utils/liveRoster";
-import { isActiveGamePhase, isCurrentLiveSnapshot, isVisibleGamePhase, shouldAutoHideLivePanel, shouldResetClearedLivePanel } from "../utils/livePanel";
-import { assignPremadeTones, findLocalPlayer, isLocalPartyMember } from "../utils/premadeGroups";
+import { enrichedRosterCoversOverlay, mergeRosterSnapshot, playerCardKey } from "../live/roster";
+import { isActiveGamePhase, isCurrentLiveSnapshot, isVisibleGamePhase, shouldAutoHideLivePanel, shouldResetClearedLivePanel } from "../live/panel";
+import { assignPremadeTones, findLocalPlayer, isLocalPartyMember } from "../live/premadeGroups";
 import { queueLabel } from "../utils/queue";
 
 const app = useAppStore();

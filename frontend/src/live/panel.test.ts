@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isCurrentLiveSnapshot, isVisibleGamePhase, shouldAutoHideLivePanel, shouldResetClearedLivePanel } from "./livePanel";
+import { isCurrentLiveSnapshot, isVisibleGamePhase, shouldAutoHideLivePanel, shouldResetClearedLivePanel } from "./panel";
 
 describe("live panel visibility", () => {
   it.each(["PreEndOfGame", "WaitingForStats", "EndOfGame"])("keeps %s visible as part of the game flow", (phase) => {

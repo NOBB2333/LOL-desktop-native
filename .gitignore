@@ -10,6 +10,9 @@ frontend/dist/
 # Zig build output and caches
 .zig-cache/
 zig-out/
+# 曾有一份 249KB 的 live-lobby 调试转储被误提交且无人引用（已删）。
+# 当前代码不再产出它；留着这条只是防止旧构建步骤再次把它带进版本库。
+.zig-cache-current-lobby.json
 
 # macOS metadata
 .DS_Store

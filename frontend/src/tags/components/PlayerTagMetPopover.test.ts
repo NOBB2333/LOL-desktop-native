@@ -1,7 +1,7 @@
 import { mount } from "@vue/test-utils";
 import { describe, expect, it } from "vitest";
 import { fixtureEncounters, fixtureLobby } from "../../fixtures/data";
-import { encounterGames } from "../../utils/encounters";
+import { encounterGames } from "../../encounters/records";
 import PlayerTagMetPopover from "./PlayerTagMetPopover.vue";
 
 const TARGET = fixtureLobby.ally[2];

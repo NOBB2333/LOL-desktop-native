@@ -1,7 +1,7 @@
 import { h } from "vue";
 import { chip } from "../chip";
 import PlayerTagMetPopover from "../components/PlayerTagMetPopover.vue";
-import { encounterGames, encounterRelation } from "../../utils/encounters";
+import { encounterGames, encounterRelation } from "../../encounters/records";
 import type { EncounterRecord } from "../../types/domain";
 import type { PlayerTagDefinition } from "../types";
 

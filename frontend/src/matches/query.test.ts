@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { matchHistoryQueryKey } from "./matchHistoryQuery";
+import { matchHistoryQueryKey } from "./query";
 
 const currentScope = {
   mode: "live" as const,

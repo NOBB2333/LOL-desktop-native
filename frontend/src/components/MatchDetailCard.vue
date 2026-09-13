@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import { ChevronDown, ChevronUp, Coins, Crosshair, HeartPulse, Shield, Swords, TowerControl, Trophy } from "@lucide/vue";
 import type { MatchSummary, RecentMatch } from "../types/domain";
 import AssetIcon from "./AssetIcon.vue";
@@ -9,7 +10,11 @@ const props = withDefaults(defineProps<{
   expanded?: boolean;
   compact?: boolean;
   clickable?: boolean;
-}>(), { expanded: false, compact: false, clickable: false });
+  /** 展开后正在按 gameId 拉完整十人数据。 */
+  detailLoading?: boolean;
+  /** 完整十人数据读取失败的原因；空串表示没有失败。 */
+  detailError?: string;
+}>(), { expanded: false, compact: false, clickable: false, detailLoading: false, detailError: "" });
 
 const emit = defineEmits<{ toggle: [] }>();
 const isSummary = (match: MatchSummary | RecentMatch): match is MatchSummary => "participants" in match;
@@ -38,6 +43,8 @@ const fallbackChampion = (match: MatchSummary | RecentMatch) => championImage(ma
 const itemSlots = Array.from({ length: 8 }, (_, index) => index);
 const itemAt = (match: MatchSummary | RecentMatch, index: number) => match.items[index] ?? null;
 const participantItems = (participant: MatchSummary["participants"][number]) => participant.items ?? [];
+/** 仍然是列表级数据（只有查询者本人），十人详情还没到位。 */
+const incompleteParticipants = computed(() => (props.match as MatchSummary).participants.length < 2);
 const participantSpells = (participant: MatchSummary["participants"][number]) => participant.summonerSpells ?? [];
 const participantRunes = (participant: MatchSummary["participants"][number]) => participant.runes ?? [];
 const participantGroups = (match: MatchSummary) => [
@@ -59,7 +66,12 @@ const banGroups = (match: MatchSummary) => {
 };
 function toggleFromRow(event: MouseEvent) {
   if (!props.clickable || !isSummary(props.match)) return;
-  if ((event.target as HTMLElement).closest("button, a, input, select, textarea")) return;
+  const target = event.target as HTMLElement | null;
+  if (!target?.closest) return;
+  // 详情区是行的子节点：在里面选文字、点图标都算「看详情」，不该把刚展开的行收回去。
+  // 收起请点右上角的箭头（那个按钮自带 @click.stop）。
+  if (target.closest(".match-row__detail")) return;
+  if (target.closest("button, a, input, select, textarea")) return;
   emit("toggle");
 }
 </script>
@@ -171,6 +183,9 @@ function toggleFromRow(event: MouseEvent) {
         <div><span class="eyebrow">MATCH DETAIL</span><h3>十人阵容与 BP</h3></div>
         <span>队伍击杀 {{ match.teamKills }}</span>
       </header>
+      <!-- 列表接口每局只带查询者本人，十人数据要按 gameId 单独拉；这期间先说明情况。 -->
+      <p v-if="incompleteParticipants && detailLoading" class="match-row__detail-status">正在读取这局的十人数据…</p>
+      <p v-else-if="incompleteParticipants && detailError" class="match-row__detail-status" data-tone="warning">{{ detailError }}</p>
       <div class="match-row__bans">
         <section v-for="group in banGroups(match)" :key="group.key" :data-side="group.key"><span>{{ group.label }}</span><div><template v-for="ban in group.rows" :key="`${group.key}-${ban.id}-${ban.name}`"><span class="ban-chip" :title="ban.bannedBy ? `禁用者：${ban.bannedBy}` : ban.pickTurn ? `第 ${ban.pickTurn} 手禁用` : 'LCU 未提供具体禁用者'"><AssetIcon v-if="ban.id" kind="champion" :id="ban.id" :name="ban.name" :fallback-url="ban.iconUrl" size="sm" /><b>{{ ban.name }}</b><small v-if="ban.bannedBy">{{ ban.bannedBy }}</small><small v-else-if="ban.pickTurn">第{{ ban.pickTurn }}手</small></span></template><b v-if="!group.rows.length">暂无记录</b></div></section>
       </div>
@@ -566,6 +581,9 @@ function toggleFromRow(event: MouseEvent) {
   color: var(--text-secondary);
   font-size: 9px;
 }
+
+.match-row__detail-status { margin: 9px 0 0; padding: 7px 9px; border: 1px dashed var(--line-strong); color: var(--text-secondary); font-size: 9px; }
+.match-row__detail-status[data-tone="warning"] { color: var(--amber); }
 
 .match-row__bans section { display: grid; grid-template-columns: 68px minmax(0, 1fr); align-items: center; gap: 5px; min-width: 0; padding: 5px 7px; border-top: 2px solid var(--blue); background: var(--surface); }
 .match-row__bans section[data-side="enemy"] { border-top-color: var(--red); }

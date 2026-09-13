@@ -8,7 +8,7 @@ import AssetIcon from "../components/AssetIcon.vue";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { ShortcutTarget } from "../types/domain";
-import { renderShortcutTemplateExample, shortcutTemplateFields } from "../utils/shortcutTemplate";
+import { renderShortcutTemplateExample, shortcutTemplateFields } from "../shortcuts/template";
 
 const app = useAppStore();
 const message = useMessage();

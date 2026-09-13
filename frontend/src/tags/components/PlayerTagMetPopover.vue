@@ -2,7 +2,7 @@
 import { computed } from "vue";
 import AssetIcon from "../../components/AssetIcon.vue";
 import type { EncounterRecord } from "../../types/domain";
-import { encounterKda, type EncounterGame } from "../../utils/encounters";
+import { encounterKda, type EncounterGame } from "../../encounters/records";
 import { championImage, dateTime, fromNow, roleName } from "../../utils/format";
 
 const props = withDefaults(

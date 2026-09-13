@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createShortcutSendQueue } from "./shortcutSendQueue";
+import { createShortcutSendQueue } from "./sendQueue";
 
 describe("消息发送队列", () => {
   it("重复快捷键共用同次发送，其他消息在完成后继续", async () => {

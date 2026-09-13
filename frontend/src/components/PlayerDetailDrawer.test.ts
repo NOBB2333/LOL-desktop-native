@@ -5,14 +5,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fixtureEncounters, fixtureLobby, fixtureMatches } from "../fixtures/data";
 import PlayerDetailDrawer from "./PlayerDetailDrawer.vue";
 
-const { encounters, matches, push } = vi.hoisted(() => ({ encounters: vi.fn(), matches: vi.fn(), push: vi.fn() }));
+const { encounters, matches, matchDetail, push } = vi.hoisted(() => ({ encounters: vi.fn(), matches: vi.fn(), matchDetail: vi.fn(), push: vi.fn() }));
 
 vi.mock("vue-router", () => ({
   useRouter: () => ({ push }),
 }));
 
 vi.mock("../services/backend", () => ({
-  backend: { encounters, matches },
+  backend: { encounters, matches, matchDetail },
   isTauri: () => false,
 }));
 
@@ -42,8 +42,14 @@ describe("PlayerDetailDrawer", () => {
     push.mockReset();
     encounters.mockReset();
     matches.mockReset();
+    matchDetail.mockReset();
     encounters.mockResolvedValue(structuredClone(fixtureEncounters));
     matches.mockResolvedValue(structuredClone(fixtureMatches));
+    matchDetail.mockImplementation(async (gameId: number) => {
+      const found = fixtureMatches.find((item) => item.gameId === gameId);
+      if (!found) throw new Error("该对局的完整详情不可用");
+      return structuredClone(found);
+    });
   });
 
   it("先前玩家的慢请求不会覆盖当前玩家相遇记录", async () => {
@@ -195,6 +201,48 @@ describe("PlayerDetailDrawer", () => {
     expect(matches).toHaveBeenCalledWith(`${player.gameName}#${player.tagLine}`, 1, 10);
     expect(wrapper.get("[data-testid='selected-detailed-match']").attributes("data-game-id")).toBe(String(selected.gameId));
     expect(wrapper.get("[data-testid='selected-detailed-match']").attributes("data-expanded")).toBe("true");
+  });
+
+  it("fetches the full ten-player detail for the expanded match", async () => {
+    const player = fixtureLobby.ally[2];
+    const local = fixtureLobby.ally[0];
+    // 列表接口只给查询者本人一条 participants；完整十人数据要按 gameId 再拉一次。
+    const listed = { ...structuredClone(fixtureMatches[0]), participants: [structuredClone(fixtureMatches[0].participants[0])] };
+    const full = { ...structuredClone(fixtureMatches[0]), championName: "十人详情" };
+    matches.mockResolvedValueOnce([listed]);
+    matchDetail.mockResolvedValueOnce(full);
+    const wrapper = mount(PlayerDetailDrawer, {
+      props: { show: true, player, localPlayer: local },
+      global: {
+        plugins: testPlugins(),
+        stubs: {
+          Drawer: DrawerStub,
+          DrawerContent: DrawerContentStub,
+          Button: { template: "<button><slot name='icon' /><slot /></button>" },
+          AssetIcon: true,
+          EncounterMatchModal: true,
+          MatchDetailCard: {
+            props: ["match", "expanded", "clickable", "detailLoading", "detailError"],
+            emits: ["toggle"],
+            template: "<button data-testid='detail-row' :data-champion='match.championName' :data-participants='match.participants ? match.participants.length : 0' :data-expanded='String(expanded)' @click='$emit(\"toggle\")' />",
+          },
+        },
+      },
+    });
+    await flushPromises();
+    expect(wrapper.get("[data-testid='detail-row']").attributes("data-participants")).toBe("1");
+    expect(matchDetail).not.toHaveBeenCalled();
+
+    await wrapper.get("[data-testid='detail-row']").trigger("click");
+    await flushPromises();
+
+    // selfPuuid 是账号归属（当前登录的我），targetPuuid / subjectPuuid 都是被查看的玩家：
+    // 那一局里通常没有我，所以行内视角必须是「他」。
+    expect(matchDetail).toHaveBeenCalledWith(listed.gameId, "HN1", local.puuid, player.puuid, player.puuid);
+    const row = wrapper.get("[data-testid='detail-row']");
+    expect(row.attributes("data-expanded")).toBe("true");
+    expect(row.attributes("data-champion")).toBe("十人详情");
+    expect(row.attributes("data-participants")).toBe("10");
   });
 
   it("does not load or show encounter history for a member of the local party", async () => {

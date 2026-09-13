@@ -437,7 +437,7 @@ export const fixtureBootstrap: AppBootstrap = {
   dataMode: "fixture",
   dashboard: {
     connection: {
-      status: "disconnected", phase: "Fixture", summonerName: "测试召唤师", gameName: "测试召唤师", tagLine: "HN1",
+      status: "disconnected", phase: "Fixture", summonerName: "测试召唤师", gameName: "测试召唤师", tagLine: "HN1", puuid: "fixture-ally-0",
       summonerLevel: 416, profileIconId: 3494, platformId: "HN1", region: "峡谷之巅 / HN1", presence: "online",
       soloRank: { queueType: "RANKED_SOLO_5x5", tier: "SILVER", division: "IV", leaguePoints: 26, wins: 10, losses: 16 },
       flexRank: { queueType: "RANKED_FLEX_SR", tier: "GOLD", division: "II", leaguePoints: 43, wins: 193, losses: 169 },

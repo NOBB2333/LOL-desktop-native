@@ -1,3 +1,13 @@
+/**
+ * 快捷消息模板的占位符字段表 —— **全应用唯一一份**。
+ *
+ * 三个消费方都从这里取字段名，不能各写一份：
+ * - `AutomationView.vue` 的占位符面板（用 `shortcutTemplateFields` 的 label/description/example）
+ * - 浏览器预览的模板渲染与校验（`services/browserBackend.ts`，用 `shortcutTemplateKeys` 判未知占位符）
+ * - 后端 `validate_shortcut_template` 的权威校验（Zig 侧 `shortcuts.zig`）
+ *
+ * 曾经这里和 `services/backend.ts` 各有一份 key 列表，加字段时容易漏改一边。
+ */
 export interface ShortcutTemplateField {
   key: string;
   label: string;
@@ -30,8 +40,12 @@ export const shortcutTemplateFields: ShortcutTemplateField[] = [
   { key: "encounter", label: "遇到记录", description: "发送当前对局中遇到过的玩家，并对照双方 Riot ID、英雄、KDA 和胜负；由本地一年记录生成", example: "遇到过：09月06日 21:35，我（松间照#0721）使用 九尾妖狐 8/2/7 胜；对方（狐狸收藏家#MID）使用 盲僧 3/5/6 负" },
 ];
 
+/** 合法占位符 key 的集合，供渲染/校验直接判未知字段。 */
+export const shortcutTemplateKeys: ReadonlySet<string> = new Set(shortcutTemplateFields.map((field) => field.key));
+
 const examples = new Map(shortcutTemplateFields.map((field) => [field.key, field.example]));
 
+/** 把模板里的占位符替换成字段表里的示例值，用于设置页的静态预览。 */
 export function renderShortcutTemplateExample(template: string) {
   const rendered = template.replace(/\{([^{}]+)\}/g, (placeholder, key: string) => examples.get(key) ?? placeholder);
   return rendered.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);

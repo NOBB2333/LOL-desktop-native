@@ -14,9 +14,10 @@ import PlayerTagMetPopover from "../tags/components/PlayerTagMetPopover.vue";
 import { championImage, percent, rankName, roleName } from "../utils/format";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
-import { matchHistoryQueryKey } from "../utils/matchHistoryQuery";
+import { matchHistoryQueryKey } from "../matches/query";
 import { useEncounters } from "../composables/useEncounters";
-import { encounterGames as groupEncounters } from "../utils/encounters";
+import { useMatchDetail } from "../composables/useMatchDetail";
+import { encounterGames as groupEncounters } from "../encounters/records";
 
 const props = defineProps<{
   show: boolean;
@@ -86,6 +87,22 @@ const matchesError = computed(() => {
   if (props.player && !props.player.tagLine.trim()) return "选人阶段尚未公开完整 Riot ID，暂时只能显示当前摘要";
   return detailedMatchQuery.isError.value ? "完整十人数据读取失败，已保留当前摘要" : "";
 });
+/**
+ * 展开的那一局单独去拿完整十人数据。
+ *
+ * LCU 的战绩**列表**接口 `/lol-match-history/v1/products/lol/{puuid}/matches`
+ * 每局只带查询者本人的一条 `participants`（实测本机缓存 32/32 局都是 1 条），
+ * 所以列表里的 MatchSummary 直接拿来渲染「十人阵容」只会显示一个人。
+ */
+const expandedMatchDetail = useMatchDetail({
+  gameId: expandedMatchId,
+  subjectPuuid: computed(() => props.player?.puuid ?? ""),
+  // 账号归属（后端 AccountChanged 校验）用连接信息里的 puuid；旧快照可能没有，
+  // 再退回本局识别出来的本人。
+  selfPuuid: computed(() => app.connection.puuid ?? props.localPlayer?.puuid ?? props.player?.puuid ?? ""),
+  enabled: computed(() => props.show),
+});
+const { matchForRow, loading: expandedDetailLoading, error: expandedDetailError } = expandedMatchDetail;
 const drawerMatches = computed<Array<MatchSummary | RecentMatch>>(() => detailedMatches.value.length ? detailedMatches.value : props.player?.recentMatches ?? []);
 function openEncounterGame(records: EncounterRecord[]) {
   selectedEncounterRecords.value = records;
@@ -139,7 +156,7 @@ function sideFor(player: PlayerProfile) {
       <section class="player-drawer__section"><header><div><span class="eyebrow">评分依据</span><h3>评分构成</h3></div></header><div class="player-drawer__breakdown"><div v-for="item in player.score.components" :key="item.key"><div><span>{{ item.label }}</span><b>{{ item.score.toFixed(1) }} / {{ item.maxScore }}</b></div><i :class="meterClass(item.maxScore ? item.score / item.maxScore : 0)" /><small>{{ item.evidence }}</small></div></div></section>
       <section class="player-drawer__section"><header><div><span class="eyebrow">英雄池</span><h3>主要英雄</h3></div><span>{{ Math.round(player.championPoolConcentration * 100) }}% 集中度</span></header><div class="player-drawer__champion-list"><div v-for="champion in player.topChampions" :key="champion.championId"><AssetIcon kind="champion" :id="champion.championId" :name="champion.championName" size="md" /><strong>{{ champion.championName }}</strong><span>{{ champion.wins }} 胜</span><b>{{ champion.games }} 把</b></div></div></section>
       <section v-if="lobbyPlayers.length" class="player-drawer__section"><header><div><span class="eyebrow">当前阵容</span><h3>本局玩家</h3></div><span>{{ lobbyPlayers.length }} 人 · 当前玩家高亮</span></header><div class="player-drawer__lobby"><section v-for="team in lobbyTeams" :key="team.id" class="player-drawer__lobby-team" :data-side="team.side"><header><strong>{{ team.label }}</strong><span>{{ team.players.length }} 人</span></header><div class="player-drawer__lobby-list"><button v-for="item in team.players" :key="item.puuid" type="button" class="player-drawer__lobby-player" :class="{ 'player-drawer__lobby-player--self': item.puuid === player.puuid }" :data-side="sideFor(item)" @click="openHistory(item)"><AssetIcon kind="champion" :id="item.championId" :name="item.championName" :fallback-url="championImage(item.championId)" size="sm" /><span><strong>{{ item.gameName }}<em v-if="item.puuid === player.puuid">本人</em></strong><small>{{ item.championName }} · {{ roleName(item.assignedPosition) }}</small></span><b>{{ item.recentMatches.length ? percent(item.recentMatches.filter((match) => match.win).length / item.recentMatches.length) : "--" }}</b></button></div></section></div></section>
-      <section ref="matchesSection" class="player-drawer__section"><header><div><span class="eyebrow">近期战绩</span><h3>完整近期战绩</h3></div><span>{{ drawerMatches.length }} 场</span></header><div v-if="matchesLoading" class="player-drawer__match-status">正在读取装备、伤害、视野、十人阵容与 BP…</div><div v-else-if="matchesError" class="player-drawer__match-status" data-tone="warning">{{ matchesError }}</div><div class="player-drawer__matches"><MatchDetailCard v-for="match in drawerMatches" :key="match.gameId" :match="match" :expanded="expandedMatchId === match.gameId" compact clickable @toggle="toggleMatch(match.gameId)" /><div v-if="!drawerMatches.length && !matchesLoading" class="player-drawer__match-status">暂无可读取的近期对局</div></div></section>
+      <section ref="matchesSection" class="player-drawer__section"><header><div><span class="eyebrow">近期战绩</span><h3>完整近期战绩</h3></div><span>{{ drawerMatches.length }} 场</span></header><div v-if="matchesLoading" class="player-drawer__match-status">正在读取装备、伤害、视野、十人阵容与 BP…</div><div v-else-if="matchesError" class="player-drawer__match-status" data-tone="warning">{{ matchesError }}</div><div class="player-drawer__matches"><MatchDetailCard v-for="match in drawerMatches" :key="match.gameId" :match="matchForRow(match)" :expanded="expandedMatchId === match.gameId" compact clickable :detail-loading="expandedMatchId === match.gameId && expandedDetailLoading" :detail-error="expandedMatchId === match.gameId ? expandedDetailError : ''" @toggle="toggleMatch(match.gameId)" /><div v-if="!drawerMatches.length && !matchesLoading" class="player-drawer__match-status">暂无可读取的近期对局</div></div></section>
     </NDrawerContent>
   </NDrawer>
   <EncounterMatchModal v-if="player" v-model:show="encounterModalOpen" :records="selectedEncounterRecords" :target-puuid="player.puuid" />

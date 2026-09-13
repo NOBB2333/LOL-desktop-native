@@ -1,8 +1,8 @@
 import { expect, it } from "vitest";
 import { createFixtureLobby, fixtureConfig, fixtureMatches } from "../fixtures/data";
-import { migrateAppConfig } from "./config";
-import { isRankedMatch, visibleMatches } from "./matchFilters";
-import { matchHistoryQueryKey } from "./matchHistoryQuery";
+import { migrateAppConfig } from "../utils/config";
+import { isRankedMatch, visibleMatches } from "./filters";
+import { matchHistoryQueryKey } from "./query";
 
 it("排位开关按队列编号筛选并在关闭后恢复全部记录", () => {
   const records = [420, 450, 440, 400, 1700].map((queueId) => ({ ...fixtureMatches[0], queueId }));

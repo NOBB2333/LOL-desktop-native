@@ -2,7 +2,7 @@
   "name": "lol-desktop-native-root",
   "private": true,
   "version": "2.0.0",
-  "description": "Host dependency for the Zig build. build.zig resolves @native-sdk/cli from node_modules/ and runs `npm install --prefix frontend`, which requires a package.json in the repository root.",
+  "description": "Host dependency for the Zig build. build.zig resolves @native-sdk/cli from node_modules/ and runs `pnpm --dir frontend install`, which requires a package.json in the repository root.",
   "engines": {
     "node": ">=24"
   },
