@@ -210,11 +210,24 @@ pub fn build(b: *std.Build) void {
     linkPlatform(b, target, app_mod, exe, selected_platform, web_engine, web_layer, native_sdk_path, cef_dir, cef_auto_install);
     b.installArtifact(exe);
 
-    const frontend_install = b.addSystemCommand(&.{ "npm", "install", "--prefix", "frontend" });
+    // 前端用 pnpm：仓库提交的锁文件是 `frontend/pnpm-lock.yaml`。
+    //
+    // 这里**不能**用 npm —— 实测 `npm install --prefix frontend`（以及 `cd frontend
+    // && npm install`）都会把仓库根的 package.json 以 `"lol-desktop-native-root":
+    // "file:.."` 的形式写进 `frontend/package.json`，每次安装都会重新出现。
+    // 根 package.json 是为了给 build.zig 提供 `@native-sdk/cli`，与前端无关。
+    //
+    // 找不到 pnpm 时退回 npm，构建仍可进行，只是会重新出现上面那条注入依赖。
+    const frontend_tool: struct { bin: []const u8, dir_flag: []const u8 } = if (b.findProgram(&.{"pnpm"}, &.{}) catch null) |pnpm|
+        .{ .bin = pnpm, .dir_flag = "--dir" }
+    else
+        .{ .bin = "npm", .dir_flag = "--prefix" };
+
+    const frontend_install = b.addSystemCommand(&.{ frontend_tool.bin, frontend_tool.dir_flag, "frontend", "install" });
     const frontend_install_step = b.step("frontend-install", "Install frontend dependencies");
     frontend_install_step.dependOn(&frontend_install.step);
 
-    const frontend_build = b.addSystemCommand(&.{ "npm", "--prefix", "frontend", "run", "build" });
+    const frontend_build = b.addSystemCommand(&.{ frontend_tool.bin, frontend_tool.dir_flag, "frontend", "run", "build" });
     frontend_build.step.dependOn(&frontend_install.step);
     const frontend_step = b.step("frontend-build", "Build the frontend");
     frontend_step.dependOn(&frontend_build.step);

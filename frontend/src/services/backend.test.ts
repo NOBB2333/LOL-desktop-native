@@ -73,3 +73,27 @@ describe("browser shortcut preview", () => {
     expect(records.some((record) => record.puuid === fixtureLobby.ally[2].puuid)).toBe(true);
   });
 });
+
+describe("player tags in browser preview", () => {
+  it("round-trips notes per player and clears them", async () => {
+    const target = fixtureLobby.ally[2].puuid;
+    const other = fixtureLobby.enemy[0].puuid;
+
+    await backend.updatePlayerTag(target, []);
+    expect(await backend.playerTags([target, other])).toEqual({ [target]: [], [other]: [] });
+
+    const saved = await backend.updatePlayerTag(target, [" 爱打野 ", "", "挂机过"]);
+    expect(saved.notes).toEqual(["爱打野", "挂机过"]);
+    expect(await backend.playerTags([target, other])).toEqual({
+      [target]: ["爱打野", "挂机过"],
+      [other]: [],
+    });
+
+    await backend.updatePlayerTag(target, []);
+    expect(await backend.playerTags([target])).toEqual({ [target]: [] });
+  });
+
+  it("rejects a missing player id", async () => {
+    await expect(backend.updatePlayerTag("   ", ["备注"])).rejects.toThrow("缺少玩家标识");
+  });
+});

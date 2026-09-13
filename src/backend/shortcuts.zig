@@ -1,4 +1,5 @@
 const std = @import("std");
+const player_signals = @import("player_signals.zig");
 
 pub fn chatMessageBody(lines: std.json.Value, allocator: std.mem.Allocator) ![]const u8 {
     if (lines != .array) return error.InvalidMessage;
@@ -41,8 +42,18 @@ const template_fields = [_][]const u8{
 const validation_player =
     "{\"gameName\":\"示例玩家\",\"championId\":103,\"championName\":\"九尾妖狐\",\"assignedPosition\":\"MIDDLE\"," ++
     "\"rankTier\":\"EMERALD\",\"rankDivision\":\"II\",\"leaguePoints\":63,\"score\":{\"total\":82}," ++
-    "\"recentMatches\":[{\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"durationMinutes\":28,\"win\":true}]," ++
-    "\"topChampions\":[{\"championName\":\"九尾妖狐\",\"winRate\":0.61}],\"tags\":[{\"key\":\"hot\",\"label\":\"状态火热\"}]," ++
+    // 5 场全胜、同一英雄。据此（阈值见 `player_signals.zig`）：
+    //   5 连胜 → 正向；场均阵亡 2 → 生存稳健；参团 70% → 参团积极；
+    //   伤害 30% → 伤害 30%；分均补刀 8.0；同英雄 100% → 英雄池集中（负向）。
+    // 因此 {tag} 与 {streak} 都是「5 连胜」，{risk} 是「英雄池集中」。
+    "\"recentMatches\":[" ++
+    "{\"championId\":103,\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"durationMinutes\":28,\"cs\":224,\"killParticipation\":0.7,\"damageShare\":0.3,\"win\":true}," ++
+    "{\"championId\":103,\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"durationMinutes\":28,\"cs\":224,\"killParticipation\":0.7,\"damageShare\":0.3,\"win\":true}," ++
+    "{\"championId\":103,\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"durationMinutes\":28,\"cs\":224,\"killParticipation\":0.7,\"damageShare\":0.3,\"win\":true}," ++
+    "{\"championId\":103,\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"durationMinutes\":28,\"cs\":224,\"killParticipation\":0.7,\"damageShare\":0.3,\"win\":true}," ++
+    "{\"championId\":103,\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"durationMinutes\":28,\"cs\":224,\"killParticipation\":0.7,\"damageShare\":0.3,\"win\":true}" ++
+    "]," ++
+    "\"topChampions\":[{\"championName\":\"九尾妖狐\",\"winRate\":0.61}]," ++
     "\"currentChampionGames\":6,\"currentChampionWinRate\":0.67,\"premadeWith\":[]," ++
     "\"junglePreference\":{\"sampleSize\":8,\"currentChampionGames\":6,\"evidence\":\"前期偏中下\",\"averageKda\":4.2,\"averageObjectiveTakedowns\":2.1,\"averageEnemyJungleMonsters\":3.4}}";
 
@@ -457,7 +468,11 @@ fn writeLine(writer: *std.Io.Writer, emitted: *bool, line: []const u8) !void {
 
 fn writeTemplateValue(writer: *std.Io.Writer, key: []const u8, player: std.json.Value, team: []const u8, phase: []const u8, recent_game_count: usize) !void {
     if (std.mem.eql(u8, key, "name")) return writer.writeAll(fallback(jsonStringField(player, "gameName"), "未知玩家"));
-    if (std.mem.eql(u8, key, "tag")) return writer.writeAll(firstTagLabel(player));
+    if (std.mem.eql(u8, key, "tag")) {
+        // 首要标签：按卡片标签注册表顺序取第一条命中信号。
+        _ = try player_signals.writeFirst(writer, player, "、", 1);
+        return;
+    }
     if (std.mem.eql(u8, key, "position")) return writer.writeAll(shortcutPositionLabel(player, phase));
     if (std.mem.eql(u8, key, "rank")) {
         try writer.writeAll(rankLabel(jsonStringField(player, "rankTier")));
@@ -478,7 +493,7 @@ fn writeTemplateValue(writer: *std.Io.Writer, key: []const u8, player: std.json.
     if (std.mem.eql(u8, key, "recent_losses")) return writer.print("{d}", .{recent.losses});
     if (std.mem.eql(u8, key, "recent_win_rate")) return writer.print("{d:.0}%", .{@as(f64, @floatFromInt(recent.wins)) / @as(f64, @floatFromInt(@max(@as(usize, 1), recent.wins + recent.losses))) * 100.0});
     if (std.mem.eql(u8, key, "recent_games")) return writeRecentGames(writer, player, recent_game_count);
-    if (std.mem.eql(u8, key, "streak")) return writer.writeAll(streakLabel(player));
+    if (std.mem.eql(u8, key, "streak")) return player_signals.writeStreak(writer, player);
     if (std.mem.eql(u8, key, "kda")) return writer.print("{d:.2}", .{recent.average_kda});
     if (std.mem.eql(u8, key, "current_champion")) {
         const name = jsonStringField(player, "championName");
@@ -493,7 +508,11 @@ fn writeTemplateValue(writer: *std.Io.Writer, key: []const u8, player: std.json.
         };
         return writeStringArray(writer, arrayField(player, "premadeWith"), "、", "无");
     }
-    if (std.mem.eql(u8, key, "risk")) return writeTagLabels(writer, player);
+    if (std.mem.eql(u8, key, "risk")) {
+        // 风险标签：只取负向信号（「阵亡偏多」「参团偏低」「N 连败」「英雄池集中」等）。
+        _ = try player_signals.writeBucket(writer, player, .risks, "、", player_signals.max_signals);
+        return;
+    }
     if (std.mem.eql(u8, key, "jungle_preference")) return writeJunglePreference(writer, player);
     if (std.mem.eql(u8, key, "team")) return writer.writeAll(team);
     if (std.mem.eql(u8, key, "horse")) return writer.writeAll(horseLabel(player, recent));
@@ -704,38 +723,6 @@ fn writeTopChampions(writer: *std.Io.Writer, player: std.json.Value) !void {
         try writer.writeAll(fallback(jsonStringField(champion, "championName"), "未知英雄"));
         try writer.print(" {d:.0}%", .{jsonFloatField(champion, "winRate", 0) * 100.0});
     }
-}
-
-fn writeTagLabels(writer: *std.Io.Writer, player: std.json.Value) !void {
-    const tags = arrayField(player, "tags") orelse return;
-    var emitted = false;
-    for (tags.array.items) |tag| {
-        const label = jsonStringField(tag, "label");
-        if (label.len == 0) continue;
-        if (emitted) try writer.writeAll("、");
-        emitted = true;
-        try writer.writeAll(label);
-    }
-}
-
-fn firstTagLabel(player: std.json.Value) []const u8 {
-    const tags = arrayField(player, "tags") orelse return "";
-    if (tags.array.items.len == 0) return "";
-    return jsonStringField(tags.array.items[0], "label");
-}
-
-fn streakLabel(player: std.json.Value) []const u8 {
-    const tags = arrayField(player, "tags") orelse return "状态稳定";
-    var first: []const u8 = "";
-    for (tags.array.items) |tag| {
-        const label = jsonStringField(tag, "label");
-        if (first.len == 0 and label.len > 0) first = label;
-        const key = jsonStringField(tag, "key");
-        for ([_][]const u8{ "hot", "slump", "win-streak", "loss-streak" }) |preferred| {
-            if (std.mem.eql(u8, key, preferred)) return fallback(label, "状态稳定");
-        }
-    }
-    return fallback(first, "状态稳定");
 }
 
 fn shortcutPositionLabel(player: std.json.Value, phase: []const u8) []const u8 {
@@ -1116,9 +1103,32 @@ test "renders all shortcut fields from enriched lobby players" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, result, "我方 示例玩家 状态火热 中路 翡翠 II 63 82") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "我方 示例玩家 5 连胜 中路 翡翠 II 63 82") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "近1场：胜 九尾妖狐 8/2/7") != null);
+    // {tag} / {streak} 取自同一套信号；{risk} 只取负向信号。
+    try std.testing.expect(std.mem.indexOf(u8, result, "英雄池集中") != null);
+    // 模板只渲染第一条正向信号（{tag}）与负向信号（{risk}）；像「生存稳健」「参团积极」
+    // 这类排在后面的正向信号不参与渲染，不该出现在文本里。
+    try std.testing.expect(std.mem.indexOf(u8, result, "生存稳健") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "参团积极") == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, result, '{') == null);
+}
+
+test "risk 变量只输出负向信号，tag 取第一条命中" {
+    var output: [512]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const player = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), validation_player, .{});
+    try std.testing.expectEqualStrings("英雄池集中", try renderTemplate("{risk}", player, "我方", "ChampSelect", 5, &output));
+    try std.testing.expectEqualStrings("5 连胜", try renderTemplate("{tag}", player, "我方", "ChampSelect", 5, &output));
+    try std.testing.expectEqualStrings("5 连胜", try renderTemplate("{streak}", player, "我方", "ChampSelect", 5, &output));
+
+    // 一位数据不足的玩家：不出任何信号，risk / tag 为空，streak 回退到「状态稳定」。
+    const sparse_buf = try std.fmt.allocPrint(arena.allocator(), "{{\"gameName\":\"新手\",\"recentMatches\":[{{\"durationMinutes\":20,\"win\":true,\"deaths\":5}}]}}", .{});
+    const sparse = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), sparse_buf, .{});
+    try std.testing.expectEqualStrings("", try renderTemplate("{risk}", sparse, "我方", "ChampSelect", 5, &output));
+    try std.testing.expectEqualStrings("", try renderTemplate("{tag}", sparse, "我方", "ChampSelect", 5, &output));
+    try std.testing.expectEqualStrings("状态稳定", try renderTemplate("{streak}", sparse, "我方", "ChampSelect", 5, &output));
 }
 
 test "horse template field classifies recent performance with a neutral small sample" {

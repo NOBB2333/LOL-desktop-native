@@ -1,4 +1,5 @@
 import { invokeNative, isNative } from "./native";
+import { shortcutPrimaryTag, shortcutRiskLabels, shortcutStreakLabel } from "../tags/signals";
 import type {
   AppBootstrap,
   AppConfig,
@@ -31,6 +32,8 @@ import { createShortcutSendQueue } from "../utils/shortcutSendQueue";
 let browserMode: DataMode = "fixture";
 let browserConfig = structuredClone(fixtureConfig);
 let browserFriends = structuredClone(fixtureFriends);
+/** 浏览器预览（无原生后端）下的玩家标记，写在内存里方便演示。 */
+let browserPlayerTags: Record<string, string[]> = {};
 const assetRequests = new Map<string, Promise<AssetPayload>>();
 const storedBrowserConfig = typeof localStorage === "undefined" ? null : localStorage.getItem("lol-desktop-config");
 if (storedBrowserConfig) {
@@ -182,6 +185,37 @@ export const backend = {
     }
     return command("get_encounters", { puuid: target || null, limitGames: boundedLimit, excludeGameId });
   },
+  /** 批量读取本局玩家的备注（玩家标记），键为 puuid。 */
+  async playerTags(puuids: string[], selfPuuid?: string | null): Promise<Record<string, string[]>> {
+    const targets = [...new Set(puuids.map((puuid) => puuid?.trim() ?? "").filter(Boolean))];
+    if (!targets.length) return {};
+    if (usesFixtureData()) {
+      const result: Record<string, string[]> = {};
+      for (const puuid of targets) result[puuid] = [...(browserPlayerTags[puuid] ?? [])];
+      return result;
+    }
+    const response = await command<{ tags?: Record<string, string[]> }>("get_player_tags", {
+      puuids: targets,
+      selfPuuid: selfPuuid?.trim() || null,
+    });
+    return response.tags ?? {};
+  },
+  /** 覆盖写入某位玩家的备注，返回清洗后的结果。 */
+  async updatePlayerTag(puuid: string, notes: string[], selfPuuid?: string | null): Promise<{ puuid: string; notes: string[]; updatedAt: number }> {
+    const target = puuid?.trim() ?? "";
+    if (!target) throw new Error("缺少玩家标识，无法保存标记");
+    const cleaned = notes.map((note) => note.trim()).filter(Boolean);
+    if (usesFixtureData()) {
+      if (cleaned.length) browserPlayerTags[target] = cleaned;
+      else delete browserPlayerTags[target];
+      return { puuid: target, notes: [...cleaned], updatedAt: Date.now() };
+    }
+    return command("update_player_tag", {
+      puuid: target,
+      notes: cleaned,
+      selfPuuid: selfPuuid?.trim() || null,
+    });
+  },
   async friends(): Promise<FriendToolsSnapshot> {
     if (usesFixtureData()) return structuredClone(browserFriends);
     return command("get_friends");
@@ -309,14 +343,14 @@ function renderBrowserTemplate(template: string, player: typeof fixtureLobby.all
   const recentGameCount = Math.min(10, Math.max(1, browserConfig.automation.shortcutRecentGameCount ?? 5));
   const recentGames = completed.slice(0, recentGameCount).map((match) => `${match.win ? "胜" : "负"} ${match.championName} ${match.kills}/${match.deaths}/${match.assists}`).join("；");
   const values: Record<string, string> = {
-    name: player.gameName, tag: player.tagLine, position: roleName(player.assignedPosition),
+    name: player.gameName, tag: shortcutPrimaryTag(player), position: roleName(player.assignedPosition),
     rank: `${player.rankTier} ${player.rankDivision}`.trim(), lp: String(player.leaguePoints), score: player.score.total.toFixed(0),
     recent_wins: String(wins), recent_losses: String(losses), recent_win_rate: `${Math.round(wins / Math.max(1, wins + losses) * 100)}%`,
     recent_games: recentGames ? `近${recentGameCount}场：${recentGames}` : "暂无近期对局",
-    streak: player.tags.find((item) => item.key === "hot" || item.key === "slump")?.label ?? "状态稳定", kda: averageKda.toFixed(2),
+    streak: shortcutStreakLabel(player), kda: averageKda.toFixed(2),
     current_champion: currentChampion, champion_games: String(player.currentChampionGames), champion_win_rate: `${Math.round(player.currentChampionWinRate * 100)}%`,
     top_champions: player.topChampions.map((item) => `${item.championName} ${Math.round(item.winRate * 100)}%`).join("、"),
-    premade: (player.premadePositions?.length ? player.premadePositions : player.premadeWith).join("、") || "无", risk: player.tags.map((item) => item.label).join("、"),
+    premade: (player.premadePositions?.length ? player.premadePositions : player.premadeWith).join("、") || "无", risk: shortcutRiskLabels(player),
     jungle_preference: formatBrowserJunglePreference(player), team,
     horse: browserHorseLabel(player.score.total, completed.length, wins, averageKda),
     encounter: "暂无本地遇到记录",

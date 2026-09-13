@@ -10,7 +10,10 @@ export default defineConfig({
   base: "./",
   build: {
     outDir: "dist",
-    emptyOutDir: true,
+    // 由 `npm run prebuild`（scripts/clean-dist.mjs）分批清空：某些环境会拦截
+    // 单次批量删除，`emptyOutDir` 在那里会直接让构建失败。目录提前清空后，
+    // Vite 也就没有必要再自己清一遍。
+    emptyOutDir: false,
     sourcemap: false,
     cssMinify: "lightningcss",
   },

@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { Check, Database, FolderOpen, MonitorCog, Palette, RefreshCw, Server, Shield } from "@lucide/vue";
+import { Check, Database, FolderOpen, MonitorCog, Palette, RefreshCw, Server, Shield, Tags } from "@lucide/vue";
 import { NButton, NInput, NSelect, NSwitch, useMessage } from "naive-ui";
 import { computed } from "vue";
 import ModeSwitch from "../components/ModeSwitch.vue";
 import PageHeader from "../components/PageHeader.vue";
 import { useAppStore } from "../stores/app";
+import { normalizePlayerTagSettings, playerTagSettingItems, type PlayerTagSettings } from "../tags/settings";
 
 const app = useAppStore();
 const message = useMessage();
@@ -15,6 +16,11 @@ async function retrySave() { try { await app.retryConfigSave(); message.success(
 // 这里拦截点击并手动滚动到对应分区，滚动容器是 .content-scroll，scrollIntoView 会一并滚动。
 function scrollToSection(id: string) {
   document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// 标签开关：整体替换对象，保证 Pinia 的深度侦听与自动保存都能感知到变化。
+function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
+  app.config.playerTags = { ...normalizePlayerTagSettings(app.config.playerTags), [key]: value };
 }
 </script>
 
@@ -38,6 +44,11 @@ function scrollToSection(id: string) {
       <a href="#settings-appearance" class="settings-nav__item" @click.prevent="scrollToSection('settings-appearance')">
         <Palette :size="15" />
         <span>外观与窗口</span>
+        <i class="settings-nav__arrow">›</i>
+      </a>
+      <a href="#settings-tags" class="settings-nav__item" @click.prevent="scrollToSection('settings-tags')">
+        <Tags :size="15" />
+        <span>玩家标签</span>
         <i class="settings-nav__arrow">›</i>
       </a>
       <a href="#settings-connection" class="settings-nav__item" @click.prevent="scrollToSection('settings-connection')">
@@ -233,6 +244,36 @@ function scrollToSection(id: string) {
         </div>
       </section>
 
+      <!-- 玩家标签 -->
+      <section id="settings-tags" class="settings-section">
+        <header class="settings-section__header">
+          <div class="settings-section__icon-wrap">
+            <Tags :size="17" />
+          </div>
+          <div>
+            <span class="eyebrow">对局页标签</span>
+            <h2>玩家标签</h2>
+            <p>对局页每张玩家卡片上的标签都由同一套规则生成（对齐 LeagueAkari）；这里可以逐个关闭不需要的信号。</p>
+          </div>
+        </header>
+
+        <div class="settings-rows settings-rows--tags">
+          <div v-for="item in playerTagSettingItems" :key="item.key" class="settings-row">
+            <div class="settings-row__label">
+              <strong>{{ item.label }}</strong>
+              <small>{{ item.description }}</small>
+            </div>
+            <div class="settings-row__control">
+              <NSwitch
+                :value="app.config.playerTags[item.key]"
+                :aria-label="item.label"
+                @update:value="(value: boolean) => setTagSetting(item.key, value)"
+              />
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- 连接方式 -->
       <section id="settings-connection" class="settings-section">
         <header class="settings-section__header">
@@ -412,6 +453,14 @@ function scrollToSection(id: string) {
 
 /* rows */
 .settings-rows { display: grid; }
+/* 标签开关条目多且文案短，两列布局能在同一屏内看全。 */
+.settings-rows--tags { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.settings-rows--tags .settings-row { border-bottom: 0; border-top: 1px solid var(--line); }
+.settings-rows--tags .settings-row:nth-child(-n + 2) { border-top: 0; }
+@media (max-width: 720px) {
+  .settings-rows--tags { grid-template-columns: 1fr; }
+  .settings-rows--tags .settings-row:nth-child(2) { border-top: 1px solid var(--line); }
+}
 .settings-row {
   display: grid;
   grid-template-columns: 1fr auto;

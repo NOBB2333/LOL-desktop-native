@@ -1,8 +1,9 @@
+import type { PlayerTagSettings } from "../tags/settings";
+
 export type DataMode = "live" | "fixture" | "replay";
 export type ConnectionStatus = "connected" | "disconnected" | "connecting" | "error";
 export type DataSource = "lcu" | "sgp" | "opgg" | "sqlite-fresh" | "sqlite-stale" | "fixture" | "unavailable";
 export type AccountPresence = "offline" | "online" | "away" | "inQueue" | "customLobby" | "readyCheck" | "champSelect" | "inGame" | "spectating" | "endOfGame" | "unknown";
-
 export interface DataStatus {
   source: DataSource;
   fetchedAt: string;
@@ -59,6 +60,10 @@ export interface RecentMatch {
   cs: number;
   damageShare: number;
   killParticipation: number;
+  /** 视野得分；后端仅在数据源提供时输出。 */
+  visionScore?: number | null;
+  /** 15 分钟前被敌方打野参与击杀的次数；仅峡谷对局且时间线富化后可用。 */
+  earlyDeathsWithEnemyJungler?: number | null;
   soloKills?: number | null;
   takedownsFirstXMinutes?: number | null;
   jungleCsBefore10Minutes?: number | null;
@@ -173,13 +178,6 @@ export interface ScoreBreakdown {
   components: ScoreComponent[];
 }
 
-export interface PlayerTag {
-  key: string;
-  label: string;
-  tone: "success" | "info" | "warning" | "danger" | string;
-  evidence: string;
-}
-
 export interface PlayerProfile {
   rosterKey?: string;
   puuid: string;
@@ -201,7 +199,6 @@ export interface PlayerProfile {
   recentMatches: RecentMatch[];
   topChampions: ChampionUsage[];
   score: ScoreBreakdown;
-  tags: PlayerTag[];
   junglePreference?: JunglePreference | null;
   encounterCount: number;
   lastEncounteredAt: string | null;
@@ -404,6 +401,7 @@ export interface AppBootstrap {
 export interface AppConfig {
   version: number;
   appearance: { theme: string; colorMode: "light" | "dark"; compact: boolean };
+  playerTags: PlayerTagSettings;
   connection: { kind: "local" | "ssh"; sshTarget: string; identityFile: string; forwardedPort: number };
   automation: {
     enabled: boolean;

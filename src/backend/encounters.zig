@@ -1,5 +1,19 @@
 const std = @import("std");
 
+/// 某位玩家在本地遭遇档案里的汇总：共遇到几次、最近一次是什么时候。
+///
+/// 原先放在 `recent_tags.zig`，那里同时还在产出「玩家标签」；标签体系迁到前端后
+/// 该模块被整体删除，这个纯遭遇数据的结构就归到 encounters 这边。
+pub const EncounterSummary = struct {
+    count: usize = 0,
+    latest: [32]u8 = undefined,
+    latest_len: usize = 0,
+
+    pub fn latestValue(self: *const EncounterSummary) []const u8 {
+        return self.latest[0..self.latest_len];
+    }
+};
+
 const EncounterKey = struct {
     game_id: i64,
     owner_hash: u64,

@@ -1,11 +1,8 @@
 <script setup lang="ts">
 import { Link2, MapPinned } from "@lucide/vue";
-import { NPopover } from "naive-ui";
-import { computed, onBeforeUnmount, ref } from "vue";
 import type { EncounterRecord, PlayerProfile, RankQueueSummary } from "../types/domain";
 import AssetIcon from "./AssetIcon.vue";
-import EncounterList from "./EncounterList.vue";
-import { encounterGames, encounterLabel as sharedEncounterLabel } from "../utils/encounters";
+import PlayerTagArea from "../tags/components/PlayerTagArea.vue";
 import { championImage, rankName, roleName, shortDate, shortDay } from "../utils/format";
 
 type RecentColumns = 1 | 2;
@@ -23,6 +20,9 @@ const props = withDefaults(
     encounterError?: boolean;
     currentGameId?: number;
     localPlayer?: PlayerProfile | null;
+    /** 本地玩家为该玩家写的备注。 */
+    playerNotes?: string[];
+    canEditNotes?: boolean;
   }>(),
   { recentLimit: 10, recentColumns: 1 },
 );
@@ -31,6 +31,7 @@ const emit = defineEmits<{
   "select-match": [player: PlayerProfile, gameId: number];
   "select-encounter": [player: PlayerProfile, records: EncounterRecord[]];
   "retry-encounters": [];
+  "edit-notes": [player: PlayerProfile];
 }>();
 
 const visibleMatches = (player: PlayerProfile) => player.recentMatches.slice(0, props.recentLimit);
@@ -122,24 +123,6 @@ const premadeClass = () => {
     : `bp-player-card--premade bp-player-card--premade-${props.premadeTone}`;
 };
 const premadeLabel = () => (props.premadeTone === undefined ? "组队" : `开黑 ${props.premadeTone + 1}`);
-const encounterLabel = (player: PlayerProfile) => {
-  if (!player.encounterCount) return "遇到过";
-  const latest = player.lastEncounteredAt ? ` · 最近 ${shortDate(player.lastEncounteredAt)}` : "";
-  return `遇到过 ${player.encounterCount} 次${latest}`;
-};
-const games = computed(() => encounterGames(props.encounterRecords ?? [], props.player.puuid, props.currentGameId));
-const metLabel = computed(() => games.value.length ? sharedEncounterLabel(games.value, props.player, props.localPlayer) : encounterLabel(props.player));
-const visibleTags = (player: PlayerProfile) => player.tags.filter((tag) => tag.key !== "met").slice(0, 3);
-const encounterOpen = ref(false);
-const encounterPinned = ref(false);
-let closeTimer: ReturnType<typeof setTimeout> | undefined;
-function openEncounters() { clearTimeout(closeTimer); encounterOpen.value = true; }
-function closeEncounters() {
-  clearTimeout(closeTimer);
-  closeTimer = setTimeout(() => { if (!encounterPinned.value) encounterOpen.value = false; }, 180);
-}
-function dismissEncounters() { encounterPinned.value = false; encounterOpen.value = false; }
-onBeforeUnmount(() => clearTimeout(closeTimer));
 function selectFromKeyboard(event: KeyboardEvent) {
   if (event.target !== event.currentTarget) return;
   emit("select", props.player);
@@ -345,39 +328,28 @@ function selectFromKeyboard(event: KeyboardEvent) {
       <small>{{ player.junglePreference.sampleSize }} 场 · {{ Math.round(player.junglePreference.winRate * 100) }}%</small>
     </div>
 
-    <!-- 特色标签区 -->
+    <!-- 特色标签区：统一由标签系统渲染，顺序与开关见 frontend/src/tags -->
     <footer class="bp-player-card__tags">
-      <small>标签</small>
-      <NPopover v-if="!suppressEncounters && (games.length || player.encounterCount > 0)" :show="encounterOpen" trigger="manual" placement="top" :show-arrow="false" @clickoutside="dismissEncounters">
-        <template #trigger><button type="button" class="bp-player-card__encounter" data-testid="encounter-trigger" :aria-expanded="encounterOpen" @mouseenter="openEncounters" @mouseleave="closeEncounters" @focus="openEncounters" @blur="closeEncounters" @click.stop="encounterPinned = !encounterPinned; encounterOpen = encounterPinned" @keydown.escape.stop="dismissEncounters">{{ metLabel }}</button></template>
-        <div @mouseenter="openEncounters" @mouseleave="closeEncounters" @focusin="openEncounters" @focusout="closeEncounters" @keydown.escape.stop="dismissEncounters" @click.stop>
-          <EncounterList :games="games" :loading="encounterLoading" :error="encounterError" compact @retry="emit('retry-encounters')" @select="emit('select-encounter', player, $event); dismissEncounters()" />
-        </div>
-      </NPopover>
-      <span v-for="tag in visibleTags(player)" :key="tag.key" :data-tone="tag.tone" :title="tag.evidence">{{ tag.label }}</span>
-      <span v-if="player.championPoolConcentration >= 0.7" data-tone="warning" title="近期该玩家过度集中使用单一英雄">
-        英雄池集中
-      </span>
-      <span
-        v-if="player.isPremade || premadeTone !== undefined"
-        data-tone="info"
-        :title="player.premadeWith.length ? `与 ${player.premadeWith.join('、')} 开黑` : '检测到已知组队'"
-      >
-        {{ player.premadeWith.length ? `与 ${player.premadeWith.join('、')} 开黑` : "已知组队" }}
-      </span>
-      <span
-        v-if="!visibleTags(player).length && (suppressEncounters || player.encounterCount === 0) && player.championPoolConcentration < 0.7 && !player.isPremade && premadeTone === undefined"
-        class="bp-player-card__empty"
-      >
-        暂无标签
-      </span>
+      <PlayerTagArea
+        :player="player"
+        :local-player="localPlayer"
+        :premade-tone="premadeTone"
+        :suppress-encounters="suppressEncounters"
+        :encounter-records="encounterRecords"
+        :encounter-loading="encounterLoading"
+        :encounter-error="encounterError"
+        :current-game-id="currentGameId"
+        :player-notes="playerNotes"
+        :can-edit-notes="canEditNotes"
+        @select-encounter="(records) => emit('select-encounter', player, records)"
+        @retry-encounters="emit('retry-encounters')"
+        @edit-notes="emit('edit-notes', player)"
+      />
     </footer>
   </article>
 </template>
 
 <style scoped>
-.bp-player-card__encounter { max-width: 100%; padding: 3px 6px; border: 1px solid transparent; border-radius: 3px; color: var(--blue); background: var(--blue-soft); font: inherit; font-size: 10px; cursor: pointer; text-align: left; }
-.bp-player-card__encounter:hover, .bp-player-card__encounter:focus-visible { border-color: var(--blue); outline: none; }
 /* 玩家卡片基础容器 */
 .bp-player-card {
   position: relative;
@@ -1003,67 +975,12 @@ function selectFromKeyboard(event: KeyboardEvent) {
 .bp-player-card__jungle[data-style="farm"] { border-left-color: var(--green); background: var(--green-soft); }
 .bp-player-card__jungle[data-style="farm"] svg { color: var(--green); }
 
-/* 7. 标签区 */
+/* 7. 标签区：chip 的尺寸/配色统一由 styles/main.css 的 .tag-chip 负责，
+   这里只保留分区本身的分隔线。 */
 .bp-player-card__tags {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px;
   margin-top: 8px;
   padding-top: 6px;
   border-top: 1px dashed var(--line);
-}
-
-.bp-player-card__tags small {
-  color: var(--text-muted);
-  font-size: 9px;
-  font-weight: 700;
-  margin-right: 2px;
-}
-
-.bp-player-card__tags span {
-  display: inline-flex;
-  align-items: center;
-  padding: 2px 6px;
-  border-radius: 4px;
-  color: var(--accent);
-  background: var(--accent-soft);
-  font-size: 9px;
-  font-weight: 700;
-  white-space: nowrap;
-}
-
-.bp-player-card__tags span[data-tone="success"] {
-  color: #15803d;
-  background: color-mix(in srgb, #15803d 12%, var(--surface));
-  border: 1px solid color-mix(in srgb, #15803d 25%, transparent);
-}
-
-.bp-player-card__tags span[data-tone="warning"] {
-  color: #b45309;
-  background: color-mix(in srgb, #b45309 14%, var(--surface));
-  border: 1px solid color-mix(in srgb, #b45309 30%, transparent);
-}
-
-.bp-player-card__tags span[data-tone="danger"] {
-  color: #dc2626;
-  background: color-mix(in srgb, #dc2626 14%, var(--surface));
-  border: 1px solid color-mix(in srgb, #dc2626 30%, transparent);
-}
-
-.bp-player-card__tags span[data-tone="info"] {
-  color: #2563eb;
-  background: color-mix(in srgb, #2563eb 12%, var(--surface));
-  border: 1px solid color-mix(in srgb, #2563eb 25%, transparent);
-}
-
-.bp-player-card__empty {
-  color: var(--text-muted) !important;
-  background: transparent !important;
-  border: none !important;
-  font-size: 9px !important;
-  font-style: normal !important;
-  font-weight: 500 !important;
 }
 
 /* 针对双列模式微调：两行排列，保证在狭窄列宽下绝不重叠 */

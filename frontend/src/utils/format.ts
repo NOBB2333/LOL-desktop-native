@@ -111,3 +111,29 @@ export const relativeTime = (value: string) => {
   const hours = Math.max(1, Math.round((Date.now() - timestamp) / 3600000));
   return hours < 24 ? `${hours} 小时前` : `${Math.floor(hours / 24)} 天前`;
 };
+
+/** 精确到分钟的日期时间，用于共同对局表格。 */
+export const dateTime = (value: string) => {
+  const timestamp = parseTimestamp(value);
+  if (!Number.isFinite(timestamp)) return "时间未知";
+  const date = new Date(timestamp);
+  const pad = (input: number) => input.toString().padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+};
+
+/** 相对当前时间的自然语言描述（对齐 LeagueAkari 的 dayjs.fromNow）。 */
+export const fromNow = (value: string) => {
+  const timestamp = parseTimestamp(value);
+  if (!Number.isFinite(timestamp)) return "时间未知";
+  const seconds = Math.round((Date.now() - timestamp) / 1000);
+  if (seconds < 60) return "刚刚";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  const days = Math.round(hours / 24);
+  if (days < 30) return `${days} 天前`;
+  const months = Math.round(days / 30);
+  if (months < 12) return `${months} 个月前`;
+  return `${Math.round(months / 12)} 年前`;
+};

@@ -8,12 +8,17 @@ import MatchDetailCard from "../components/MatchDetailCard.vue";
 import PageHeader from "../components/PageHeader.vue";
 import PlayerCard from "../components/PlayerCard.vue";
 import PlayerDetailDrawer from "../components/PlayerDetailDrawer.vue";
+import PlayerTagEditPanel from "../components/PlayerTagEditPanel.vue";
 import EncounterDetails from "../components/EncounterDetails.vue";
 import { useEncounters } from "../composables/useEncounters";
+import { usePlayerNotes } from "../composables/usePlayerNotes";
 import TeamSummaryCard from "../components/TeamSummaryCard.vue";
 import { backend, isTauri } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { EncounterRecord, LiveLobby, LiveTeam, PlayerProfile } from "../types/domain";
+import { HIGH_WIN_RATE_LABEL, HIGH_WIN_RATE_MIN_SAMPLE, HIGH_WIN_RATE_THRESHOLD } from "../tags/definitions/performance";
+import { POOL_CONCENTRATION_LABEL, POOL_CONCENTRATION_THRESHOLD } from "../tags/definitions/playstyle";
+import { deriveTagFacts } from "../tags/facts";
 import { createCoalescedAsyncRunner } from "../utils/coalescedAsync";
 import { roleName } from "../utils/format";
 import { enrichedRosterCoversOverlay, mergeRosterSnapshot, playerCardKey } from "../utils/liveRoster";
@@ -189,6 +194,35 @@ function selectEncounter(player: PlayerProfile, records: EncounterRecord[]) {
   encounterModalOpen.value = true;
 }
 const isMyPartyMember = (player: PlayerProfile) => isLocalPartyMember(localPlayer.value, player, premadeTones.value);
+// 玩家标记（备注）：按本局十人的 puuid 批量读取，只有「别人」才允许编辑。
+const lobbyPuuids = computed(() => teams.value.flatMap((team) => team.players).map((player) => player.puuid));
+const playerNotes = usePlayerNotes(lobbyPuuids, () => localPlayer.value?.puuid ?? null);
+const tagEditorPlayer = ref<PlayerProfile | null>(null);
+const tagEditorSaving = ref(false);
+const tagEditorError = ref("");
+function openTagEditor(player: PlayerProfile) {
+  tagEditorError.value = "";
+  tagEditorPlayer.value = player;
+}
+async function saveTagNotes(notes: string[]) {
+  const player = tagEditorPlayer.value;
+  if (!player || tagEditorSaving.value) return;
+  tagEditorSaving.value = true;
+  tagEditorError.value = "";
+  try {
+    await playerNotes.save(player.puuid, notes);
+    tagEditorPlayer.value = null;
+    message.success(notes.length ? "玩家标记已保存" : "玩家标记已清空");
+  } catch (cause) {
+    tagEditorError.value = cause instanceof Error ? cause.message : String(cause);
+  } finally {
+    tagEditorSaving.value = false;
+  }
+}
+function closeTagEditor() {
+  tagEditorPlayer.value = null;
+  tagEditorError.value = "";
+}
 const dataSource = computed(() => {
   if (current.value?.phase === "Retained") return "上一局快照";
   const player = teams.value.flatMap((team) => team.players).find((item) => item.dataStatus);
@@ -218,16 +252,20 @@ const dangerPoints = computed(() => {
   if (!current.value) return [];
   const points: { tone: "danger" | "warning" | "success"; title: string; detail: string }[] = [];
   const enemy = enemyPlayers.value;
-  const hot = enemy.find((player) => player.tags.some((tag) => tag.key === "hot"));
+  // 高风险判定走标签系统同一套事实与阈值，避免与卡片标签出现两套口径。
+  const hot = enemy.find((player) => {
+    const facts = deriveTagFacts(player);
+    return facts.sample >= HIGH_WIN_RATE_MIN_SAMPLE && facts.winRate >= HIGH_WIN_RATE_THRESHOLD;
+  });
   const premade = enemy.filter((player) => player.isPremade);
-  const concentrated = enemy.find((player) => player.championPoolConcentration >= .7);
+  const concentrated = enemy.find((player) => player.championPoolConcentration >= POOL_CONCENTRATION_THRESHOLD);
   if (hot) {
     const recent = hot.recentMatches.slice(0, recentLimit.value);
-    points.push({ tone: "danger", title: `${roleName(hot.assignedPosition)} 位状态火热`, detail: `${hot.gameName} 近${recentLimit.value}场 ${recent.filter((match) => match.win).length} 胜，当前英雄 ${hot.currentChampionGames} 场。` });
+    points.push({ tone: "danger", title: `${roleName(hot.assignedPosition)} 位${HIGH_WIN_RATE_LABEL}`, detail: `${hot.gameName} 近${recentLimit.value}场 ${recent.filter((match) => match.win).length} 胜，当前英雄 ${hot.currentChampionGames} 场。` });
   }
   if (premade.length >= 2) points.push({ tone: "warning", title: "敌方存在已知组队", detail: `${premade.slice(0, 2).map((player) => player.gameName).join(" + ")} 有共同组队证据。` });
-  if (concentrated) points.push({ tone: "warning", title: `${roleName(concentrated.assignedPosition)} 英雄池集中`, detail: `${concentrated.gameName} 的英雄池集中度 ${Math.round(concentrated.championPoolConcentration * 100)}%，可结合 BP 针对。` });
-  if (!points.length) points.push({ tone: "success", title: "暂未发现高风险玩家", detail: "当前局没有触发高连胜、组队或英雄池集中的规则。" });
+  if (concentrated) points.push({ tone: "warning", title: `${roleName(concentrated.assignedPosition)} ${POOL_CONCENTRATION_LABEL}`, detail: `${concentrated.gameName} 的英雄池集中度 ${Math.round(concentrated.championPoolConcentration * 100)}%，可结合 BP 针对。` });
+  if (!points.length) points.push({ tone: "success", title: "暂未发现高风险玩家", detail: `当前局没有触发${HIGH_WIN_RATE_LABEL}、组队或${POOL_CONCENTRATION_LABEL}的规则。` });
   return points;
 });
 
@@ -424,14 +462,14 @@ onBeforeUnmount(() => {
       <section v-if="hasLobbyPlayers" class="game-board" :data-layout="current.layoutKind || 'classic'">
         <div v-if="classicLayout" class="game-teams">
           <header class="game-team-heading game-team-heading--ally"><div><span class="side-kicker ally">我方 · {{ allyTeam.players.length }} 人</span><h2>{{ allyTeam.label }}</h2></div><strong>{{ (allyTeam.summary?.score ?? current.allySummary.score).toFixed(1) }}<small> 队伍评分</small></strong></header>
-          <div class="game-player-row" :style="{ '--player-columns': playerColumnCount(allyTeam.players.length) }"><PlayerCard v-for="(player, index) in allyTeam.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :suppress-encounters="isMyPartyMember(player)" data-side="ally" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" /></div>
+          <div class="game-player-row" :style="{ '--player-columns': playerColumnCount(allyTeam.players.length) }"><PlayerCard v-for="(player, index) in allyTeam.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :suppress-encounters="isMyPartyMember(player)" data-side="ally" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" :player-notes="playerNotes.notesFor(player.puuid)" :can-edit-notes="playerNotes.canEdit(player.puuid)" @edit-notes="openTagEditor" /></div>
           <header class="game-team-heading game-team-heading--enemy"><div><span class="side-kicker enemy">敌方 · {{ enemyTeam.players.length }} 人</span><h2>{{ enemyTeam.label }}</h2></div><strong>{{ (enemyTeam.summary?.score ?? current.enemySummary.score).toFixed(1) }}<small> 队伍评分</small></strong></header>
-          <div class="game-player-row" :style="{ '--player-columns': playerColumnCount(enemyTeam.players.length) }"><PlayerCard v-for="(player, index) in enemyTeam.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" data-side="enemy" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" /></div>
+          <div class="game-player-row" :style="{ '--player-columns': playerColumnCount(enemyTeam.players.length) }"><PlayerCard v-for="(player, index) in enemyTeam.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" data-side="enemy" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" :player-notes="playerNotes.notesFor(player.puuid)" :can-edit-notes="playerNotes.canEdit(player.puuid)" @edit-notes="openTagEditor" /></div>
         </div>
         <div v-else class="game-teams game-teams--generic">
           <section v-for="team in teams" :key="team.id" class="game-team-group" :data-side="team.side">
             <header class="game-team-heading"><div><span class="side-kicker" :class="team.side">{{ team.side === 'enemy' ? '敌方' : '我方' }} · {{ team.players.length }} 人</span><h2>{{ team.label }}</h2></div><strong v-if="team.summary">{{ team.summary.score.toFixed(1) }}<small> 队伍评分</small></strong></header>
-            <div class="game-player-row" :class="{ 'game-player-row--sparse': team.players.length < 5 }" :style="{ '--player-columns': playerColumnCount(team.players.length) }"><PlayerCard v-for="(player, index) in team.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :suppress-encounters="team.side === 'ally' && isMyPartyMember(player)" :data-side="team.side" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" /></div>
+            <div class="game-player-row" :class="{ 'game-player-row--sparse': team.players.length < 5 }" :style="{ '--player-columns': playerColumnCount(team.players.length) }"><PlayerCard v-for="(player, index) in team.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :suppress-encounters="team.side === 'ally' && isMyPartyMember(player)" :data-side="team.side" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" :player-notes="playerNotes.notesFor(player.puuid)" :can-edit-notes="playerNotes.canEdit(player.puuid)" @edit-notes="openTagEditor" /></div>
           </section>
         </div>
         <aside class="game-summary-column"><div class="game-summary-column__head"><span class="eyebrow">实时概览</span><h2>本局总结</h2><p>{{ dangerPoints.length }} 条规则命中 · {{ teams.length }} 个队伍</p></div><template v-if="classicLayout"><div class="game-summary-team game-summary-team--ally"><strong>我方总结</strong><TeamSummaryCard :summary="current.allySummary" side="ally" /></div><div class="game-summary-team game-summary-team--enemy"><strong>敌方总结</strong><TeamSummaryCard :summary="current.enemySummary" side="enemy" /></div></template><template v-else><div v-for="team in teams.filter((item) => item.summary)" :key="`summary-${team.id}`" class="game-summary-team" :class="`game-summary-team--${team.side}`"><strong>{{ team.side === 'enemy' ? '敌方总结' : '我方总结' }}</strong><TeamSummaryCard :summary="team.summary!" :side="team.side === 'enemy' ? 'enemy' : 'ally'" /></div></template><div class="game-danger-list"><article v-for="(point, index) in dangerPoints" :key="point.title" :data-tone="point.tone"><b>0{{ index + 1 }}</b><div><strong>{{ point.title }}</strong><p>{{ point.detail }}</p></div></article></div><div class="game-summary-foot"><span>快捷键</span><strong>Ctrl + F1</strong><small>随时调出对局速看</small></div></aside>
@@ -443,7 +481,15 @@ onBeforeUnmount(() => {
       </section>
     </template>
     <EncounterDetails v-model:show="encounterModalOpen" :records="selectedEncounterRecords" :target-puuid="selectedEncounterTarget" />
-    <PlayerDetailDrawer v-model:show="drawerOpen" :player="selectedPlayer" :lobby="current" :initial-match-id="selectedMatchId" :suppress-encounters="selectedPlayer ? isMyPartyMember(selectedPlayer) : false" />
+    <PlayerDetailDrawer v-model:show="drawerOpen" :player="selectedPlayer" :lobby="current" :initial-match-id="selectedMatchId" :suppress-encounters="selectedPlayer ? isMyPartyMember(selectedPlayer) : false" :local-player="localPlayer" :player-notes="selectedPlayer ? playerNotes.notesFor(selectedPlayer.puuid) : []" :can-edit-notes="selectedPlayer ? playerNotes.canEdit(selectedPlayer.puuid) : false" @edit-notes="openTagEditor" />
+    <PlayerTagEditPanel
+      :player="tagEditorPlayer"
+      :notes="tagEditorPlayer ? playerNotes.notesFor(tagEditorPlayer.puuid) : []"
+      :saving="tagEditorSaving"
+      :error="tagEditorError"
+      @save="saveTagNotes"
+      @close="closeTagEditor"
+    />
   </div>
 </template>
 

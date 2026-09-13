@@ -1,6 +1,7 @@
 import type { AppConfig, ShortcutDefinition } from "../types/domain";
+import { normalizePlayerTagSettings } from "../tags/settings";
 
-export const CURRENT_CONFIG_VERSION = 18;
+export const CURRENT_CONFIG_VERSION = 19;
 export const defaultOpenGameShortcutKey = "Ctrl+F1";
 
 export const defaultAssessmentTemplate =
@@ -26,6 +27,12 @@ export const encounterShortcut: ShortcutDefinition = {
 
 export function migrateAppConfig(config: AppConfig) {
   let changed = false;
+  // v19：标签系统重建后新增逐标签开关；老配置缺字段时按默认值补齐。
+  const normalizedTags = normalizePlayerTagSettings(config.playerTags);
+  if (JSON.stringify(normalizedTags) !== JSON.stringify(config.playerTags ?? null)) {
+    config.playerTags = normalizedTags;
+    changed = true;
+  }
   if (typeof config.providers.rankedOnly !== "boolean") {
     config.providers.rankedOnly = false;
     changed = true;

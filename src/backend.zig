@@ -12,13 +12,16 @@ const native_input = @import("backend/input.zig");
 const shortcut_service = @import("backend/shortcuts.zig");
 const hotkey_service = @import("backend/hotkeys.zig");
 const jungle_analysis = @import("backend/jungle_analysis.zig");
-const recent_tags = @import("backend/recent_tags.zig");
+const player_signals = @import("backend/player_signals.zig");
+const player_tag_service = @import("backend/player_tags.zig");
 const live_loading = @import("backend/live_loading.zig");
 
 const fallback_data_dir = std.fmt.comptimePrint(".{s}", .{build_options.data_dir_name});
 
 test {
     std.testing.refAllDecls(storage);
+    std.testing.refAllDecls(player_tag_service);
+    std.testing.refAllDecls(player_signals);
 }
 
 test "慢查询期间状态可读取且切换模式后旧结果被拒绝" {
@@ -171,6 +174,7 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.MatchDetailUnavailable => "该对局的完整详情暂不可用",
         error.InvalidRequest => "请求参数无效",
         error.InvalidShortcut => "快捷消息配置无效",
+        error.PlayerTagUnavailable => "玩家标记暂不可用，请稍后重试",
         error.ShortcutUnavailable => "当前阶段或资料不足，暂时无法发送",
         error.ChatUnavailable => "当前聊天会话不可用",
         error.AdministratorRequired => "游戏内发送需要以管理员身份运行辅助程序",
@@ -266,6 +270,8 @@ pub const command_names = [_][]const u8{
     "lol.open_game_view",
     "lol.get_lcu_events",
     "lol.get_shortcut_events",
+    "lol.get_player_tags",
+    "lol.update_player_tag",
 };
 
 const default_config =
@@ -598,6 +604,8 @@ pub const Runtime = struct {
             .{ .name = "lol.open_game_view", .context = self, .invoke_fn = openGameView },
             .{ .name = "lol.get_lcu_events", .context = self, .invoke_fn = getLcuEvents },
             .{ .name = "lol.get_shortcut_events", .context = self, .invoke_fn = getShortcutEvents },
+            .{ .name = "lol.get_player_tags", .context = self, .invoke_fn = getPlayerTags },
+            .{ .name = "lol.update_player_tag", .context = self, .invoke_fn = updatePlayerTag },
         };
     }
 };
@@ -1936,7 +1944,7 @@ fn mergeLobbyProfile(allocator: std.mem.Allocator, base: std.json.Value, dynamic
     if (dynamic_enriched and attempted) {
         var retained = false;
         if (profileSourceMissing(dynamic, "recentMatches") and arrayFieldHasItems(base, "recentMatches")) {
-            for ([_][]const u8{ "recentMatches", "topChampions", "score", "tags", "junglePreference", "positionGames", "positionWinRate", "currentChampionGames", "currentChampionWinRate", "championPoolConcentration" }) |field| copyObjectField(&merged, base, field);
+            for ([_][]const u8{ "recentMatches", "topChampions", "score", "junglePreference", "positionGames", "positionWinRate", "currentChampionGames", "currentChampionWinRate", "championPoolConcentration" }) |field| copyObjectField(&merged, base, field);
             retained = true;
         }
         if (profileSourceMissing(dynamic, "rank") and !profileSourceMissing(base, "rank")) {
@@ -2890,6 +2898,101 @@ fn getEncounters(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
     const payload = payload_json.value;
     const limit: usize = @intCast(std.math.clamp(payload.limitGames, @as(i64, 1), @as(i64, 40)));
     return cachedEncounterResponse(self, payload.puuid orelse "", limit, payload.excludeGameId, output);
+}
+
+const PlayerTagQueryPayload = struct {
+    puuids: []const []const u8 = &.{},
+    selfPuuid: ?[]const u8 = null,
+};
+
+const PlayerTagUpdatePayload = struct {
+    puuid: []const u8,
+    notes: []const []const u8 = &.{},
+    selfPuuid: ?[]const u8 = null,
+};
+
+/// 备注的「写入者」：优先用请求里带的 puuid（快照模式与测试没有登录账号），
+/// 否则退回当前客户端登录账号。
+fn playerTagOwner(self: *Runtime, provided: ?[]const u8) []const u8 {
+    if (provided) |puuid| {
+        if (puuid.len > 0) return puuid;
+    }
+    return self.live_owner_puuid[0..self.live_owner_puuid_len];
+}
+
+fn writePlayerTagNotes(
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    self: *Runtime,
+    owner: []const u8,
+    puuid: []const u8,
+) !void {
+    const notes: []const []const u8 = if (self.storage) |*store|
+        try player_tag_service.read(store, allocator, owner, puuid)
+    else
+        &.{};
+    try writer.writeByte('[');
+    for (notes, 0..) |note, index| {
+        if (index > 0) try writer.writeByte(',');
+        try jsonString(writer, note);
+    }
+    try writer.writeByte(']');
+}
+
+/// 批量读取本局十人的备注，返回 `{"tags":{"<puuid>":["备注"]}}`。
+fn getPlayerTags(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = runtime(context);
+    const payload_json = parsePayload(PlayerTagQueryPayload, invocation.request.payload) catch return error.InvalidRequest;
+    defer payload_json.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const owner = playerTagOwner(self, payload_json.value.selfPuuid);
+
+    var writer = std.Io.Writer.fixed(output);
+    try writer.writeAll("{\"tags\":{");
+    var first = true;
+    for (payload_json.value.puuids) |puuid| {
+        if (puuid.len == 0) continue;
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try jsonString(&writer, puuid);
+        try writer.writeByte(':');
+        try writePlayerTagNotes(&writer, allocator, self, owner, puuid);
+    }
+    try writer.writeAll("}}");
+    return writer.buffered();
+}
+
+/// 覆盖写入某位玩家的备注，返回清洗后的结果与更新时间。
+fn updatePlayerTag(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = runtime(context);
+    const payload_json = parsePayload(PlayerTagUpdatePayload, invocation.request.payload) catch return error.InvalidRequest;
+    defer payload_json.deinit();
+    const payload = payload_json.value;
+    if (payload.puuid.len == 0) return error.InvalidRequest;
+
+    const owner = playerTagOwner(self, payload.selfPuuid);
+    if (owner.len == 0) return error.PlayerTagUnavailable;
+    const store = if (self.storage) |*slot| slot else return error.PlayerTagUnavailable;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const saved = try player_tag_service.write(store, allocator, owner, payload.puuid, payload.notes);
+    const updated_at = try player_tag_service.updatedAt(store, allocator, owner, payload.puuid);
+
+    var writer = std.Io.Writer.fixed(output);
+    try writer.writeAll("{\"puuid\":");
+    try jsonString(&writer, payload.puuid);
+    try writer.writeAll(",\"notes\":[");
+    for (saved, 0..) |note, index| {
+        if (index > 0) try writer.writeByte(',');
+        try jsonString(&writer, note);
+    }
+    try writer.print("],\"updatedAt\":{d}}}", .{updated_at});
+    return writer.buffered();
 }
 
 fn getFriends(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
@@ -4045,6 +4148,9 @@ test "lost matches are never classified as carried" {
 /// Keep the live payload's team summaries compatible with the Rust analysis
 /// layer. The native host receives the same enriched player cards, so the
 /// summary can be derived without another LCU request.
+///
+/// 优势 / 风险来自 `player_signals`：它读的是同一份 `recentMatches`，阈值与文案与
+/// 前端卡片标签逐条一致，所以队伍小结和玩家卡片不会出现两套说法。
 fn writeLiveTeamSummary(writer: *std.Io.Writer, side: []const u8, players_json: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -4053,10 +4159,6 @@ fn writeLiveTeamSummary(writer: *std.Io.Writer, side: []const u8, players_json: 
     var count: usize = 0;
     var focus_score: f64 = std.math.inf(f64);
     var focus_puuid: []const u8 = "";
-    var strengths: [3][]const u8 = .{ "", "", "" };
-    var risks: [3][]const u8 = .{ "", "", "" };
-    var strengths_len: usize = 0;
-    var risks_len: usize = 0;
     if (root == .array) for (root.array.items) |player| {
         if (player != .object) continue;
         count += 1;
@@ -4066,18 +4168,6 @@ fn writeLiveTeamSummary(writer: *std.Io.Writer, side: []const u8, players_json: 
             focus_score = score;
             focus_puuid = jsonField(player, "puuid");
         }
-        if (player.object.get("tags")) |tags| if (tags == .array) for (tags.array.items) |tag| {
-            if (tag != .object) continue;
-            const label = jsonField(tag, "label");
-            if (label.len == 0) continue;
-            const tone = jsonField(tag, "tone");
-            const target = if (std.ascii.eqlIgnoreCase(tone, "success") or std.ascii.eqlIgnoreCase(tone, "info")) &strengths else &risks;
-            const target_len = if (target == &strengths) &strengths_len else &risks_len;
-            if (target_len.* < target.len) {
-                target[target_len.*] = label;
-                target_len.* += 1;
-            }
-        };
     };
     const score = if (count > 0) score_total / @as(f64, @floatFromInt(count)) else 0;
     const title = if (count == 0) "暂无队伍数据" else if (score >= 75) "状态占优" else if (score < 55) "需要关注" else "整体均衡";
@@ -4087,25 +4177,57 @@ fn writeLiveTeamSummary(writer: *std.Io.Writer, side: []const u8, players_json: 
     try jsonString(writer, title);
     try writer.writeAll(",\"focusPlayerPuuid\":");
     if (focus_puuid.len > 0) try jsonString(writer, focus_puuid) else try writer.writeAll("null");
-    try writer.writeAll(",\"strengths\":[");
-    if (strengths_len == 0 and count > 0) {
-        try jsonString(writer, "整体状态稳定");
-    } else {
-        for (strengths[0..strengths_len], 0..) |value, index| {
-            if (index > 0) try writer.writeByte(',');
-            try jsonString(writer, value);
+    try writer.writeAll(",\"strengths\":");
+    try writeTeamSignals(writer, root, .strengths);
+    try writer.writeAll(",\"risks\":");
+    try writeTeamSignals(writer, root, .risks);
+    try writer.writeAll(",\"composition\":null}");
+}
+
+/// 逐位玩家取指定档位的信号，去重后写入 JSON 数组；一条都没有时给一句兜底。
+///
+/// 去重表里的标签必须活到函数结束，所以统一拷进函数自己的 arena
+/// —— 复用同一个固定缓冲会在下一位玩家被覆盖。
+fn writeTeamSignals(writer: *std.Io.Writer, players: std.json.Value, bucket: player_signals.Bucket) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var label_buffer: [512]u8 = undefined;
+    const seen = try allocator.alloc([]const u8, 16);
+    var seen_len: usize = 0;
+
+    const player_count: usize = if (players == .array) players.array.items.len else 0;
+
+    try writer.writeByte('[');
+    var emitted: usize = 0;
+    if (players == .array) for (players.array.items) |player| {
+        if (player != .object) continue;
+        var signal_writer = std.Io.Writer.fixed(&label_buffer);
+        _ = player_signals.writeBucket(&signal_writer, player, bucket, "、", player_signals.max_signals) catch continue;
+        var labels = std.mem.splitSequence(u8, signal_writer.buffered(), "、");
+        while (labels.next()) |label| {
+            if (label.len == 0) continue;
+            if (containsLabel(seen[0..seen_len], label)) continue;
+            if (emitted > 0) try writer.writeByte(',');
+            try jsonString(writer, label);
+            emitted += 1;
+            if (seen_len < seen.len) {
+                seen[seen_len] = try allocator.dupe(u8, label);
+                seen_len += 1;
+            }
         }
-    }
-    try writer.writeAll("],\"risks\":[");
-    if (risks_len == 0) {
-        try jsonString(writer, if (count == 0) "等待玩家信息" else "暂无明显风险");
-    } else {
-        for (risks[0..risks_len], 0..) |value, index| {
-            if (index > 0) try writer.writeByte(',');
-            try jsonString(writer, value);
-        }
-    }
-    try writer.writeAll("],\"composition\":null}");
+    };
+    if (emitted == 0) try jsonString(writer, switch (bucket) {
+        .strengths => if (player_count > 0) "整体状态稳定" else "暂无队伍数据",
+        .risks => if (player_count > 0) "暂无明显风险" else "等待玩家信息",
+    });
+    try writer.writeByte(']');
+}
+
+fn containsLabel(known: []const []const u8, label: []const u8) bool {
+    for (known) |item| if (std.mem.eql(u8, item, label)) return true;
+    return false;
 }
 
 fn writeBanNames(writer: *std.Io.Writer, game: std.json.Value, catalog: std.json.Value) !void {
@@ -5591,8 +5713,6 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     try writer.writeAll(",\"score\":");
     try writeRecentScore(writer, recent_items);
     const encounter = if (shared_encounter) |shared| shared.summary(puuid) else encounterProfileSummary(self, puuid);
-    try writer.writeAll(",\"tags\":");
-    try writeRecentTags(writer, recent_items, position, champion_id, encounter);
     try writer.writeAll(",\"junglePreference\":");
     try writeJunglePreference(writer, recent_items, champion_id);
     try writeEncounterProfileFields(writer, encounter);
@@ -5669,7 +5789,7 @@ fn liveRosterNeedsReload(self: *Runtime, lobby: std.json.Value) bool {
     return false;
 }
 
-const EncounterSummary = recent_tags.EncounterSummary;
+const EncounterSummary = encounter_service.EncounterSummary;
 
 fn encounterProfileSummary(self: *Runtime, puuid: []const u8) EncounterSummary {
     var summary = EncounterSummary{};
@@ -6188,7 +6308,7 @@ fn recentChampionWinRate(matches: []const std.json.Value, champion_id: i64) f64 
 }
 
 fn recentChampionConcentration(matches: []const std.json.Value) f64 {
-    return recent_tags.concentrationOf(matches);
+    return player_signals.concentrationOf(matches);
 }
 
 fn writeRecentChampionUsage(writer: *std.Io.Writer, matches: []const std.json.Value) !void {
@@ -6248,10 +6368,6 @@ fn writeRecentScore(writer: *std.Io.Writer, matches: []const std.json.Value) !vo
     const kda_score = @round(@min(average_kda, 5.0) * 40.0) / 10.0;
     const total = 35.0 + recent_score + kda_score;
     try writer.print("{{\"total\":{d:.1},\"confidence\":{d:.1},\"components\":[{{\"key\":\"base\",\"label\":\"基础分\",\"score\":35,\"maxScore\":35,\"evidence\":\"有效近期样本的基础分\"}},{{\"key\":\"recent\",\"label\":\"近期战绩\",\"score\":{d:.1},\"maxScore\":45,\"evidence\":\"近{d}场胜率 {d:.0}%\"}},{{\"key\":\"kda\",\"label\":\"击杀助攻比\",\"score\":{d:.1},\"maxScore\":20,\"evidence\":\"平均击杀助攻比 {d:.2}\"}}]}}", .{ total, @min(100.0, @as(f64, @floatFromInt(stats.count * 10))), recent_score, stats.count, win_rate * 100.0, kda_score, average_kda });
-}
-
-fn writeRecentTags(writer: *std.Io.Writer, matches: []const std.json.Value, assigned_position: []const u8, current_champion_id: i64, encounter: EncounterSummary) !void {
-    return recent_tags.writeMatches(writer, matches, assigned_position, current_champion_id, encounter);
 }
 
 fn liveSessionEnvelopePhase(session_json: []const u8, phase: []const u8, current_json: ?[]const u8, output: []u8) ![]const u8 {
@@ -7139,41 +7255,6 @@ test "maps queue catalog labels without exposing LCU class names" {
     try std.testing.expectEqualStrings("召唤师峡谷", queueNameFromCatalog(catalog, 0, "CLASS"));
 }
 
-test "recent analysis emits solo threat from exact timeline data" {
-    const recent =
-        "[" ++
-        "{\"durationMinutes\":30,\"win\":true,\"deaths\":2,\"soloKills\":1,\"position\":\"MIDDLE\",\"championId\":103}," ++
-        "{\"durationMinutes\":31,\"win\":true,\"deaths\":3,\"soloKills\":1,\"position\":\"MID\",\"championId\":103}," ++
-        "{\"durationMinutes\":29,\"win\":false,\"deaths\":4,\"soloKills\":0.5,\"position\":\"MIDDLE\",\"championId\":112}" ++
-        "]";
-    var output: [4096]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&output);
-    var recent_matches = RecentMatchesView.parse(recent);
-    defer recent_matches.deinit();
-    try writeRecentTags(&writer, recent_matches.items, "MIDDLE", 103, .{});
-    const tags = writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, tags, "\"key\":\"soloThreat\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tags, "\"label\":\"单杀威胁\"") != null);
-}
-
-test "recent analysis caps aggregate evidence at five tags" {
-    const match = "{\"durationMinutes\":20,\"win\":true,\"deaths\":8,\"kills\":10,\"assists\":10,\"killParticipation\":0.8,\"damageShare\":0.32,\"cs\":180,\"soloKills\":1,\"earlyDeathsWithEnemyJungler\":2,\"position\":\"TOP\",\"championId\":86}";
-    const recent = "[" ++ match ++ "," ++ match ++ "," ++ match ++ "," ++ match ++ "," ++ match ++ "]";
-    var output: [8192]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&output);
-    var recent_matches = RecentMatchesView.parse(recent);
-    defer recent_matches.deinit();
-    try writeRecentTags(&writer, recent_matches.items, "MIDDLE", 103, .{});
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 5), parsed.value.array.items.len);
-    try std.testing.expectEqualStrings("soloThreat", jsonField(parsed.value.array.items[0], "key"));
-    try std.testing.expectEqualStrings("easyGank", jsonField(parsed.value.array.items[1], "key"));
-    try std.testing.expectEqualStrings("highDeaths", jsonField(parsed.value.array.items[2], "key"));
-    try std.testing.expectEqualStrings("highParticipation", jsonField(parsed.value.array.items[3], "key"));
-    try std.testing.expectEqualStrings("damageCore", jsonField(parsed.value.array.items[4], "key"));
-}
-
 test "persists complete BP picks with game id localized names and queue label" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -7766,69 +7847,6 @@ test "merges encounter archive with deduplication and retention cutoff" {
     try std.testing.expect(std.mem.indexOf(u8, result, "kept-player") != null);
 }
 
-test "writes encounter evidence before LeagueAkari gank labels" {
-    const matches = "[{\"durationMinutes\":20,\"earlyDeathsWithEnemyJungler\":3},{\"durationMinutes\":24,\"earlyDeathsWithEnemyJungler\":2}]";
-    var encounter = EncounterSummary{ .count = 2 };
-    const latest = "2026-08-28T12:00:00.000Z";
-    @memcpy(encounter.latest[0..latest.len], latest);
-    encounter.latest_len = latest.len;
-    var output: [4096]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&output);
-    var recent_matches = RecentMatchesView.parse(matches);
-    defer recent_matches.deinit();
-    try writeRecentTags(&writer, recent_matches.items, "TOP", 0, encounter);
-    const result = writer.buffered();
-    const met_index = std.mem.indexOf(u8, result, "遇到过") orelse return error.TestUnexpectedResult;
-    const gank_index = std.mem.indexOf(u8, result, "非常好抓") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(met_index < gank_index);
-    try std.testing.expect(std.mem.indexOf(u8, result, "共遇到过 2 次") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, latest) != null);
-}
-
-test "matches LeagueAkari easy-gank thresholds" {
-    const cases = [_]struct {
-        matches: []const u8,
-        position: []const u8 = "TOP",
-        expected: ?[]const u8,
-    }{
-        .{ .matches = "[{\"durationMinutes\":20,\"earlyDeathsWithEnemyJungler\":3},{\"durationMinutes\":20,\"earlyDeathsWithEnemyJungler\":2}]", .expected = "非常好抓" },
-        .{ .matches = "[{\"durationMinutes\":20,\"earlyDeathsWithEnemyJungler\":2},{\"durationMinutes\":20,\"earlyDeathsWithEnemyJungler\":1}]", .expected = "好抓" },
-        .{ .matches = "[{\"durationMinutes\":20,\"earlyDeathsWithEnemyJungler\":1},{\"durationMinutes\":20,\"earlyDeathsWithEnemyJungler\":1}]", .expected = null },
-        .{ .matches = "[{\"durationMinutes\":20,\"earlyDeathsWithEnemyJungler\":0},{\"durationMinutes\":20,\"earlyDeathsWithEnemyJungler\":1}]", .expected = "难抓" },
-        .{ .matches = "[{\"durationMinutes\":20,\"earlyDeathsWithEnemyJungler\":3}]", .position = "JUNGLE", .expected = null },
-    };
-    for (cases) |case| {
-        var output: [4096]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&output);
-        var recent_matches = RecentMatchesView.parse(case.matches);
-        defer recent_matches.deinit();
-        try writeRecentTags(&writer, recent_matches.items, case.position, 0, .{});
-        if (case.expected) |label| {
-            try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), label) != null);
-        } else {
-            try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "好抓") == null);
-            try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "难抓") == null);
-        }
-    }
-}
-
-test "keeps encounter label when recent match history is unavailable" {
-    var encounter = EncounterSummary{ .count = 1 };
-    const latest = "2026-08-28T12:00:00.000Z";
-    @memcpy(encounter.latest[0..latest.len], latest);
-    encounter.latest_len = latest.len;
-    var output: [1024]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&output);
-    var recent_matches = RecentMatchesView.parse("[]");
-    defer recent_matches.deinit();
-    try writeRecentTags(&writer, recent_matches.items, "TOP", 0, encounter);
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
-    try std.testing.expectEqualStrings("met", jsonField(parsed.value.array.items[0], "key"));
-    try std.testing.expectEqualStrings("遇到过", jsonField(parsed.value.array.items[0], "label"));
-}
-
 test "normalizes friend groups and friend-since dates" {
     var state = Runtime.init();
     const groups = "[{\"id\":7,\"name\":\"双排\",\"priority\":2}]";
@@ -8068,7 +8086,7 @@ fn writeProfileWithGroupIndexed(writer: *std.Io.Writer, participant: std.json.Va
     try jsonString(writer, position);
     try writer.writeAll(",\"summonerSpells\":");
     try writeSummonerSpells(writer, participant);
-    try writer.writeAll(",\"rankTier\":\"\",\"rankDivision\":\"\",\"leaguePoints\":0,\"wins\":0,\"losses\":0,\"soloRank\":null,\"flexRank\":null,\"recentMatches\":[],\"topChampions\":[],\"score\":{\"total\":0,\"confidence\":0,\"components\":[]},\"tags\":[],\"junglePreference\":null,\"encounterCount\":0,\"lastEncounteredAt\":null");
+    try writer.writeAll(",\"rankTier\":\"\",\"rankDivision\":\"\",\"leaguePoints\":0,\"wins\":0,\"losses\":0,\"soloRank\":null,\"flexRank\":null,\"recentMatches\":[],\"topChampions\":[],\"score\":{\"total\":0,\"confidence\":0,\"components\":[]},\"junglePreference\":null,\"encounterCount\":0,\"lastEncounteredAt\":null");
     try writePremadeFields(writer, participant, group_members);
     try writer.writeAll(",\"positionGames\":0,\"positionWinRate\":0,\"currentChampionGames\":0,\"currentChampionWinRate\":0,\"championPoolConcentration\":0,\"dataComplete\":false,\"unavailableSources\":[\"lcu\"],\"dataStatus\":{\"source\":\"lcu\",\"fetchedAt\":\"1970-01-01T00:00:00.000Z\",\"expiresAt\":null,\"isStale\":false,\"error\":null},\"side\":");
     try jsonString(writer, side);

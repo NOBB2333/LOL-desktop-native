@@ -1,2 +1,5 @@
 allowBuilds:
-  vue-demi: set this to true or false
+  # vue-demi ships a Vue 3 build in lib/ by default; its postinstall only
+  # rewrites lib/ when Vue 2 is installed. The peer resolves to Vue 3 here, so
+  # the script is a no-op for us -- deny it and keep installs reproducible.
+  vue-demi: false

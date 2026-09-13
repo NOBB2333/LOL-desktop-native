@@ -25,7 +25,9 @@ pub const Store = struct {
 
     fn scopedKind(self: *const Store, kind: []const u8, buffer: []u8) ![]const u8 {
         // 配置和公共静态资源仍共用；玩家及对局缓存必须绑定账号和大区。
-        if (std.mem.eql(u8, kind, "config") or std.mem.eql(u8, kind, "settings") or std.mem.eql(u8, kind, "cache")) return kind;
+        // 玩家标记的键自带「谁写的」，因此同样不需要账号作用域。
+        if (std.mem.eql(u8, kind, "config") or std.mem.eql(u8, kind, "settings") or
+            std.mem.eql(u8, kind, "cache") or std.mem.eql(u8, kind, "playerTag")) return kind;
         if (self.scope_len == 0) return if (self.require_scope) error.CacheScopeUnavailable else kind;
         return std.fmt.bufPrint(buffer, "{s}/{s}", .{ kind, self.scope[0..self.scope_len] });
     }

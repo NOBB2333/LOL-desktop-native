@@ -16,6 +16,8 @@ import type {
   SpellSummary,
   TeamSummary,
 } from "../types/domain";
+import { defaultPlayerTagSettings } from "../tags/settings";
+import { playerSignals, teamSignals } from "../tags/signals";
 
 const now = Date.now();
 const champions = [
@@ -124,25 +126,12 @@ function makePlayer(index: number, ally: boolean, rankedOnly = false): PlayerPro
   const wins = matches.filter((match) => match.win).length;
   const kda = matches.reduce((sum, match) => sum + (match.kills + match.assists) / Math.max(1, match.deaths), 0) / matches.length;
   const score = Math.round((58 + wins * 2.8 + Math.min(kda, 5) * 2.2 + (rankTier === "MASTER" ? 10 : 0)) * 10) / 10;
-  const tags: PlayerProfile["tags"] = [];
-  const averageSoloKills = matches.reduce((sum, match) => sum + (match.soloKills ?? 0), 0) / matches.length;
-  const averageDeaths = matches.reduce((sum, match) => sum + match.deaths, 0) / matches.length;
-  const averageParticipation = matches.reduce((sum, match) => sum + match.killParticipation, 0) / matches.length;
-  if (averageSoloKills >= 0.4) tags.push({ key: "soloThreat", label: "单杀威胁", tone: "danger", evidence: `10场精确数据，场均单杀 ${averageSoloKills.toFixed(1)} 次` });
-  if (averageDeaths >= 6) tags.push({ key: "highDeaths", label: "阵亡偏多", tone: "warning", evidence: `近10场场均阵亡 ${averageDeaths.toFixed(1)} 次` });
-  else if (averageDeaths <= 3) tags.push({ key: "survivor", label: "生存稳健", tone: "success", evidence: `近10场场均阵亡 ${averageDeaths.toFixed(1)} 次` });
-  if (averageParticipation >= 0.62) tags.push({ key: "highParticipation", label: "参团积极", tone: "success", evidence: `近10场平均参团率 ${Math.round(averageParticipation * 100)}%` });
-  if (wins >= 7) tags.push({ key: "hot", label: "状态火热", tone: "success", evidence: `近10场 ${wins} 胜` });
-  if (wins <= 3) tags.push({ key: "slump", label: "近期低迷", tone: "danger", evidence: `近10场仅 ${wins} 胜` });
-  if (index === 1) tags.push({ key: "autofill", label: "位置样本少", tone: "warning", evidence: "近10场同位置 4 场" });
-  if (index === 2) tags.push({ key: "signature", label: "当前英雄熟练", tone: "success", evidence: "当前英雄 5 场" });
-  if (index === 2) tags.unshift({ key: "met", label: "遇到过", tone: "info", evidence: "近期战绩中遇到过 3 次" });
-  if (!tags.length) tags.push({ key: "stable", label: "状态稳定", tone: "info", evidence: "近期表现无明显波动" });
   const topChampions = [
     { championId: id, championName, games: 63 - index * 5, wins: 39 - index * 2, winRate: 0.62 - index * 0.01 },
     { championId: champions[(index + 1) % 5][0], championName: champions[(index + 1) % 5][1], games: 31, wins: 18, winRate: 0.58 },
     { championId: champions[(index + 2) % 5][0], championName: champions[(index + 2) % 5][1], games: 19, wins: 10, winRate: 0.53 },
   ];
+  const averageParticipation = matches.reduce((sum, match) => sum + match.killParticipation, 0) / matches.length;
   const averageCsPerMinute = matches.reduce((sum, match) => sum + match.cs / Math.max(1, match.durationMinutes), 0) / matches.length;
   const averageEarlyTakedowns = role === "JUNGLE" ? matches.reduce((sum, match) => sum + (match.takedownsFirstXMinutes ?? 0), 0) / matches.length : null;
   const averageObjectiveTakedowns = role === "JUNGLE" ? matches.reduce((sum, match) => sum + (match.dragonTakedowns ?? 0) + (match.baronTakedowns ?? 0) + (match.riftHeraldTakedowns ?? 0), 0) / matches.length : null;
@@ -192,7 +181,6 @@ function makePlayer(index: number, ally: boolean, rankedOnly = false): PlayerPro
         { key: "pool", label: "英雄池", score: 4, maxScore: 5, evidence: "主要使用 3 个英雄" },
       ],
     },
-    tags,
     junglePreference,
     encounterCount: index === 2 ? 3 : index % 2,
     lastEncounteredAt: index === 2 ? new Date(now - 12 * 86400000).toISOString() : null,
@@ -211,13 +199,21 @@ function makePlayer(index: number, ally: boolean, rankedOnly = false): PlayerPro
 
 function summary(side: "ally" | "enemy", players: PlayerProfile[]): TeamSummary {
   const score = players.reduce((sum, player) => sum + player.score.total, 0) / players.length;
+  // 与后端 `writeLiveTeamSummary` 同口径：优势 / 风险取自 `player_signals` 那份信号表。
+  const { strengths, risks } = teamSignals(players, { emptyStrengths: "整体状态稳定", emptyRisks: "暂无明显风险" });
   return {
     side,
     score: Math.round(score * 10) / 10,
     title: score >= 78 ? "状态占优" : "整体均衡",
     focusPlayerPuuid: players.reduce((lowest, player) => player.score.total < lowest.score.total ? player : lowest).puuid,
-    strengths: players.filter((player) => player.tags.some((tag) => tag.tone === "success")).slice(0, 2).map((player) => `${player.championName}：${player.tags[0].label}`),
-    risks: players.filter((player) => player.tags.some((tag) => ["warning", "danger"].includes(tag.tone))).slice(0, 2).map((player) => `${player.championName}：${player.tags[0].label}`),
+    strengths: strengths.slice(0, 2).map((label) => {
+      const owner = players.find((player) => playerSignals(player).some((signal) => signal.label === label));
+      return owner ? `${owner.championName}：${label}` : label;
+    }),
+    risks: risks.slice(0, 2).map((label) => {
+      const owner = players.find((player) => playerSignals(player).some((signal) => signal.label === label));
+      return owner ? `${owner.championName}：${label}` : label;
+    }),
     composition: { early: side === "ally" ? 76 : 72, mid: side === "ally" ? 84 : 78, late: side === "ally" ? 71 : 82, teamfight: side === "ally" ? 86 : 79 },
   };
 }
@@ -406,8 +402,9 @@ export const fixtureFriends: FriendToolsSnapshot = {
 };
 
 export const fixtureConfig: AppConfig = {
-  version: 18,
+  version: 19,
   appearance: { theme: "mint", colorMode: "light", compact: false },
+  playerTags: { ...defaultPlayerTagSettings },
   connection: { kind: "local", sshTarget: "", identityFile: "", forwardedPort: 0 },
   automation: {
     enabled: true,

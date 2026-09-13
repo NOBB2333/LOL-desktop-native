@@ -19,16 +19,21 @@
 
 ## 开发
 
-需要 Node.js 24.15.0（见 `.node-version`）、npm/pnpm、Zig 0.16 和 Native SDK CLI。若 SDK 安装在全局目录，Zig 命令需要显式传入 `-Dnative-sdk-path=<SDK路径>`；默认路径是项目内的 `node_modules/@native-sdk/cli`。
+需要 Node.js 24.15.0（见 `.node-version`）、**pnpm 12**（前端依赖只能用 pnpm，见下）、Zig 0.16 和 Native SDK CLI。若 SDK 安装在全局目录，Zig 命令需要显式传入 `-Dnative-sdk-path=<SDK路径>`；默认路径是项目内的 `node_modules/@native-sdk/cli`。
 
 ```sh
-npm install --prefix frontend
-npm run build --prefix frontend
-npm run typecheck --prefix frontend
-npm test --prefix frontend
+pnpm --dir frontend install
+pnpm --dir frontend run build
+pnpm --dir frontend run typecheck
+pnpm --dir frontend test
 native check . --strict
 zig build test -Dplatform=null
 ```
+
+> 前端依赖**必须**用 pnpm：仓库提交的是 `frontend/pnpm-lock.yaml`。
+> 用 `npm install --prefix frontend` 会把仓库根的 `package.json`（它只为
+> `build.zig` 提供 `@native-sdk/cli`）以 `"lol-desktop-native-root": "file:.."`
+> 写进 `frontend/package.json`，每次安装都会重新出现。
 
 启动 Native WebView 壳和 Vite：
 

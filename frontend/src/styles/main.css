@@ -1774,3 +1774,109 @@ a {
 .runtime-error-banner { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 12px; min-height: 34px; padding: 6px 16px; border-bottom: 1px solid var(--red); color: var(--red); background: var(--red-soft); font-size: 11px; font-weight: 600; }
 .runtime-error-banner span { min-width: 0; overflow-wrap: anywhere; }
 .runtime-error-banner button { display: grid; flex: 0 0 26px; width: 26px; height: 26px; padding: 0; border: 0; color: currentColor; background: transparent; cursor: pointer; place-items: center; }
+
+/* ---------------------------------------------------------------------------
+ * 标签系统（对齐 LeagueAkari 的 chip 规范）
+ * 所有标签共用一个 `.tag-chip` 尺寸，颜色由 tone 令牌决定；
+ * 需要动态配色（如开黑分组）时用内联 --tag-bg / --tag-fg 覆盖。
+ * ------------------------------------------------------------------------- */
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 5px;
+  border: 0;
+  border-radius: 3px;
+  color: var(--tag-fg, var(--text-primary));
+  background: var(--tag-bg, var(--surface-muted));
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 15px;
+  white-space: nowrap;
+}
+
+/* 色值直接对应 LeagueAkari 各标签的固定 class，保证同一个标签在两边看起来一致。 */
+.tag-chip--self { --tag-bg: #37246c; --tag-fg: #ffffff; }
+.tag-chip--premade { --tag-bg: #64748b; --tag-fg: #ffffff; }
+.tag-chip--met { --tag-bg: #5cacea; --tag-fg: #000000; }
+.tag-chip--note { --tag-bg: #49914d; --tag-fg: #ffffff; }
+.tag-chip--win-rate { --tag-bg: #7e2c85; --tag-fg: #ffffff; }
+.tag-chip--privacy { --tag-bg: #870808; --tag-fg: #ffffff; }
+.tag-chip--streak-win { --tag-bg: #18571c; --tag-fg: #ffffff; }
+.tag-chip--streak-loss { --tag-bg: #893b3b; --tag-fg: #ffffff; }
+.tag-chip--score { --tag-bg: #b81b86; --tag-fg: #ffffff; }
+.tag-chip--gank-hard { --tag-bg: #24606d; --tag-fg: #ffffff; }
+.tag-chip--gank-easy { --tag-bg: #8f541e; --tag-fg: #ffffff; }
+.tag-chip--gank-very-easy { --tag-bg: #a81919; --tag-fg: #ffffff; }
+.tag-chip--solo { --tag-bg: #9019a8; --tag-fg: #ffffff; }
+.tag-chip--damage { --tag-bg: #692723; --tag-fg: #ffffff; }
+.tag-chip--cs { --tag-bg: #5a4a1f; --tag-fg: #ffffff; }
+.tag-chip--vision { --tag-bg: #2451a6; --tag-fg: #ffffff; }
+.tag-chip--good { --tag-bg: #04614b; --tag-fg: #ffffff; }
+.tag-chip--warn { --tag-bg: #8f541e; --tag-fg: #ffffff; }
+.tag-chip--danger { --tag-bg: #a81919; --tag-fg: #ffffff; }
+.tag-chip--info { --tag-bg: #2451a6; --tag-fg: #ffffff; }
+.tag-chip--neutral { --tag-bg: #6b7280; --tag-fg: #ffffff; }
+
+/* 深色模式：仅把底色压暗一点点保证与深色卡片的对比，文字保持白色（met 仍为黑字）。 */
+:root[data-color-mode="dark"] .tag-chip--self { --tag-bg: #4b3488; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--premade { --tag-bg: #4b5563; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--met { --tag-bg: #5cacea; --tag-fg: #000000; }
+:root[data-color-mode="dark"] .tag-chip--note { --tag-bg: #3f7d43; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--win-rate { --tag-bg: #8f3a97; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--privacy { --tag-bg: #a01b1b; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--streak-win { --tag-bg: #226b28; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--streak-loss { --tag-bg: #9c4a4a; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--score { --tag-bg: #c92f96; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--gank-hard { --tag-bg: #2e7484; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--gank-easy { --tag-bg: #a4641f; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--gank-very-easy { --tag-bg: #c22020; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--solo { --tag-bg: #a52bc0; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--damage { --tag-bg: #7d322d; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--cs { --tag-bg: #6d5926; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--vision { --tag-bg: #2b62c4; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--good { --tag-bg: #0a7a5e; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--warn { --tag-bg: #a4641f; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--danger { --tag-bg: #c22020; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--info { --tag-bg: #2b62c4; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--neutral { --tag-bg: #4b5563; --tag-fg: #ffffff; }
+
+.tag-chip--interactive {
+  cursor: pointer;
+}
+
+.tag-chip--interactive:hover {
+  filter: brightness(1.08);
+}
+
+/* 可点击标签的外层按钮：去掉浏览器默认外观，只让内部 chip 承担视觉。 */
+.tag-clickable {
+  display: inline-flex;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.tag-clickable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+
+.tag-notes {
+  display: grid;
+  gap: 5px;
+  max-width: 260px;
+}
+
+.tag-notes__item {
+  padding: 4px 6px;
+  border-left: 2px solid var(--green);
+  color: var(--text-secondary);
+  background: var(--surface-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}

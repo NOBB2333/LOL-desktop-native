@@ -62,9 +62,9 @@ describe("PlayerDetailDrawer", () => {
     await flushPromises();
     finishFirst(structuredClone(fixtureEncounters));
     await flushPromises();
-    const rows = wrapper.findAll('[data-testid="encounter-match-open"]');
+    const rows = wrapper.findAll('[data-testid="met-inspect"]');
     expect(rows).toHaveLength(1);
-    expect(rows[0].text()).toContain("新玩家英雄");
+    expect(rows[0].text()).toContain("7654321");
     expect(wrapper.text()).not.toContain("最近一年");
     wrapper.unmount();
   });
@@ -116,13 +116,22 @@ describe("PlayerDetailDrawer", () => {
     await flushPromises();
 
     expect(encounters).toHaveBeenCalledWith(player.puuid, 40, Number(fixtureLobby.id) || 0);
-    expect(wrapper.text()).toContain(`${fixtureLobby.ally[0].gameName}#${fixtureLobby.ally[0].tagLine}`);
-    expect(wrapper.text()).toContain(`${player.gameName}#${player.tagLine}`);
-    expect(wrapper.get("[data-testid='encounter-tag']").text()).toContain(player.championName);
-    expect(wrapper.get("[data-testid='encounter-tag']").text()).toMatch(/\d+\/\d+\/\d+/);
-    expect(wrapper.findAll("[data-testid='encounter-tag-match']")).toHaveLength(3);
-    expect(wrapper.findAll("[data-testid='encounter-match-open']")).toHaveLength(3);
-    await wrapper.get("[data-testid='encounter-match-open']").trigger("click");
+    // 「遇到过的对局」分区复用标签系统的表格弹层：两侧玩家一列自己、一列该玩家。
+    const table = wrapper.get(".player-drawer__encounters .met-table");
+    expect(table.findAll("thead th").map((cell) => cell.text())).toEqual([
+      "对局 ID",
+      "对局日期",
+      "结果",
+      "关系",
+      "自己",
+      player.gameName,
+    ]);
+    const rows = table.findAll("[data-testid='met-row']");
+    expect(rows).toHaveLength(3);
+    // 每一行都同时给出自己与该玩家的 KDA。
+    expect(rows[0].findAll("td")).toHaveLength(6);
+    expect(rows[0].text()).toMatch(/\d+\/\d+\/\d+/);
+    await wrapper.get("[data-testid='met-inspect']").trigger("click");
     expect(wrapper.get("[data-testid='encounter-modal']").text()).toBe("9");
   });
 
@@ -208,6 +217,6 @@ describe("PlayerDetailDrawer", () => {
 
     expect(encounters).not.toHaveBeenCalled();
     expect(wrapper.text()).not.toContain("遇到过的对局");
-    expect(wrapper.find("[data-testid='encounter-tag']").exists()).toBe(false);
+    expect(wrapper.find("[data-testid='player-tags'] .tag-chip--met").exists()).toBe(false);
   });
 });
