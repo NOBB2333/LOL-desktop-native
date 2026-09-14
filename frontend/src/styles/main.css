@@ -1833,6 +1833,12 @@ a {
 :root[data-color-mode="dark"] .tag-chip--gank-very-easy { --tag-bg: #c22020; --tag-fg: #ffffff; }
 :root[data-color-mode="dark"] .tag-chip--solo { --tag-bg: #a52bc0; --tag-fg: #ffffff; }
 :root[data-color-mode="dark"] .tag-chip--damage { --tag-bg: #7d322d; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--damage-taken { --tag-bg: #1a6b31; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--gold { --tag-bg: #c24a33; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--damage-gold { --tag-bg: #a54e24; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--kill-damage { --tag-bg: #04614b; --tag-fg: #ffffff; }
+:root[data-color-mode="dark"] .tag-chip--pings { --tag-bg: #e7da30; --tag-fg: #000000; }
+:root[data-color-mode="dark"] .tag-chip--flash { --tag-bg: #4c2ad6; --tag-fg: #ffffff; }
 :root[data-color-mode="dark"] .tag-chip--cs { --tag-bg: #6d5926; --tag-fg: #ffffff; }
 :root[data-color-mode="dark"] .tag-chip--vision { --tag-bg: #2b62c4; --tag-fg: #ffffff; }
 :root[data-color-mode="dark"] .tag-chip--good { --tag-bg: #0a7a5e; --tag-fg: #ffffff; }

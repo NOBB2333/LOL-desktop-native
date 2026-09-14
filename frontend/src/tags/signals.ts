@@ -9,39 +9,27 @@
  * - 快捷消息模板里的 `{tag}` / `{streak}` / `{risk}`（`services/backend.ts`）
  *
  * 为了不出现「同一概念两套说法」：
- * - **阈值**全部 import 自 `definitions/`，不存在第二份数字；
- * - **文案**全部来自 `definitions/` 导出的常量与函数；
+ * - **阈值**全部 import 自 `definitions/` 与 `facts.ts`，不存在第二份数字；
+ * - **文案**全部来自上面导出的常量与函数；
  * - 分档顺序与 `backend/player_signals.zig` 的 `emitAll` 保持一致。
+ *
+ * 注意这里**只保留 LeagueAkari 有的那几档**：极高胜率、连胜连败、好抓难抓、
+ * 击杀伤害转化、场均单杀。此前本项目自己加的「阵亡偏多 / 参团偏低 / 英雄池集中」
+ * 三档已随标签系统一并删除——它们是噪声的主要来源。
  */
 import type { PlayerProfile } from "../types/domain";
-import { deriveTagFacts, type PlayerTagFacts } from "./facts";
+import { deriveTagFacts, SOLO_KILL_MIN_SAMPLE, type PlayerTagFacts } from "./facts";
 import {
+  EASY_GANK_LABELS,
   HIGH_WIN_RATE_LABEL,
   HIGH_WIN_RATE_MIN_SAMPLE,
   HIGH_WIN_RATE_THRESHOLD,
-  STREAK_THRESHOLD,
-  streakLabel,
-} from "./definitions/performance";
-import {
-  AVERAGE_MIN_SAMPLE,
-  DAMAGE_CORE_THRESHOLD,
-  DEATHS_HIGH_LABEL,
-  DEATHS_LOW_LABEL,
-  EASY_GANK_LABELS,
-  HIGH_DEATH_THRESHOLD,
-  HIGH_PARTICIPATION_THRESHOLD,
-  LOW_DEATH_THRESHOLD,
-  LOW_PARTICIPATION_THRESHOLD,
-  PARTICIPATION_HIGH_LABEL,
-  PARTICIPATION_LOW_LABEL,
-  POOL_CONCENTRATION_LABEL,
-  POOL_CONCENTRATION_THRESHOLD,
-  SOLO_KILL_MIN_SAMPLE,
-  STRONG_FARM_THRESHOLD,
-  csPerMinuteLabel,
-  damageShareLabel,
+  resolveEasyGankTag,
+  resolveKillDamageEfficiency,
   soloKillsLabel,
-} from "./definitions/playstyle";
+  streakLabel,
+  STREAK_THRESHOLD,
+} from "./definitions/basic";
 
 /**
  * 信号倾向。`neutral` 与 `positive` 同进 strengths（只是陈述，不是优点）。
@@ -53,10 +41,6 @@ export interface PlayerSignal {
   label: string;
   polarity: SignalPolarity;
 }
-
-/** 好抓判定阈值，与 `EASY_GANK_TAG` 注释里的四档一致。 */
-const GANK_VERY_EASY_THRESHOLD = 2;
-const GANK_EASY_THRESHOLD = 1.5;
 
 /** 按与后端 `emitAll` 相同的顺序产出全部信号。 */
 export function playerSignals(profile: PlayerProfile, facts = deriveTagFacts(profile)): PlayerSignal[] {
@@ -73,36 +57,26 @@ export function playerSignals(profile: PlayerProfile, facts = deriveTagFacts(pro
   if (facts.winningStreak >= STREAK_THRESHOLD) push(`${facts.winningStreak} 连胜`, "positive");
   if (facts.losingStreak >= STREAK_THRESHOLD) push(`${facts.losingStreak} 连败`, "negative");
 
-  if (!facts.isJungler && facts.averageEarlyDeathsWithJungler !== null) {
-    const times = facts.averageEarlyDeathsWithJungler;
-    if (times > GANK_VERY_EASY_THRESHOLD) push(EASY_GANK_LABELS["very-easy-gank"], "negative");
-    else if (times >= GANK_EASY_THRESHOLD) push(EASY_GANK_LABELS["easy-gank"], "negative");
-    else if (times < 1) push(EASY_GANK_LABELS["hard-gank"], "positive");
-  }
+  const gank = resolveEasyGankTag(
+    facts.averageEarlyDeathsWithJungler,
+    facts.earlyDeathsSample,
+    facts.isJungler,
+  );
+  if (gank) push(EASY_GANK_LABELS[gank.kind], gank.kind === "hard-gank" ? "positive" : "negative");
 
-  if (facts.soloKillsSample >= SOLO_KILL_MIN_SAMPLE && facts.averageSoloKills !== null && facts.averageSoloKills > 0) {
+  const killDamage = resolveKillDamageEfficiency(facts.avgKillDamageEfficiency);
+  if (killDamage === "high") push("击杀伤害转化高", "positive");
+  else if (killDamage === "low") push("击杀伤害转化低", "negative");
+
+  // 闪现一会儿放 D、一会儿放 F：在「是不是本人」这件事上比战绩更有信息量。
+  if (facts.flashOnD > 0 && facts.flashOnF > 0) push("闪现位置可疑", "negative");
+
+  if (
+    facts.soloKillsSample >= SOLO_KILL_MIN_SAMPLE &&
+    facts.averageSoloKills !== null &&
+    facts.averageSoloKills > 0
+  ) {
     push(soloKillsLabel(facts.averageSoloKills), "neutral");
-  }
-
-  if (facts.sample >= AVERAGE_MIN_SAMPLE) {
-    if (facts.averageDamageShare >= DAMAGE_CORE_THRESHOLD) {
-      push(damageShareLabel(facts.averageDamageShare), "positive");
-    }
-    if (facts.averageCsPerMinute >= STRONG_FARM_THRESHOLD) {
-      push(csPerMinuteLabel(facts.averageCsPerMinute), "neutral");
-    }
-    if (facts.averageDeaths >= HIGH_DEATH_THRESHOLD) push(DEATHS_HIGH_LABEL, "negative");
-    else if (facts.averageDeaths <= LOW_DEATH_THRESHOLD) push(DEATHS_LOW_LABEL, "positive");
-
-    if (facts.averageParticipation >= HIGH_PARTICIPATION_THRESHOLD) {
-      push(PARTICIPATION_HIGH_LABEL, "positive");
-    } else if (facts.averageParticipation > 0 && facts.averageParticipation <= LOW_PARTICIPATION_THRESHOLD) {
-      push(PARTICIPATION_LOW_LABEL, "negative");
-    }
-  }
-
-  if (profile.championPoolConcentration >= POOL_CONCENTRATION_THRESHOLD) {
-    push(POOL_CONCENTRATION_LABEL, "negative");
   }
 
   return signals;

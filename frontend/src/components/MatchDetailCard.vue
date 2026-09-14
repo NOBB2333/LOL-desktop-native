@@ -9,15 +9,44 @@ const props = withDefaults(defineProps<{
   match: MatchSummary | RecentMatch;
   expanded?: boolean;
   compact?: boolean;
-  clickable?: boolean;
+  /**
+   * 宿主显式声明「这一行可以展开」。
+   *
+   * 默认判定看数据形态：带 `participants` 的 `MatchSummary` 本来就能展开。
+   * 首页 / 对局页拿到的行本身没有 `participants`（只有查询者本人一条），
+   * 展开能力由宿主用 `useMatchDetail` 补上，那些场景必须显式传 `true`，
+   * 否则箭头不渲染、点了也没反应。
+   *
+   * 只做「额外允许」，不做「禁止」：`boolean` 类型的 prop 在 Vue 里缺省会被强转成
+   * `false`，写成 `props.expandable ?? isSummary(...)` 会让所有不传它的调用方都失去
+   * 展开能力（这正是之前首页点不动的原因）。没有任何调用方需要禁止展开，所以用
+   * `isSummary(...) || expandable === true`。
+   */
+  expandable?: boolean;
   /** 展开后正在按 gameId 拉完整十人数据。 */
   detailLoading?: boolean;
   /** 完整十人数据读取失败的原因；空串表示没有失败。 */
   detailError?: string;
-}>(), { expanded: false, compact: false, clickable: false, detailLoading: false, detailError: "" });
+}>(), { expanded: false, compact: false, detailLoading: false, detailError: "" });
 
 const emit = defineEmits<{ toggle: [] }>();
 const isSummary = (match: MatchSummary | RecentMatch): match is MatchSummary => "participants" in match;
+/** 这一行能不能展开：带 `participants` 的数据自带十人明细，或者宿主显式允许。 */
+const canExpand = computed(() => isSummary(props.match) || props.expandable === true);
+/**
+ * 展开后要渲染的那份「有十人明细」的数据。
+ *
+ * 宿主会把 `useMatchDetail().matchForRow()` 的结果传进来，所以明细到位后这里才会有值；
+ * 在此之前是 null —— 模板据此走「正在读取这局的十人数据…」分支，而不是硬渲染
+ * 一份不存在 `participants` 的列表数据。
+ */
+const summary = computed<MatchSummary | null>(() => (isSummary(props.match) ? props.match : null));
+const banRows = computed(() => (summary.value ? banGroups(summary.value) : []));
+const teamRows = computed(() => (summary.value ? participantGroups(summary.value) : []));
+const teamKillsText = computed(() => {
+  const value = summary.value?.teamKills;
+  return typeof value === "number" ? String(value) : "—";
+});
 const unfinished = (match: MatchSummary | RecentMatch) => match.durationMinutes === 0;
 const win = (match: MatchSummary | RecentMatch) => !unfinished(match) && ("win" in match ? match.win : match.result === "胜利");
 const resultLabel = (match: MatchSummary | RecentMatch) => unfinished(match) ? "未完成" : win(match) ? "胜利" : "失败";
@@ -44,7 +73,7 @@ const itemSlots = Array.from({ length: 8 }, (_, index) => index);
 const itemAt = (match: MatchSummary | RecentMatch, index: number) => match.items[index] ?? null;
 const participantItems = (participant: MatchSummary["participants"][number]) => participant.items ?? [];
 /** 仍然是列表级数据（只有查询者本人），十人详情还没到位。 */
-const incompleteParticipants = computed(() => (props.match as MatchSummary).participants.length < 2);
+const incompleteParticipants = computed(() => !isSummary(props.match) || props.match.participants.length < 2);
 const participantSpells = (participant: MatchSummary["participants"][number]) => participant.summonerSpells ?? [];
 const participantRunes = (participant: MatchSummary["participants"][number]) => participant.runes ?? [];
 const participantGroups = (match: MatchSummary) => [
@@ -65,7 +94,9 @@ const banGroups = (match: MatchSummary) => {
   ];
 };
 function toggleFromRow(event: MouseEvent) {
-  if (!props.clickable || !isSummary(props.match)) return;
+  // 只要这一行能展开，点行身也应该展开：首页 / 对局页的行本来就没有单独的可点区域，
+  // 之前这里额外要求 `clickable`，结果那些页面上点击毫无反应（只有右上角小箭头能用）。
+  if (!canExpand.value) return;
   const target = event.target as HTMLElement | null;
   if (!target?.closest) return;
   // 详情区是行的子节点：在里面选文字、点图标都算「看详情」，不该把刚展开的行收回去。
@@ -79,7 +110,8 @@ function toggleFromRow(event: MouseEvent) {
 <template>
   <article
     class="match-row"
-    :class="[`match-row--${resultClass(match)}`, { 'match-row--compact': compact, 'match-row--clickable': clickable && isSummary(match) }]"
+    :class="[`match-row--${resultClass(match)}`, { 'match-row--compact': compact, 'match-row--clickable': canExpand }]"
+    :data-game-id="match.gameId"
     :aria-label="`${resultLabel(match)}，${match.championName}，${match.kills}/${match.deaths}/${match.assists}`"
     @click="toggleFromRow"
   >
@@ -157,7 +189,7 @@ function toggleFromRow(event: MouseEvent) {
     </div>
 
     <button
-      v-if="isSummary(match)"
+      v-if="canExpand"
       class="match-row__toggle"
       type="button"
       :aria-expanded="expanded"
@@ -178,35 +210,38 @@ function toggleFromRow(event: MouseEvent) {
       </div>
     </div>
 
-    <section v-if="expanded && isSummary(match)" class="match-row__detail">
+    <section v-if="expanded && canExpand" class="match-row__detail">
       <header>
         <div><span class="eyebrow">MATCH DETAIL</span><h3>十人阵容与 BP</h3></div>
-        <span>队伍击杀 {{ match.teamKills }}</span>
+        <span>队伍击杀 {{ teamKillsText }}</span>
       </header>
       <!-- 列表接口每局只带查询者本人，十人数据要按 gameId 单独拉；这期间先说明情况。 -->
       <p v-if="incompleteParticipants && detailLoading" class="match-row__detail-status">正在读取这局的十人数据…</p>
       <p v-else-if="incompleteParticipants && detailError" class="match-row__detail-status" data-tone="warning">{{ detailError }}</p>
-      <div class="match-row__bans">
-        <section v-for="group in banGroups(match)" :key="group.key" :data-side="group.key"><span>{{ group.label }}</span><div><template v-for="ban in group.rows" :key="`${group.key}-${ban.id}-${ban.name}`"><span class="ban-chip" :title="ban.bannedBy ? `禁用者：${ban.bannedBy}` : ban.pickTurn ? `第 ${ban.pickTurn} 手禁用` : 'LCU 未提供具体禁用者'"><AssetIcon v-if="ban.id" kind="champion" :id="ban.id" :name="ban.name" :fallback-url="ban.iconUrl" size="sm" /><b>{{ ban.name }}</b><small v-if="ban.bannedBy">{{ ban.bannedBy }}</small><small v-else-if="ban.pickTurn">第{{ ban.pickTurn }}手</small></span></template><b v-if="!group.rows.length">暂无记录</b></div></section>
-      </div>
-      <div class="match-row__participants">
-        <section v-for="group in participantGroups(match)" :key="group.key" class="participant-team" :data-side="group.key">
-          <header><strong>{{ group.label }}</strong><span>{{ group.rows.length }} 人</span></header>
-          <div class="participant-team__rows">
-            <div v-for="participant in group.rows" :key="participant.puuid || `${participant.championId}-${participant.gameName}`" class="participant-line" :data-side="participant.side">
-              <AssetIcon class="participant-line__champion" kind="champion" :id="participant.championId" :name="participant.championName" :fallback-url="championImage(participant.championId)" size="sm" />
-              <span class="participant-line__identity"><strong>{{ participant.gameName }}<em v-if="participant.isBot">人机</em></strong><small>{{ participant.championName }} · {{ roleName(participant.position) }}</small></span>
-              <b class="participant-line__kda">{{ participant.kills }}/{{ participant.deaths }}/{{ participant.assists }}</b>
-              <span class="participant-line__metric participant-line__damage"><strong>{{ number(participant.damageDealt) }}</strong><small>英雄伤害</small></span>
-              <span class="participant-line__metric participant-line__economy"><strong>{{ number(participant.goldEarned) }}</strong><small>{{ participant.cs }} 补刀</small></span>
-              <span class="participant-line__icons participant-line__items"><AssetIcon v-for="item in participantItems(participant)" :key="`item-${participant.puuid}-${item.id}`" kind="item" :id="item.id" :name="item.name" :fallback-url="item.iconUrl" size="sm" /><i v-if="!participantItems(participant).length">无装备数据</i></span>
-              <span class="participant-line__icons participant-line__spells"><AssetIcon v-for="spell in participantSpells(participant)" :key="`spell-${participant.puuid}-${spell.id}`" kind="spell" :id="spell.id" :name="spell.name" :fallback-url="spell.iconUrl" size="sm" /><i v-if="!participantSpells(participant).length">无技能</i></span>
-              <span class="participant-line__icons participant-line__runes"><AssetIcon v-for="rune in participantRunes(participant)" :key="`rune-${participant.puuid}-${rune.id}`" kind="perk" :id="rune.id" :name="rune.name" :fallback-url="rune.iconUrl" size="sm" /><i v-if="!participantRunes(participant).length">无符文</i></span>
-              <span class="participant-line__metric participant-line__vision"><strong>{{ participant.wardsPlaced ?? 0 }}/{{ participant.wardsKilled ?? 0 }}</strong><small>视野 {{ participant.visionScore ?? 0 }}</small></span>
+      <p v-else-if="incompleteParticipants" class="match-row__detail-status">这局没有可用的十人明细（通常是人机、训练或数据源未提供）。</p>
+      <template v-if="summary">
+        <div class="match-row__bans">
+          <section v-for="group in banRows" :key="group.key" :data-side="group.key"><span>{{ group.label }}</span><div><template v-for="ban in group.rows" :key="`${group.key}-${ban.id}-${ban.name}`"><span class="ban-chip" :title="ban.bannedBy ? `禁用者：${ban.bannedBy}` : ban.pickTurn ? `第 ${ban.pickTurn} 手禁用` : 'LCU 未提供具体禁用者'"><AssetIcon v-if="ban.id" kind="champion" :id="ban.id" :name="ban.name" :fallback-url="ban.iconUrl" size="sm" /><b>{{ ban.name }}</b><small v-if="ban.bannedBy">{{ ban.bannedBy }}</small><small v-else-if="ban.pickTurn">第{{ ban.pickTurn }}手</small></span></template><b v-if="!group.rows.length">暂无记录</b></div></section>
+        </div>
+        <div class="match-row__participants">
+          <section v-for="group in teamRows" :key="group.key" class="participant-team" :data-side="group.key">
+            <header><strong>{{ group.label }}</strong><span>{{ group.rows.length }} 人</span></header>
+            <div class="participant-team__rows">
+              <div v-for="participant in group.rows" :key="participant.puuid || `${participant.championId}-${participant.gameName}`" class="participant-line" :data-side="participant.side">
+                <AssetIcon class="participant-line__champion" kind="champion" :id="participant.championId" :name="participant.championName" :fallback-url="championImage(participant.championId)" size="sm" />
+                <span class="participant-line__identity"><strong>{{ participant.gameName }}<em v-if="participant.isBot">人机</em></strong><small>{{ participant.championName }} · {{ roleName(participant.position) }}</small></span>
+                <b class="participant-line__kda">{{ participant.kills }}/{{ participant.deaths }}/{{ participant.assists }}</b>
+                <span class="participant-line__metric participant-line__damage"><strong>{{ number(participant.damageDealt) }}</strong><small>英雄伤害</small></span>
+                <span class="participant-line__metric participant-line__economy"><strong>{{ number(participant.goldEarned) }}</strong><small>{{ participant.cs }} 补刀</small></span>
+                <span class="participant-line__icons participant-line__items"><AssetIcon v-for="item in participantItems(participant)" :key="`item-${participant.puuid}-${item.id}`" kind="item" :id="item.id" :name="item.name" :fallback-url="item.iconUrl" size="sm" /><i v-if="!participantItems(participant).length">无装备数据</i></span>
+                <span class="participant-line__icons participant-line__spells"><AssetIcon v-for="spell in participantSpells(participant)" :key="`spell-${participant.puuid}-${spell.id}`" kind="spell" :id="spell.id" :name="spell.name" :fallback-url="spell.iconUrl" size="sm" /><i v-if="!participantSpells(participant).length">无技能</i></span>
+                <span class="participant-line__icons participant-line__runes"><AssetIcon v-for="rune in participantRunes(participant)" :key="`rune-${participant.puuid}-${rune.id}`" kind="perk" :id="rune.id" :name="rune.name" :fallback-url="rune.iconUrl" size="sm" /><i v-if="!participantRunes(participant).length">无符文</i></span>
+                <span class="participant-line__metric participant-line__vision"><strong>{{ participant.wardsPlaced ?? 0 }}/{{ participant.wardsKilled ?? 0 }}</strong><small>视野 {{ participant.visionScore ?? 0 }}</small></span>
+              </div>
             </div>
-          </div>
-        </section>
-      </div>
+          </section>
+        </div>
+      </template>
     </section>
   </article>
 </template>

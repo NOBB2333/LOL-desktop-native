@@ -154,7 +154,7 @@ describe("PlayerDetailDrawer", () => {
           AssetIcon: true,
           EncounterMatchModal: true,
           MatchDetailCard: {
-            props: ["match", "expanded", "clickable"],
+            props: ["match", "expanded", "expandable"],
             emits: ["toggle"],
             template: "<button data-testid='detailed-match' :data-participants='match.participants ? match.participants.length : 0' :data-expanded='String(expanded)' @click='$emit(\"toggle\")' />",
           },
@@ -190,7 +190,7 @@ describe("PlayerDetailDrawer", () => {
           AssetIcon: true,
           EncounterMatchModal: true,
           MatchDetailCard: {
-            props: ["match", "expanded", "clickable"],
+            props: ["match", "expanded", "expandable"],
             template: "<div data-testid='selected-detailed-match' :data-game-id='match.gameId' :data-expanded='String(expanded)' />",
           },
         },
@@ -198,7 +198,10 @@ describe("PlayerDetailDrawer", () => {
     });
     await flushPromises();
 
-    expect(matches).toHaveBeenCalledWith(`${player.gameName}#${player.tagLine}`, 1, 10);
+    // 目标那一局排在第二页（索引 10+）：抽屉必须把请求深度补到覆盖它，
+    // 否则自动展开会落空。后端总是先拉满 50 场窗口再本地切片，所以用
+    // 「起点 0 + 已加载条数」一次拿齐，不必按页并发再拼。
+    expect(matches).toHaveBeenCalledWith(`${player.gameName}#${player.tagLine}`, 0, 20);
     expect(wrapper.get("[data-testid='selected-detailed-match']").attributes("data-game-id")).toBe(String(selected.gameId));
     expect(wrapper.get("[data-testid='selected-detailed-match']").attributes("data-expanded")).toBe("true");
   });
@@ -222,7 +225,7 @@ describe("PlayerDetailDrawer", () => {
           AssetIcon: true,
           EncounterMatchModal: true,
           MatchDetailCard: {
-            props: ["match", "expanded", "clickable", "detailLoading", "detailError"],
+            props: ["match", "expanded", "expandable", "detailLoading", "detailError"],
             emits: ["toggle"],
             template: "<button data-testid='detail-row' :data-champion='match.championName' :data-participants='match.participants ? match.participants.length : 0' :data-expanded='String(expanded)' @click='$emit(\"toggle\")' />",
           },
@@ -243,6 +246,50 @@ describe("PlayerDetailDrawer", () => {
     expect(row.attributes("data-expanded")).toBe("true");
     expect(row.attributes("data-champion")).toBe("十人详情");
     expect(row.attributes("data-participants")).toBe("10");
+  });
+
+  it("roster 轮询换掉 player 对象引用时不会收起已展开的对局", async () => {
+    // LiveView 每 1.2~1.5s 会用后端快照重建 roster，`selectedPlayer` 因此每次都是
+    // 新对象：同 puuid、新引用。抽屉的 watch 不能因此把 expandedMatchId 重置为 null
+    // （否则用户手动展开的下拉框一秒后自己收回）。
+    const player = fixtureLobby.ally[2];
+    const wrapper = mount(PlayerDetailDrawer, {
+      props: { show: true, player },
+      global: {
+        plugins: testPlugins(),
+        stubs: {
+          Drawer: DrawerStub,
+          DrawerContent: DrawerContentStub,
+          Button: { template: "<button><slot name='icon' /><slot /></button>" },
+          AssetIcon: true,
+          EncounterMatchModal: true,
+          MatchDetailCard: {
+            props: ["match", "expanded", "expandable", "detailLoading", "detailError"],
+            emits: ["toggle"],
+            template: "<button class='poll-row' :data-game-id='match.gameId' :data-expanded='String(expanded)' @click='$emit(\"toggle\")' />",
+          },
+        },
+      },
+    });
+    await flushPromises();
+
+    const targetGameId = fixtureMatches[1].gameId;
+    const rowFor = () => wrapper.findAll(".poll-row").find((row) => row.attributes("data-game-id") === String(targetGameId))!;
+    await rowFor().trigger("click");
+    await flushPromises();
+    expect(rowFor().attributes("data-expanded")).toBe("true");
+
+    // 同 puuid、新对象引用 —— 相当于一次 roster 轮询。
+    await wrapper.setProps({ player: { ...player } });
+    await flushPromises();
+    expect(rowFor().attributes("data-expanded")).toBe("true");
+
+    // 真的换了人（不同 puuid）时才应该清空展开态。
+    await wrapper.setProps({ player: { ...player, puuid: "another-puuid" } });
+    await flushPromises();
+    expect(rowFor().attributes("data-expanded")).toBe("false");
+
+    wrapper.unmount();
   });
 
   it("does not load or show encounter history for a member of the local party", async () => {

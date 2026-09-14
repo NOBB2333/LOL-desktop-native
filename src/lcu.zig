@@ -146,6 +146,30 @@ pub const Client = struct {
         return error.NotRunning;
     }
 
+    /// 发现 **Riot Client** 本地服务凭据。
+    ///
+    /// 只有跨区 `名字#TAG → puuid`（`player-account/aliases/v1/lookup`）需要它，
+    /// 该接口在 RC 端口而不在 LCU 端口。复用与 LCU 相同的进程发现路径，但只用
+    /// [`fromRiotClientCommandLine`] 解析；找不到就返回 `error.NotRunning`，
+    /// 调用方据此降级为「只用当前大区的 LCU 查询」。
+    pub fn discoverRiotClient(allocator: std.mem.Allocator, io: std.Io) !Client {
+        if (builtin.os.tag == .windows) {
+            if (discoverProcessNative(allocator, io)) |command_line| {
+                defer allocator.free(command_line);
+                if (fromRiotClientCommandLine(command_line)) |credentials| {
+                    return .{ .allocator = allocator, .io = io, .credentials = try ownCredentials(allocator, credentials) };
+                } else |_| {}
+            }
+            if (discoverProcess(allocator, io)) |command_line| {
+                defer allocator.free(command_line);
+                if (fromRiotClientCommandLine(command_line)) |credentials| {
+                    return .{ .allocator = allocator, .io = io, .credentials = try ownCredentials(allocator, credentials) };
+                } else |_| {}
+            }
+        }
+        return error.NotRunning;
+    }
+
     pub fn discoverRemote(allocator: std.mem.Allocator, io: std.Io, ssh_target: []const u8, identity_file: []const u8, forwarded_port: u16, timeout_ms: u32, verify_tls: bool) !Client {
         if (std.mem.trim(u8, ssh_target, " \t\r\n").len == 0) return error.NotRunning;
         var argv: [20][]const u8 = undefined;
@@ -615,6 +639,29 @@ pub fn fromCommandLine(command_line: []const u8) ParseError!Credentials {
     return credentials;
 }
 
+/// 只从 `--riotclient-app-port` / `--riotclient-auth-token` 解析的 Riot Client 凭据。
+///
+/// `LeagueClientUx.exe` 的命令行里同时带两套凭据，指向**两个不同的本地服务**：
+/// LCU 是 `--app-port` + `--remoting-auth-token`，Riot Client 是
+/// `--riotclient-app-port` + `--riotclient-auth-token`。
+///
+/// 必须分开解析的原因：跨区 `名字#TAG → puuid` 的
+/// `player-account/aliases/v1/lookup` **只在 RC 端口可用**（`fromCommandLine`
+/// 会优先挑 `--app-port`，拿它去查 alias 只会 404）。
+pub fn fromRiotClientCommandLine(command_line: []const u8) ParseError!Credentials {
+    const port_text = argumentValue(command_line, "--riotclient-app-port") orelse return error.MissingPort;
+    const token = argumentValue(command_line, "--riotclient-auth-token") orelse return error.MissingToken;
+    const port = std.fmt.parseInt(u16, port_text, 10) catch return error.InvalidPort;
+    if (token.len == 0) return error.MissingToken;
+    var credentials = Credentials{ .port = port, .token = token, .protocol = "https" };
+    const platform = argumentValue(command_line, "--rso_platform_id") orelse argumentValue(command_line, "--rso-platform-id") orelse "";
+    if (platform.len <= credentials.platform.len) {
+        @memcpy(credentials.platform[0..platform.len], platform);
+        credentials.platform_len = platform.len;
+    }
+    return credentials;
+}
+
 fn ownCredentials(allocator: std.mem.Allocator, borrowed: Credentials) !Credentials {
     const token = try allocator.dupe(u8, borrowed.token);
     errdefer allocator.free(token);
@@ -677,6 +724,27 @@ test "解析两种参数格式并保留独立大区信息" {
         defer std.testing.allocator.free(owned.protocol);
         try std.testing.expectEqualStrings("HN1", owned.platformId());
     }
+}
+
+test "Riot Client 凭据只取 riotclient 参数，不误用 LCU 端口" {
+    // 真实命令行同时带两套凭据：LCU 是 --app-port，RC 是 --riotclient-app-port。
+    // RC 解析必须挑后者，否则 alias 查询会打到 LCU 端口上（404）。
+    const command =
+        "LeagueClientUx.exe --app-port=53970 --remoting-auth-token=lcu-token " ++
+        "--riotclient-app-port=53971 --riotclient-auth-token=rc-token --rso_platform_id=HN1";
+    const rc = try fromRiotClientCommandLine(command);
+    try std.testing.expectEqual(@as(u16, 53971), rc.port);
+    try std.testing.expectEqualStrings("rc-token", rc.token);
+    try std.testing.expectEqualStrings("HN1", rc.platformId());
+    // LCU 解析仍然挑 --app-port，两者互不影响。
+    const lcu_credentials = try fromCommandLine(command);
+    try std.testing.expectEqual(@as(u16, 53970), lcu_credentials.port);
+    try std.testing.expectEqualStrings("lcu-token", lcu_credentials.token);
+    // 只有 LCU 参数时 RC 解析必须失败，而不是退回 LCU 端口。
+    try std.testing.expectError(
+        error.MissingPort,
+        fromRiotClientCommandLine("LeagueClientUx.exe --app-port=53970 --remoting-auth-token=lcu-token"),
+    );
 }
 
 test "rejects malformed credentials" {

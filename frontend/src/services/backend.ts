@@ -19,6 +19,7 @@ import type {
   LiveLobby,
   MatchSummary,
   ShortcutValidation,
+  SummonerSearchResult,
 } from "../types/domain";
 import { createShortcutSendQueue } from "../shortcuts/sendQueue";
 
@@ -112,6 +113,20 @@ export const backend = {
   async matches(summonerName?: string, page = 0, pageSize = 10): Promise<MatchSummary[]> {
     if (usesFixtureData()) return browserBackend.matches(page, pageSize);
     return command("get_match_history", { summonerName: summonerName?.trim() || null, page, pageSize });
+  },
+  /**
+   * 把一个「可能不完整」的查询解析成候选「名字#TAG」。
+   *
+   * 本地接口都是精确匹配，且没有任何 name→tags 的反向索引：带 `#TAG` 时能走
+   * Riot Client 跨区命中；只给名字时最多在当前大区解析一个结果，解析不到就返回空
+   * 候选并把 `requiresTag` 置真，由界面提示需要完整 Riot ID。
+   */
+  async searchSummoner(query: string): Promise<SummonerSearchResult> {
+    const trimmed = query.trim();
+    const hasTag = trimmed.includes("#");
+    if (!trimmed) return { query: "", hasTag, requiresTag: false, candidates: [] };
+    if (usesFixtureData()) return { query: trimmed, hasTag, requiresTag: !hasTag, candidates: [] };
+    return command("search_summoner", { query: trimmed });
   },
   async champions(): Promise<ChampionOverview[]> {
     if (usesFixtureData()) return browserBackend.champions();

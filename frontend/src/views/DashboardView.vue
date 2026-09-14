@@ -12,6 +12,7 @@ import type { RankQueueSummary } from "../types/domain";
 import { championImage, percent, platformRegionGuide, platformRegionName, platformRegionOverview, rankName, relativeTime } from "../utils/format";
 import { visibleMatches } from "../matches/filters";
 import { matchHistoryQueryKey } from "../matches/query";
+import { useMatchDetail } from "../composables/useMatchDetail";
 
 const app = useAppStore();
 const message = useMessage();
@@ -37,6 +38,19 @@ const regionValue = computed(() => account.value.platformId || account.value.reg
 const regionDisplay = computed(() => platformRegionName(regionValue.value));
 const regionOverview = computed(() => platformRegionOverview(regionValue.value));
 const expandedMatchId = ref<number | null>(null);
+/**
+ * 首页这些行有两个来源：`backend.matches()` 的 MatchSummary（带十人明细），
+ * 以及 LCU 重连时兜底的 `app.bootstrap.dashboard.recentMatches`（只有本人一条）。
+ * 后者没有 `participants`，所以必须显式告诉卡片「这一行可以展开」，否则箭头都不渲染。
+ * 展开后按 gameId 单独拉完整十人数据。
+ */
+// 必须解构成顶层绑定：`expandedMatchDetail` 是普通对象，模板里写
+// `expandedMatchDetail.loading` 拿到的是 computed 本身（恒真），`v-if` 会永远命中。
+const { matchForRow, loading: expandedDetailLoading, error: expandedDetailError } = useMatchDetail({
+  gameId: expandedMatchId,
+  subjectPuuid: computed(() => rows.value.find((match) => match.gameId === expandedMatchId.value)?.participants?.[0]?.puuid ?? app.connection.puuid ?? ""),
+  selfPuuid: computed(() => app.connection.puuid ?? ""),
+});
 const source = computed(() => rows.value[0]?.dataStatus);
 const sourceLabel = computed(() => {
   if (!source.value && app.connection.status === "connected") return "客户端已连接 · 正在同步";
@@ -337,8 +351,11 @@ function toggleMatch(gameId: number) {
           <MatchDetailCard
             v-for="match in rows.slice(0, 10)"
             :key="match.gameId"
-            :match="match"
+            :match="matchForRow(match)"
+            :expandable="true"
             :expanded="expandedMatchId === match.gameId"
+            :detail-loading="expandedMatchId === match.gameId && expandedDetailLoading"
+            :detail-error="expandedMatchId === match.gameId ? expandedDetailError : ''"
             @toggle="toggleMatch(match.gameId)"
             compact
           />

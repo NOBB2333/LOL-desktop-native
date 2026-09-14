@@ -40,6 +40,18 @@ export type TagTone =
   | "solo"
   /** 团队伤害占比 */
   | "damage"
+  /** 团队承伤占比 */
+  | "damage-taken"
+  /** 团队经济占比 */
+  | "gold"
+  /** 伤害经济转化 */
+  | "damage-gold"
+  /** 击杀伤害转化 */
+  | "kill-damage"
+  /** 敌方消失信号 */
+  | "pings"
+  /** 可疑闪现位置 */
+  | "flash"
   /** 分均补刀 */
   | "cs"
   /** 视野得分 */

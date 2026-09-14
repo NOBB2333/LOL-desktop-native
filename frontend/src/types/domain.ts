@@ -62,6 +62,24 @@ export interface RecentMatch {
   cs: number;
   damageShare: number;
   killParticipation: number;
+  /**
+   * 队伍占比类字段。只有拿到十人明细（SGP 富化后的战绩）时才由后端输出——
+   * 战绩列表接口本身每局只带查询者一条 participants。缺字段时标签侧会把这些
+   * 指标排除在样本外，而不是按 0 混进去拉低均值。
+   * 见 `src/backend.zig` 的 `writeRecentMatchesFiltered`。
+   */
+  damageTakenShare?: number | null;
+  goldShare?: number | null;
+  csShare?: number | null;
+  visionScoreShare?: number | null;
+  /** 该局己方队伍人数；AK 的「理应贡献比」= 队伍占比 × 队伍人数。 */
+  teamSize?: number | null;
+  /** 该局己方队伍总击杀；用于击杀伤害转化。 */
+  teamKills?: number | null;
+  /** 该局己方队伍总承伤；用于治疗效率。 */
+  teamDamageTaken?: number | null;
+  /** 本局发出的「敌人消失」信号次数；LCU 数据源没有这个字段，因此可能为 null。 */
+  enemyMissingPings?: number | null;
   /** 视野得分；后端仅在数据源提供时输出。 */
   visionScore?: number | null;
   /** 15 分钟前被敌方打野参与击杀的次数；仅峡谷对局且时间线富化后可用。 */
@@ -214,6 +232,11 @@ export interface PlayerProfile {
   currentChampionGames: number;
   currentChampionWinRate: number;
   championPoolConcentration: number;
+  /**
+   * 客户端返回的生涯可见性；`"PRIVATE"` 表示该玩家隐藏了战绩。
+   * LCU 不一定带上这个字段，缺失时为 null，此时「战绩隐藏」标签不会渲染。
+   */
+  privacy?: string | null;
   dataComplete: boolean;
   unavailableSources: string[];
   dataStatus: DataStatus;
@@ -389,6 +412,27 @@ export interface DashboardSnapshot {
   recentEncounters: EncounterRecord[];
   patch: string;
   cachedChampions: number;
+}
+
+/**
+ * 查询串 → 候选「名字#TAG」。
+ *
+ * 本地 API 只有精确匹配（LCU 的 `lol-summoner/v1/summoners?name=` 覆盖当前大区，
+ * Riot Client 的 `player-account/aliases/v1/lookup` 覆盖跨区但要 gameName + tagLine
+ * 两个字段），没有任何 name→tags 的反向索引，所以「只给名字列出所有 TAG」做不到。
+ * `requiresTag` 就是用来把这个限制讲清楚的：只给了名字又没查到任何候选时为 `true`。
+ */
+export interface SummonerSearchCandidate {
+  gameName: string;
+  tagLine: string;
+  puuid: string;
+}
+
+export interface SummonerSearchResult {
+  query: string;
+  hasTag: boolean;
+  requiresTag: boolean;
+  candidates: SummonerSearchCandidate[];
 }
 
 export interface AppBootstrap {

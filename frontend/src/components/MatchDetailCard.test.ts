@@ -39,7 +39,7 @@ describe("MatchDetailCard", () => {
 
   it("keeps the row expanded when the detail area itself is clicked", async () => {
     const wrapper = mount(MatchDetailCard, {
-      props: { match: structuredClone(fixtureMatches[0]), expanded: true, clickable: true },
+      props: { match: structuredClone(fixtureMatches[0]), expanded: true },
       global: { stubs: { AssetIcon: true } },
     });
 
@@ -77,5 +77,32 @@ describe("MatchDetailCard", () => {
     const status = wrapper.get(".match-row__detail-status");
     expect(status.text()).toContain("读取失败");
     expect(status.attributes("data-tone")).toBe("warning");
+  });
+
+  /**
+   * 首页 / 对局页的行是列表级数据（只有查询者本人一条 participants），
+   * 展开能力由宿主的 `useMatchDetail` 补上，所以必须显式 `expandable`。
+   * 这条用例锁住「显式允许后箭头与详情都出来」以及「不传时保持不可展开」。
+   */
+  it("list-level rows only expand when the host allows it", async () => {
+    // 列表级数据就是 RecentMatch：根本没有 `participants` 这个键。
+    const row = structuredClone(fixtureLobby.ally[0].recentMatches[0]);
+
+    const plain = mount(MatchDetailCard, {
+      props: { match: row, expanded: true },
+      global: { stubs: { AssetIcon: true } },
+    });
+    expect(plain.find(".match-row__detail").exists()).toBe(false);
+    expect(plain.find(".match-row__toggle").exists()).toBe(false);
+
+    const expandable = mount(MatchDetailCard, {
+      props: { match: row, expanded: true, expandable: true, detailLoading: true },
+      global: { stubs: { AssetIcon: true } },
+    });
+    expect(expandable.find(".match-row__toggle").exists()).toBe(true);
+    expect(expandable.get(".match-row__detail-status").text()).toContain("正在读取");
+    // 行身也是可点区域：只有右上角小箭头能点的体验太差。
+    await expandable.get(".match-row__identity").trigger("click");
+    expect(expandable.emitted("toggle")).toHaveLength(1);
   });
 });

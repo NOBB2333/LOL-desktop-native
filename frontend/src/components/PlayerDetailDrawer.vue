@@ -37,6 +37,8 @@ const app = useAppStore();
 const full = ref(false);
 
 const expandedMatchId = ref<number | null>(null);
+/** 已经自动展开过的 initialMatchId；避免后台刷新数据时把用户手动收起的行再次弹开。 */
+let autoExpandedMatchId: number | null = null;
 const matchesSection = ref<HTMLElement | null>(null);
 const selectedEncounterRecords = ref<EncounterRecord[]>([]);
 const encounterModalOpen = ref(false);
@@ -61,8 +63,32 @@ const encounterLoading = encounterQuery.isFetching;
 const selectedMatchPage = computed(() => {
   if (!props.player || props.initialMatchId == null) return 0;
   const index = props.player.recentMatches.findIndex((match) => match.gameId === props.initialMatchId);
-  return index < 0 ? 0 : Math.floor(index / 10);
+  return index < 0 ? 0 : Math.floor(index / DRAWER_PAGE_SIZE);
 });
+/**
+ * 抽屉里的战绩分页。
+ *
+ * 之前这里固定只拉一页（10 场），于是抽屉顶部的「N 场」永远停在 10，
+ * 外面战绩页能一直翻、抽屉里却看不到多出来的那些。
+ *
+ * 现在按「已加载页数」累积：默认 1 页，点「加载更多」再加一页；
+ * 目标那一局（`initialMatchId`）所在的页会被自动补上，否则自动展开会落空。
+ */
+const DRAWER_PAGE_SIZE = 10;
+/**
+ * 上限 5 页 = 50 场。后端 `getMatches` 把 LCU 的历史窗口固定成
+ * `begIndex=0&endIndex=49` 再本地切片，第 6 页起必然是空的，所以不给出这个按钮。
+ */
+const DRAWER_MAX_PAGES = 5;
+const drawerPages = ref(1);
+const requiredDrawerPages = computed(() => Math.min(DRAWER_MAX_PAGES, selectedMatchPage.value + 1));
+watch(requiredDrawerPages, (value) => {
+  if (value > drawerPages.value) drawerPages.value = value;
+}, { immediate: true });
+/** 最后一页刚好装满才认为后面还有，和后端「按页切片」的口径一致。 */
+function loadMoreDrawerMatches() {
+  if (drawerPages.value < DRAWER_MAX_PAGES) drawerPages.value += 1;
+}
 const selectedRiotId = computed(() => props.player ? riotIdFor(props.player) : "");
 const detailedMatchQuery = useQuery({
   queryKey: computed(() => matchHistoryQueryKey({
@@ -71,18 +97,27 @@ const detailedMatchQuery = useQuery({
     gameName: app.connection.gameName,
     tagLine: app.connection.tagLine,
     summonerName: selectedRiotId.value,
-    page: selectedMatchPage.value,
-    pageSize: 10,
+    // 以「已加载条数」当分页维度：键随加载深度变化，缓存按深度区分。
+    page: 0,
+    pageSize: drawerPages.value * DRAWER_PAGE_SIZE,
     hideUnfinishedMatches: app.config.providers.hideUnfinishedMatches,
     rankedOnly: app.config.providers.rankedOnly,
   })),
-  queryFn: () => backend.matches(selectedRiotId.value, selectedMatchPage.value, 10),
+  queryFn: () => {
+    const summoner = selectedRiotId.value;
+    if (!summoner) return Promise.resolve<MatchSummary[]>([]);
+    // 后端总是先拉满 LCU 的 50 场窗口再本地切片，所以一次要「已加载条数」就够：
+    // 按页并发再拼会把同一份窗口重复拉 N 次，拼接处还会重叠。
+    return backend.matches(summoner, 0, drawerPages.value * DRAWER_PAGE_SIZE);
+  },
   enabled: computed(() => Boolean(props.show && props.player?.tagLine.trim() && selectedRiotId.value)),
   staleTime: 60_000,
   retry: 1,
 });
 const detailedMatches = computed(() => detailedMatchQuery.data.value ?? []);
 const matchesLoading = computed(() => detailedMatchQuery.isLoading.value);
+/** 最后一页刚好装满才认为后面还有，和后端「按页切片」的口径一致。 */
+const drawerHasMore = computed(() => drawerPages.value < DRAWER_MAX_PAGES && detailedMatches.value.length >= drawerPages.value * DRAWER_PAGE_SIZE);
 const matchesError = computed(() => {
   if (props.player && !props.player.tagLine.trim()) return "选人阶段尚未公开完整 Riot ID，暂时只能显示当前摘要";
   return detailedMatchQuery.isError.value ? "完整十人数据读取失败，已保留当前摘要" : "";
@@ -108,16 +143,62 @@ function openEncounterGame(records: EncounterRecord[]) {
   selectedEncounterRecords.value = records;
   encounterModalOpen.value = true;
 }
-watch(() => [props.show, props.player?.puuid], () => {
+/**
+ * 换人或关抽屉时清空展开态。
+ *
+ * 注意必须写成「多个 source 的数组」而不是「一个返回数组的 getter」：
+ * `() => [a, b]` 每次求值都是新数组，Vue 用 `Object.is` 比较整个返回值，永远算「变了」；
+ * 而 LiveView 的 roster 轮询（1.2~1.5s）会不断替换 `props.player` 的对象引用，
+ * 于是这个 watch 每秒都会误触发，把用户刚手动展开的那一局收回 `null`。
+ * 多 source 数组由 Vue 逐元素比较，只有 show / puuid 真的变了才触发。
+ * （LeagueAkari 的 `watch([puuid, () => me.puuid], ...)` 也是这个写法。）
+ */
+watch([() => props.show, () => props.player?.puuid], () => {
   expandedMatchId.value = null;
+  autoExpandedMatchId = null;
   encounterModalOpen.value = false;
   selectedEncounterRecords.value = [];
+  // 换人后分页回到第一页；目标那一局的页会由 `requiredDrawerPages` 再补回来。
+  drawerPages.value = 1;
 });
-watch(() => [props.show, props.initialMatchId, detailedMatchQuery.data.value] as const, async ([show, gameId, matches]) => {
-  if (!show || gameId == null || !matches?.some((match) => match.gameId === gameId)) return;
-  expandedMatchId.value = gameId;
-  await nextTick();
-  matchesSection.value?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+/** 下一帧；`requestAnimationFrame` 在部分测试环境里不存在，退化成定时器。 */
+function nextFrame(callback: () => void) {
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(callback);
+  else window.setTimeout(callback, 16);
+}
+/**
+ * 把抽屉滚到对应那一局。
+ *
+ * 之前滚的是「完整近期战绩」这个 section（`matchesSection`）本身，所以最多只滚到
+ * 列表顶部；用户点的那一行可能排在很后面（第 20、30 场），根本没进视野。
+ * 要滚的是那一行自己的元素（`MatchDetailCard` 根节点上的 `data-game-id`）。
+ *
+ * 另外两件事让这个动作不能只做一次：
+ * - 目标行要等分页数据回来才渲染，所以先按帧等它出现；
+ * - 抽屉自身的进入动画会在之后再次改变布局，所以落位后再补一次。
+ *
+ * 容器没了（抽屉已关 / 组件已卸载）就立刻收手，避免留下一串空转的定时器。
+ */
+function scrollToMatchInDrawer(gameId: number, attempt = 0) {
+  void nextTick(() => {
+    const section = matchesSection.value;
+    if (!section) return;
+    const row = section.querySelector<HTMLElement>(`[data-game-id="${gameId}"]`);
+    if (!row) {
+      if (attempt < 8) nextFrame(() => scrollToMatchInDrawer(gameId, attempt + 1));
+      return;
+    }
+    row.scrollIntoView?.({ behavior: "smooth", block: "center" });
+    if (attempt === 0) window.setTimeout(() => scrollToMatchInDrawer(gameId, 1), 320);
+  });
+}
+watch([() => props.show, () => props.initialMatchId, () => detailedMatchQuery.data.value], async () => {
+  if (!props.show || props.initialMatchId == null || autoExpandedMatchId === props.initialMatchId) return;
+  const matches = detailedMatchQuery.data.value;
+  if (!matches?.some((match) => match.gameId === props.initialMatchId)) return;
+  autoExpandedMatchId = props.initialMatchId;
+  expandedMatchId.value = props.initialMatchId;
+  scrollToMatchInDrawer(props.initialMatchId);
 }, { immediate: true });
 function toggleMatch(gameId: number) {
   expandedMatchId.value = expandedMatchId.value === gameId ? null : gameId;
@@ -156,7 +237,7 @@ function sideFor(player: PlayerProfile) {
       <section class="player-drawer__section"><header><div><span class="eyebrow">评分依据</span><h3>评分构成</h3></div></header><div class="player-drawer__breakdown"><div v-for="item in player.score.components" :key="item.key"><div><span>{{ item.label }}</span><b>{{ item.score.toFixed(1) }} / {{ item.maxScore }}</b></div><i :class="meterClass(item.maxScore ? item.score / item.maxScore : 0)" /><small>{{ item.evidence }}</small></div></div></section>
       <section class="player-drawer__section"><header><div><span class="eyebrow">英雄池</span><h3>主要英雄</h3></div><span>{{ Math.round(player.championPoolConcentration * 100) }}% 集中度</span></header><div class="player-drawer__champion-list"><div v-for="champion in player.topChampions" :key="champion.championId"><AssetIcon kind="champion" :id="champion.championId" :name="champion.championName" size="md" /><strong>{{ champion.championName }}</strong><span>{{ champion.wins }} 胜</span><b>{{ champion.games }} 把</b></div></div></section>
       <section v-if="lobbyPlayers.length" class="player-drawer__section"><header><div><span class="eyebrow">当前阵容</span><h3>本局玩家</h3></div><span>{{ lobbyPlayers.length }} 人 · 当前玩家高亮</span></header><div class="player-drawer__lobby"><section v-for="team in lobbyTeams" :key="team.id" class="player-drawer__lobby-team" :data-side="team.side"><header><strong>{{ team.label }}</strong><span>{{ team.players.length }} 人</span></header><div class="player-drawer__lobby-list"><button v-for="item in team.players" :key="item.puuid" type="button" class="player-drawer__lobby-player" :class="{ 'player-drawer__lobby-player--self': item.puuid === player.puuid }" :data-side="sideFor(item)" @click="openHistory(item)"><AssetIcon kind="champion" :id="item.championId" :name="item.championName" :fallback-url="championImage(item.championId)" size="sm" /><span><strong>{{ item.gameName }}<em v-if="item.puuid === player.puuid">本人</em></strong><small>{{ item.championName }} · {{ roleName(item.assignedPosition) }}</small></span><b>{{ item.recentMatches.length ? percent(item.recentMatches.filter((match) => match.win).length / item.recentMatches.length) : "--" }}</b></button></div></section></div></section>
-      <section ref="matchesSection" class="player-drawer__section"><header><div><span class="eyebrow">近期战绩</span><h3>完整近期战绩</h3></div><span>{{ drawerMatches.length }} 场</span></header><div v-if="matchesLoading" class="player-drawer__match-status">正在读取装备、伤害、视野、十人阵容与 BP…</div><div v-else-if="matchesError" class="player-drawer__match-status" data-tone="warning">{{ matchesError }}</div><div class="player-drawer__matches"><MatchDetailCard v-for="match in drawerMatches" :key="match.gameId" :match="matchForRow(match)" :expanded="expandedMatchId === match.gameId" compact clickable :detail-loading="expandedMatchId === match.gameId && expandedDetailLoading" :detail-error="expandedMatchId === match.gameId ? expandedDetailError : ''" @toggle="toggleMatch(match.gameId)" /><div v-if="!drawerMatches.length && !matchesLoading" class="player-drawer__match-status">暂无可读取的近期对局</div></div></section>
+      <section ref="matchesSection" class="player-drawer__section"><header><div><span class="eyebrow">近期战绩</span><h3>完整近期战绩</h3></div><span>已加载 {{ drawerMatches.length }} 场</span></header><div v-if="matchesLoading" class="player-drawer__match-status">正在读取装备、伤害、视野、十人阵容与 BP…</div><div v-else-if="matchesError" class="player-drawer__match-status" data-tone="warning">{{ matchesError }}</div><div class="player-drawer__matches"><MatchDetailCard v-for="match in drawerMatches" :key="match.gameId" :match="matchForRow(match)" :expanded="expandedMatchId === match.gameId" :expandable="true" compact :detail-loading="expandedMatchId === match.gameId && expandedDetailLoading" :detail-error="expandedMatchId === match.gameId ? expandedDetailError : ''" @toggle="toggleMatch(match.gameId)" /><div v-if="!drawerMatches.length && !matchesLoading" class="player-drawer__match-status">暂无可读取的近期对局</div></div><div v-if="drawerHasMore" class="player-drawer__more"><NButton size="small" secondary :loading="matchesLoading" @click="loadMoreDrawerMatches">加载更多对局</NButton><small>一次 10 场，最多 50 场（LCU 战绩窗口上限）</small></div></section>
     </NDrawerContent>
   </NDrawer>
   <EncounterMatchModal v-if="player" v-model:show="encounterModalOpen" :records="selectedEncounterRecords" :target-puuid="player.puuid" />
@@ -216,5 +297,7 @@ function sideFor(player: PlayerProfile) {
 .player-drawer__champion-list span { color: var(--text-secondary); }.player-drawer__champion-list b { color: var(--green); }
  .player-drawer__lobby { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }.player-drawer__lobby-team { min-width: 0; padding: 6px; border: 1px solid var(--line); border-top: 2px solid var(--blue); background: var(--surface); }.player-drawer__lobby-team[data-side="enemy"] { border-top-color: var(--red); }.player-drawer__lobby-team > header { display: flex; align-items: center; justify-content: space-between; margin: 0 0 5px; color: var(--text-secondary); font-size: 8px; }.player-drawer__lobby-team > header strong { color: var(--text-primary); font-size: 9px; }.player-drawer__lobby-list { display: grid; gap: 3px; }.player-drawer__lobby-player { display: grid; grid-template-columns: 26px minmax(0, 1fr) auto; align-items: center; gap: 6px; min-width: 0; padding: 6px; border: 1px solid var(--line); color: var(--text-primary); background: var(--surface-raised); cursor: pointer; text-align: left; }.player-drawer__lobby-player:hover { border-color: var(--accent); }.player-drawer__lobby-player > span { min-width: 0; }.player-drawer__lobby-player strong, .player-drawer__lobby-player small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.player-drawer__lobby-player strong { font-size: 9px; }.player-drawer__lobby-player small { margin-top: 2px; color: var(--text-secondary); font-size: 8px; }.player-drawer__lobby-player b { color: var(--green); font-size: 9px; font-variant-numeric: tabular-nums; }
 .player-drawer__lobby-player strong em { display: inline-flex; margin-left: 4px; padding: 1px 3px; border-radius: 2px; color: var(--accent); background: var(--accent-soft); font-size: 7px; font-style: normal; font-weight: 700; }.player-drawer__lobby-player--self { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); background: color-mix(in srgb, var(--accent-soft) 55%, var(--surface-raised)); }.player-drawer__match-status { margin-bottom: 7px; padding: 9px 10px; border: 1px dashed var(--line-strong); color: var(--text-secondary); background: var(--surface-raised); font-size: 9px; }.player-drawer__match-status[data-tone="warning"] { color: var(--amber); }.player-drawer__matches { display: grid; gap: 7px; min-width: 0; overflow: hidden; }.player-drawer__matches :deep(.match-row--compact) { grid-template-areas: "identity kda metrics toggle" "items items traits toggle"; grid-template-columns: minmax(180px, .9fr) minmax(92px, .45fr) minmax(260px, 1.4fr) 28px; gap: 5px 7px; width: 100%; min-width: 0; padding: 8px 8px 7px 10px; }.player-drawer__matches :deep(.match-row--compact .match-row__traits) { display: flex; align-items: center; gap: 7px; min-width: 0; }.player-drawer__matches :deep(.match-row--compact .match-row__badges) { flex-wrap: nowrap; }.player-drawer__matches :deep(.match-row--compact .match-row__items) { min-width: 0; padding-top: 0; border-top: 0; }.player-drawer__matches :deep(.match-row--compact .match-row__items > span) { display: none; }.player-drawer__matches :deep(.match-row--compact .match-row__item-list) { flex-wrap: nowrap; gap: 3px; min-width: 0; overflow: hidden; }.player-drawer__matches :deep(.match-row--compact .match-row__item-slot) { width: 22px; height: 22px; font-size: 6px; }.player-drawer__matches :deep(.match-row--compact .asset-icon--sm) { width: 22px; height: 22px; }.player-drawer__matches :deep(.match-row--compact .match-row__metrics) { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 3px 5px; }.player-drawer__matches :deep(.match-row--compact .match-row__stat) { grid-template-columns: 12px minmax(14px, 1fr) minmax(28px, auto) 20px; gap: 2px; }.player-drawer__matches :deep(.match-row--compact .match-row__stat strong) { font-size: 9px; }.player-drawer__matches :deep(.match-row--compact .match-row__stat small) { width: 20px; font-size: 7px; }.player-drawer__matches :deep(.match-row--compact .match-row__detail) { min-width: 0; overflow: hidden; }
+.player-drawer__more { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 9px; }
+.player-drawer__more small { color: var(--text-muted); font-size: 9px; }
  @media (max-width: 720px) { .player-drawer__lobby { grid-template-columns: 1fr; }.player-drawer__jungle-head { grid-template-columns: 1fr; }.player-drawer__jungle-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 </style>

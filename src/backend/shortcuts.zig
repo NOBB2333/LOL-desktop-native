@@ -42,16 +42,16 @@ const template_fields = [_][]const u8{
 const validation_player =
     "{\"gameName\":\"示例玩家\",\"championId\":103,\"championName\":\"九尾妖狐\",\"assignedPosition\":\"MIDDLE\"," ++
     "\"rankTier\":\"EMERALD\",\"rankDivision\":\"II\",\"leaguePoints\":63,\"score\":{\"total\":82}," ++
-    // 5 场全胜、同一英雄。据此（阈值见 `player_signals.zig`）：
-    //   5 连胜 → 正向；场均阵亡 2 → 生存稳健；参团 70% → 参团积极；
-    //   伤害 30% → 伤害 30%；分均补刀 8.0；同英雄 100% → 英雄池集中（负向）。
-    // 因此 {tag} 与 {streak} 都是「5 连胜」，{risk} 是「英雄池集中」。
+    // 5 场全胜、同一英雄，每局 8/10 击杀份额 → 2.67 的高击杀伤害转化；
+    // 前 3 局闪现在 D、后 2 局在 F。（阈值见 `player_signals.zig`）
+    //   5 连胜 → 正向；击杀伤害转化高 → 正向；闪现位置可疑 → 负向。
+    // 因此 {tag} 与 {streak} 都是「5 连胜」，{risk} 是「闪现位置可疑」。
     "\"recentMatches\":[" ++
-    "{\"championId\":103,\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"durationMinutes\":28,\"cs\":224,\"killParticipation\":0.7,\"damageShare\":0.3,\"win\":true}," ++
-    "{\"championId\":103,\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"durationMinutes\":28,\"cs\":224,\"killParticipation\":0.7,\"damageShare\":0.3,\"win\":true}," ++
-    "{\"championId\":103,\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"durationMinutes\":28,\"cs\":224,\"killParticipation\":0.7,\"damageShare\":0.3,\"win\":true}," ++
-    "{\"championId\":103,\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"durationMinutes\":28,\"cs\":224,\"killParticipation\":0.7,\"damageShare\":0.3,\"win\":true}," ++
-    "{\"championId\":103,\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"durationMinutes\":28,\"cs\":224,\"killParticipation\":0.7,\"damageShare\":0.3,\"win\":true}" ++
+    "{\"championId\":103,\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"teamKills\":10,\"durationMinutes\":28,\"cs\":224,\"killParticipation\":0.7,\"damageShare\":0.3,\"summonerSpells\":[{\"id\":4},{\"id\":12}],\"win\":true}," ++
+    "{\"championId\":103,\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"teamKills\":10,\"durationMinutes\":28,\"cs\":224,\"killParticipation\":0.7,\"damageShare\":0.3,\"summonerSpells\":[{\"id\":4},{\"id\":12}],\"win\":true}," ++
+    "{\"championId\":103,\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"teamKills\":10,\"durationMinutes\":28,\"cs\":224,\"killParticipation\":0.7,\"damageShare\":0.3,\"summonerSpells\":[{\"id\":4},{\"id\":12}],\"win\":true}," ++
+    "{\"championId\":103,\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"teamKills\":10,\"durationMinutes\":28,\"cs\":224,\"killParticipation\":0.7,\"damageShare\":0.3,\"summonerSpells\":[{\"id\":12},{\"id\":4}],\"win\":true}," ++
+    "{\"championId\":103,\"championName\":\"九尾妖狐\",\"position\":\"MIDDLE\",\"kills\":8,\"deaths\":2,\"assists\":7,\"teamKills\":10,\"durationMinutes\":28,\"cs\":224,\"killParticipation\":0.7,\"damageShare\":0.3,\"summonerSpells\":[{\"id\":12},{\"id\":4}],\"win\":true}" ++
     "]," ++
     "\"topChampions\":[{\"championName\":\"九尾妖狐\",\"winRate\":0.61}]," ++
     "\"currentChampionGames\":6,\"currentChampionWinRate\":0.67,\"premadeWith\":[]," ++
@@ -509,7 +509,7 @@ fn writeTemplateValue(writer: *std.Io.Writer, key: []const u8, player: std.json.
         return writeStringArray(writer, arrayField(player, "premadeWith"), "、", "无");
     }
     if (std.mem.eql(u8, key, "risk")) {
-        // 风险标签：只取负向信号（「阵亡偏多」「参团偏低」「N 连败」「英雄池集中」等）。
+        // 风险标签：只取负向信号（「好抓」「N 连败」「击杀伤害转化低」「闪现位置可疑」等）。
         _ = try player_signals.writeBucket(writer, player, .risks, "、", player_signals.max_signals);
         return;
     }
@@ -1106,9 +1106,10 @@ test "renders all shortcut fields from enriched lobby players" {
     try std.testing.expect(std.mem.indexOf(u8, result, "我方 示例玩家 5 连胜 中路 翡翠 II 63 82") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "近1场：胜 九尾妖狐 8/2/7") != null);
     // {tag} / {streak} 取自同一套信号；{risk} 只取负向信号。
-    try std.testing.expect(std.mem.indexOf(u8, result, "英雄池集中") != null);
-    // 模板只渲染第一条正向信号（{tag}）与负向信号（{risk}）；像「生存稳健」「参团积极」
+    try std.testing.expect(std.mem.indexOf(u8, result, "闪现位置可疑") != null);
+    // 模板只渲染第一条正向信号（{tag}）与负向信号（{risk}）；像「击杀伤害转化高」
     // 这类排在后面的正向信号不参与渲染，不该出现在文本里。
+    try std.testing.expect(std.mem.indexOf(u8, result, "击杀伤害转化高") == null);
     try std.testing.expect(std.mem.indexOf(u8, result, "生存稳健") == null);
     try std.testing.expect(std.mem.indexOf(u8, result, "参团积极") == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, result, '{') == null);
@@ -1119,7 +1120,7 @@ test "risk 变量只输出负向信号，tag 取第一条命中" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const player = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), validation_player, .{});
-    try std.testing.expectEqualStrings("英雄池集中", try renderTemplate("{risk}", player, "我方", "ChampSelect", 5, &output));
+    try std.testing.expectEqualStrings("闪现位置可疑", try renderTemplate("{risk}", player, "我方", "ChampSelect", 5, &output));
     try std.testing.expectEqualStrings("5 连胜", try renderTemplate("{tag}", player, "我方", "ChampSelect", 5, &output));
     try std.testing.expectEqualStrings("5 连胜", try renderTemplate("{streak}", player, "我方", "ChampSelect", 5, &output));
 

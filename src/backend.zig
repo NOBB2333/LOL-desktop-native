@@ -258,6 +258,7 @@ pub const command_names = [_][]const u8{
     "lol.get_live_roster",
     "lol.get_match_history",
     "lol.get_match_detail",
+    "lol.search_summoner",
     "lol.get_champions",
     "lol.get_asset",
     "lol.get_encounters",
@@ -592,6 +593,7 @@ pub const Runtime = struct {
             .{ .name = "lol.get_live_roster", .context = self, .invoke_fn = getLiveRoster },
             .{ .name = "lol.get_match_history", .context = self, .invoke_fn = getMatches },
             .{ .name = "lol.get_match_detail", .context = self, .invoke_fn = getMatchDetail },
+            .{ .name = "lol.search_summoner", .context = self, .invoke_fn = searchSummoner },
             .{ .name = "lol.get_champions", .context = self, .invoke_fn = assets_ipc.getChampions },
             .{ .name = "lol.get_asset", .context = self, .invoke_fn = assets_ipc.getAsset },
             .{ .name = "lol.get_encounters", .context = self, .invoke_fn = getEncounters },
@@ -2352,9 +2354,10 @@ fn getMatches(context: *anyopaque, invocation: native_sdk.bridge.Invocation, out
             const trimmed = std.mem.trim(u8, value, " \t\r\n");
             break :blk if (trimmed.len > 0) trimmed else null;
         } else null;
-        if (explicit_subject) |subject| {
-            if (std.mem.indexOfScalar(u8, subject, '#') == null) return error.FullRiotIdRequired;
-        }
+        // 不再要求查询串必须带 `#`：`lol-summoner/v1/summoners?name=` 在部分客户端版本
+        // 能解析唯一裸名，直接放行让 LCU 自己判断，比在这里硬报「需要完整 Riot ID」更有用。
+        // 解析不到会落到 `error.SummonerLookupFailed`，前端再提示需要 `名字#TAG`。
+        // 需要枚举候选（含跨区）请走 `lol.search_summoner`。
         if (self.io) |io| {
             var client = discoverClient(self, io) catch {
                 if (cachedMatchesPageForSubject(self, explicit_subject, offset, page_size, output)) |cached| return cached;
@@ -2452,6 +2455,194 @@ fn getMatches(context: *anyopaque, invocation: native_sdk.bridge.Invocation, out
 
 fn cachedMatchesPage(self: *Runtime, offset: usize, limit: usize, output: []u8) ?[]const u8 {
     return cachedMatchesPageForSubject(self, null, offset, limit, output);
+}
+
+/// 一次查询最多回这么多「名字#TAG」候选；本地 API 本身就是精确匹配，去重后远小于该值。
+const summoner_candidate_limit = 8;
+
+const SummonerCandidate = struct {
+    game_name: []const u8,
+    tag_line: []const u8,
+    puuid: []const u8,
+};
+
+/// 名字是否和查询一致（忽略大小写）。
+///
+/// 必须校验：LCU `/lol-summoner/v1/summoners?name=` 在部分客户端版本里**忽略无法解析的
+/// name 参数、直接返回当前登录账号**。不比对名字就会把「查无此人」显示成「查到的就是你自己」。
+/// 返回体没给名字（空串）时无从校验，按通过处理。
+fn candidateNameMatches(returned: []const u8, expected: []const u8) bool {
+    const actual = std.mem.trim(u8, returned, " \t\r\n");
+    if (actual.len == 0) return true;
+    return std.ascii.eqlIgnoreCase(actual, std.mem.trim(u8, expected, " \t\r\n"));
+}
+
+/// 从 LCU `lol-summoner/v1/summoners?name=` 的响应里抽一个候选。
+///
+/// 命中时是一个召唤师对象（`puuid`/`gameName`/`tagLine`），查不到时 LCU 直接 404；
+/// 两种失败都只是「没有候选」，由调用方决定怎么提示。
+fn appendSummonerCandidate(
+    allocator: std.mem.Allocator,
+    candidates: *[summoner_candidate_limit]SummonerCandidate,
+    count: *usize,
+    body: []const u8,
+    expected_name: []const u8,
+) void {
+    if (count.* == summoner_candidate_limit) return;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, body, .{}) catch return;
+    const item = firstJsonValue(parsed);
+    if (item != .object) return;
+    const puuid = identityPuuid(item);
+    if (puuid.len == 0) return;
+    const game_name = if (jsonField(item, "gameName").len > 0) jsonField(item, "gameName") else jsonField(item, "displayName");
+    if (!candidateNameMatches(game_name, expected_name)) return;
+    candidates[count.*] = .{ .game_name = game_name, .tag_line = jsonField(item, "tagLine"), .puuid = puuid };
+    count.* += 1;
+}
+
+/// 从 Riot Client `player-account/aliases/v1/lookup` 的响应里抽候选。
+///
+/// 响应形如 `[{ "puuid": "...", "alias": { "game_name": ..., "tag_line": ... } }]`，
+/// 少数版本直接返回单个对象。名称一律取调用方传入的查询值：`alias` 内层字段命名
+/// 在不同版本间不稳定，而 RC 本身只做精确匹配，回填查询值不会失真。
+fn appendAliasCandidates(
+    allocator: std.mem.Allocator,
+    candidates: *[summoner_candidate_limit]SummonerCandidate,
+    count: *usize,
+    body: []const u8,
+    game_name: []const u8,
+    tag_line: []const u8,
+) void {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, body, .{}) catch return;
+    // 单对象版本也要能读：放进一个长度 1 的局部数组，避免对临时数组取切片。
+    var single: [1]std.json.Value = undefined;
+    const items: []const std.json.Value = if (parsed == .array)
+        parsed.array.items
+    else blk: {
+        single[0] = parsed;
+        break :blk single[0..];
+    };
+    for (items) |item| {
+        if (count.* == summoner_candidate_limit) return;
+        const puuid = identityPuuid(item);
+        if (puuid.len == 0) continue;
+        // 同一个 puuid 只收一次：LCU 与 RC 两条路径都可能命中。
+        var duplicate = false;
+        for (candidates[0..count.*]) |existing| {
+            if (std.mem.eql(u8, existing.puuid, puuid)) duplicate = true;
+        }
+        if (duplicate) continue;
+        candidates[count.*] = .{ .game_name = game_name, .tag_line = tag_line, .puuid = puuid };
+        count.* += 1;
+    }
+}
+
+/// 把一个「可能不完整」的召唤师查询解析成候选列表。
+///
+/// ## 平台现实（决定了这个命令能做什么、不能做什么）
+///
+/// 本机只有两个查询入口，**都要求完整的 `名字#TAG`**：
+/// - LCU `lol-summoner/v1/summoners?name=`：只覆盖**当前大区**；
+/// - Riot Client `player-account/aliases/v1/lookup?gameName=&tagLine=`：跨区通用，
+///   但同样要 gameName **和** tagLine 两个字段（见 `rank-analysis` 的
+///   `resolve_puuid_by_riot_id`，注释里明确写了「全区查询必须带 TAG」）。
+///
+/// 所以「只给一个名字、把某个名字的所有 TAG 枚举出来」在本地 API 上做不到——没有任何
+/// 接口提供 name→tags 的反向索引。这个命令能提供的是：
+/// - 带 `#TAG` 时走 RC 跨区解析，**不再局限于当前大区**；
+/// - 只给名字时退化成一次 LCU 裸名查询（少数版本能解析唯一名字），失败就回空候选并
+///   置 `requiresTag`，由前端提示「需要完整 Riot ID」并列出可选大区。
+fn searchSummoner(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = runtime(context);
+    const request_json = parsePayload(struct { query: []const u8 = "" }, invocation.request.payload) catch return error.InvalidRequest;
+    defer request_json.deinit();
+    const raw = std.mem.trim(u8, request_json.value.query, " \t\r\n");
+    if (raw.len == 0) return error.InvalidRequest;
+
+    // 按最后一个 `#` 切分：名字本身允许含 `#`，标签不允许。
+    const separator = std.mem.lastIndexOfScalar(u8, raw, '#');
+    const game_name = if (separator) |index| std.mem.trim(u8, raw[0..index], " \t\r\n") else raw;
+    const tag_line = if (separator) |index| std.mem.trim(u8, raw[index + 1 ..], " \t\r\n") else "";
+    const has_tag = game_name.len > 0 and tag_line.len > 0;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var candidates: [summoner_candidate_limit]SummonerCandidate = undefined;
+    var count: usize = 0;
+
+    if (self.mode == .live) if (self.io) |io| {
+        if (has_tag) {
+            // 首选 RC：跨区，且不受当前登录大区限制。
+            if (lcu.Client.discoverRiotClient(std.heap.page_allocator, io)) |found| {
+                var riot_client = found;
+                defer riot_client.deinit();
+                riot_client.timeout_ms = runtimeRequestTimeoutMs(self);
+                riot_client.verify_tls = build_options.lcu_verify_tls;
+                riot_client.control = snapshotControl(self);
+                riot_client.lane = self.snapshot_lane;
+                var encoded_name: [1024]u8 = undefined;
+                var encoded_tag: [256]u8 = undefined;
+                var path_buffer: [2048]u8 = undefined;
+                const name_query = percentEncodeQuery(game_name, &encoded_name) catch null;
+                const tag_query = percentEncodeQuery(tag_line, &encoded_tag) catch null;
+                if (name_query != null and tag_query != null) {
+                    const path = std.fmt.bufPrint(
+                        &path_buffer,
+                        "/player-account/aliases/v1/lookup?gameName={s}&tagLine={s}",
+                        .{ name_query.?, tag_query.? },
+                    ) catch null;
+                    if (path) |lookup_path| {
+                        if (riot_client.get(lookup_path)) |body| {
+                            defer std.heap.page_allocator.free(body);
+                            appendAliasCandidates(allocator, &candidates, &count, body, game_name, tag_line);
+                        } else |_| {}
+                    }
+                }
+            } else |_| {}
+        }
+        // RC 不可用 / 未命中时退回 LCU。带 TAG 时按完整 Riot ID 查；只给名字时按裸名查。
+        if (count == 0) {
+            const subject = if (has_tag) raw else game_name;
+            if (discoverClient(self, io)) |found| {
+                var client = found;
+                defer client.deinit();
+                var encoded_buffer: [1024]u8 = undefined;
+                if (percentEncodeQuery(subject, &encoded_buffer)) |encoded| {
+                    var path_buffer: [1280]u8 = undefined;
+                    if (std.fmt.bufPrint(&path_buffer, "/lol-summoner/v1/summoners?name={s}", .{encoded})) |path| {
+                        if (client.get(path)) |body| {
+                            defer std.heap.page_allocator.free(body);
+                            appendSummonerCandidate(allocator, &candidates, &count, body, game_name);
+                        } else |_| {}
+                    } else |_| {}
+                } else |_| {}
+            } else |_| {}
+        }
+    };
+
+    var writer = std.Io.Writer.fixed(output);
+    try writer.writeAll("{\"query\":");
+    try jsonString(&writer, raw);
+    try writer.writeAll(",\"hasTag\":");
+    try writer.writeAll(if (has_tag) "true" else "false");
+    // 没拿到候选、而且用户只给了名字 → 前端据此提示「需要完整的名字#TAG」。
+    try writer.writeAll(",\"requiresTag\":");
+    try writer.writeAll(if (!has_tag and count == 0) "true" else "false");
+    try writer.writeAll(",\"candidates\":[");
+    for (candidates[0..count], 0..) |candidate, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writer.writeAll("{\"gameName\":");
+        try jsonString(&writer, candidate.game_name);
+        try writer.writeAll(",\"tagLine\":");
+        try jsonString(&writer, candidate.tag_line);
+        try writer.writeAll(",\"puuid\":");
+        try jsonString(&writer, candidate.puuid);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]}");
+    return writer.buffered();
 }
 
 fn cachedMatchesPageForSubject(self: *Runtime, subject: ?[]const u8, offset: usize, limit: usize, output: []u8) ?[]const u8 {
@@ -3675,6 +3866,37 @@ fn teamStat(value: ?std.json.Value, team_id: i64, name: []const u8) i64 {
 fn ratio(value: i64, total: i64) f64 {
     if (total <= 0 or value <= 0) return 0;
     return @as(f64, @floatFromInt(value)) / @as(f64, @floatFromInt(total));
+}
+
+/// 队伍占比：队伍总量为 0 时返回 `null`（数据缺失），而不是 0 —— 前端据此把该局
+/// 排除在相关均值之外，而不是用一个假 0 把均值拉低。
+/// 见 LeagueAkari `computeSingleSummary` 的 `*PercentageOfTeam` 系列。
+fn teamShare(value: i64, total: i64) ?f64 {
+    if (total <= 0) return null;
+    return @as(f64, @floatFromInt(@max(value, 0))) / @as(f64, @floatFromInt(total));
+}
+
+/// 写出一个可空的占比：有值写小数，无值写 `null`。
+fn writeOptionalRatio(writer: *std.Io.Writer, value: ?f64) !void {
+    if (value) |number| try writer.print("{d:.4}", .{number}) else try writer.writeAll("null");
+}
+
+/// 读一个 ping 计数。SGP 的战绩明细把 ping 统计直接放在 participant 顶层
+/// （AK 读的就是 `p.enemyMissingPings`）；LCU 的 match-history 没有这些字段，
+/// 此时返回 `null`，前端会把整条「消失信号」标签一起隐藏。
+fn pingCount(participant: std.json.Value, name: []const u8) ?i64 {
+    if (participant != .object) return null;
+    if (nestedObject(participant, "stats")) |stats| {
+        if (stats.object.get(name) != null) {
+            const value = jsonInt(stats, name);
+            if (value >= 0) return value;
+        }
+    }
+    if (participant.object.get(name) != null) {
+        const value = jsonInt(participant, name);
+        if (value >= 0) return value;
+    }
+    return null;
 }
 
 fn participantScore(participant: std.json.Value, team_damage: i64) f64 {
@@ -5282,6 +5504,11 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     try jsonString(writer, champion_name);
     try writer.print(",\"profileIconId\":{d},\"assignedPosition\":", .{profile_icon_id});
     try jsonString(writer, position);
+    // 战绩隐私：LCU/SGP 的召唤师对象带 `privacy`（`PUBLIC` / `PRIVATE`）。
+    // 拿不到身份时写 `null`，「战绩隐藏」标签便不渲染。
+    const privacy = if (identity != .null) jsonField(identity, "privacy") else "";
+    try writer.writeAll(",\"privacy\":");
+    if (privacy.len > 0) try jsonString(writer, privacy) else try writer.writeAll("null");
     // Preserve summoner spells in the live roster. Champ-select may not
     // provide an assigned position yet, so shortcut targeting can identify
     // the jungler from Smite (spell id 11) instead of array order.
@@ -5533,8 +5760,20 @@ fn writeRecentMatchesFiltered(writer: *std.Io.Writer, history_json: []const u8, 
         const kills = statInt(participant, "kills");
         const deaths = statInt(participant, "deaths");
         const assists = statInt(participant, "assists");
+        const gold = statInt(participant, "goldEarned");
+        const cs = statInt(participant, "totalMinionsKilled") + statInt(participant, "neutralMinionsKilled");
+        const vision = statInt(participant, "visionScore");
         const team_damage = teamStat(participants, team_id, "totalDamageDealtToChampions");
         const team_kills = teamStat(participants, team_id, "kills");
+        // 十人明细才凑得出的队伍总量；对应 AK `computeSingleSummary` 的 `teamTotal*`。
+        const team_taken = teamStat(participants, team_id, "totalDamageTaken");
+        const team_gold = teamStat(participants, team_id, "goldEarned");
+        const team_cs = teamStat(participants, team_id, "totalMinionsKilled") + teamStat(participants, team_id, "neutralMinionsKilled");
+        const team_vision = teamStat(participants, team_id, "visionScore");
+        const team_size = teamParticipantCount(participants, team_id);
+        // 只有一个人时「占队伍比例」恒为 100%，是数据不足而不是真实结论，写 `null`
+        // 让前端把该局排除在均值之外（Akari 评分侧同样要求队伍人数 > 1）。
+        const has_team = team_size > 1;
         const explicit_damage_share = statFloat(participant, "damageDealtToChampionsRate");
         const damage_share = if (explicit_damage_share > 0)
             if (explicit_damage_share > 1) explicit_damage_share / 100.0 else explicit_damage_share
@@ -5556,7 +5795,20 @@ fn writeRecentMatchesFiltered(writer: *std.Io.Writer, history_json: []const u8, 
         try writeSummonerSpells(writer, participant);
         try writer.writeAll(",\"runes\":");
         try writeRunes(writer, participant);
-        try writer.print(",\"damageDealt\":{d},\"damageTaken\":{d},\"heal\":{d},\"goldEarned\":{d},\"cs\":{d},\"damageShare\":{d:.4},\"killParticipation\":{d:.4}", .{ damage, taken, statInt(participant, "totalHeal"), statInt(participant, "goldEarned"), statInt(participant, "totalMinionsKilled") + statInt(participant, "neutralMinionsKilled"), damage_share, kill_participation });
+        try writer.print(",\"damageDealt\":{d},\"damageTaken\":{d},\"heal\":{d},\"goldEarned\":{d},\"cs\":{d},\"damageShare\":{d:.4},\"killParticipation\":{d:.4}", .{ damage, taken, statInt(participant, "totalHeal"), gold, cs, damage_share, kill_participation });
+        // 队伍占比与队伍总量：AK 的场均标签（承伤/经济/补刀/视野占比）与 Akari 评分
+        // 都吃这几个数。缺十人明细时写 `null`，前端会把该局排除在样本外。
+        try writer.writeAll(",\"damageTakenShare\":");
+        try writeOptionalRatio(writer, if (has_team) teamShare(taken, team_taken) else null);
+        try writer.writeAll(",\"goldShare\":");
+        try writeOptionalRatio(writer, if (has_team) teamShare(gold, team_gold) else null);
+        try writer.writeAll(",\"csShare\":");
+        try writeOptionalRatio(writer, if (has_team) teamShare(cs, team_cs) else null);
+        try writer.writeAll(",\"visionScoreShare\":");
+        try writeOptionalRatio(writer, if (has_team) teamShare(vision, team_vision) else null);
+        try writer.print(",\"visionScore\":{d},\"teamSize\":{d},\"teamKills\":{d},\"teamDamageTaken\":{d}", .{ vision, team_size, team_kills, team_taken });
+        try writer.writeAll(",\"enemyMissingPings\":");
+        if (pingCount(participant, "enemyMissingPings")) |pings| try writer.print("{d}", .{pings}) else try writer.writeAll("null");
         for ([_][]const u8{
             "soloKills",
             "takedownsFirstXMinutes",
@@ -6764,6 +7016,72 @@ test "排位过滤先筛选再分页和统计且关闭后恢复全部原始战�
     for (recent.value.array.items) |game| try std.testing.expect(jsonBool(game, "win") and isRankedHistoryGame(game));
     writer = std.Io.Writer.fixed(&output);
     try std.testing.expectEqual(@as(usize, 3), try writeRecentMatchesFiltered(&writer, history, .null, "本人", 20, false));
+}
+
+test "战绩列表补齐队伍占比与闪现位置所需的字段" {
+    const history =
+        \\{"games":{"games":[{"gameId":77,"queueId":420,"gameDuration":1800,"gameCreation":1700000000000,"participants":[
+        \\{"puuid":"本人","championId":1,"teamId":100,"spell1Id":4,"spell2Id":12,"stats":{"win":true,"kills":5,"deaths":2,"assists":5,"totalDamageDealtToChampions":1000,"totalDamageTaken":500,"goldEarned":10000,"totalMinionsKilled":100,"neutralMinionsKilled":10,"visionScore":20,"totalHeal":300,"enemyMissingPings":7}},
+        \\{"puuid":"队友","championId":2,"teamId":100,"spell1Id":12,"spell2Id":4,"stats":{"win":true,"kills":5,"deaths":2,"assists":5,"totalDamageDealtToChampions":4000,"totalDamageTaken":1500,"goldEarned":30000,"totalMinionsKilled":200,"neutralMinionsKilled":20,"visionScore":60,"totalHeal":100,"enemyMissingPings":3}}
+        \\]}]}}
+    ;
+    var output: [32 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    try std.testing.expectEqual(@as(usize, 1), try writeRecentMatchesFiltered(&writer, history, .null, "本人", 20, false));
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
+    defer parsed.deinit();
+    const match = parsed.value.array.items[0];
+
+    // 队伍占比：500 / 2000 承伤、10000 / 40000 经济、110 / 330 补刀、20 / 80 视野。
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), jsonFloat(match, "damageTakenShare"), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), jsonFloat(match, "goldShare"), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 110.0 / 330.0), jsonFloat(match, "csShare"), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), jsonFloat(match, "visionScoreShare"), 0.0001);
+    // 队伍总量：Akari 评分与击杀伤害转化都要用。
+    try std.testing.expectEqual(@as(i64, 2), jsonInt(match, "teamSize"));
+    try std.testing.expectEqual(@as(i64, 10), jsonInt(match, "teamKills"));
+    try std.testing.expectEqual(@as(i64, 2000), jsonInt(match, "teamDamageTaken"));
+    try std.testing.expectEqual(@as(i64, 20), jsonInt(match, "visionScore"));
+    // ping 统计：SGP 明细里才有。
+    try std.testing.expectEqual(@as(i64, 7), jsonInt(match, "enemyMissingPings"));
+    // 闪现位置靠 `summonerSpells` 的顺序：索引 0 = D(闪现)、索引 1 = F(点燃)。
+    const spells = match.object.get("summonerSpells").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), spells.len);
+    try std.testing.expectEqual(@as(i64, 4), jsonInt(spells[0], "id"));
+    try std.testing.expectEqual(@as(i64, 12), jsonInt(spells[1], "id"));
+
+    // 队伍总量整块缺失时写 `null`，而不是用假 0 把均值拉低。
+    const sparse =
+        \\{"games":{"games":[{"gameId":78,"queueId":420,"gameDuration":1800,"participants":[{"puuid":"本人","championId":1,"teamId":100,"win":false}]}]}}
+    ;
+    writer = std.Io.Writer.fixed(&output);
+    try std.testing.expectEqual(@as(usize, 1), try writeRecentMatchesFiltered(&writer, sparse, .null, "本人", 20, false));
+    const sparse_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
+    defer sparse_parsed.deinit();
+    const sparse_match = sparse_parsed.value.array.items[0];
+    try std.testing.expect(sparse_match.object.get("damageTakenShare").? == .null);
+    try std.testing.expect(sparse_match.object.get("goldShare").? == .null);
+    try std.testing.expect(sparse_match.object.get("csShare").? == .null);
+    try std.testing.expect(sparse_match.object.get("visionScoreShare").? == .null);
+    try std.testing.expect(sparse_match.object.get("enemyMissingPings").? == .null);
+    try std.testing.expectEqual(@as(i64, 1), jsonInt(sparse_match, "teamSize"));
+
+    // 队伍只剩一个人时，「占队伍比例」恒为 100%，属于数据不足 → 也写 `null`。
+    const solo =
+        \\{"games":{"games":[{"gameId":79,"queueId":420,"gameDuration":1800,"participants":[{"puuid":"本人","championId":1,"teamId":100,"stats":{"win":true,"kills":5,"totalDamageTaken":500,"goldEarned":10000,"totalMinionsKilled":100,"visionScore":20}}]}]}}
+    ;
+    writer = std.Io.Writer.fixed(&output);
+    try std.testing.expectEqual(@as(usize, 1), try writeRecentMatchesFiltered(&writer, solo, .null, "本人", 20, false));
+    const solo_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
+    defer solo_parsed.deinit();
+    const solo_match = solo_parsed.value.array.items[0];
+    try std.testing.expect(solo_match.object.get("damageTakenShare").? == .null);
+    try std.testing.expect(solo_match.object.get("goldShare").? == .null);
+    try std.testing.expect(solo_match.object.get("csShare").? == .null);
+    try std.testing.expect(solo_match.object.get("visionScoreShare").? == .null);
+    // 原始数值仍然照常输出，便于其它 UI 直接展示。
+    try std.testing.expectEqual(@as(i64, 500), jsonInt(solo_match, "damageTaken"));
+    try std.testing.expectEqual(@as(i64, 10000), jsonInt(solo_match, "goldEarned"));
 }
 
 test "切换排位口径取消旧批次并清除已生成统计" {

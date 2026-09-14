@@ -11,13 +11,13 @@ import PlayerDetailDrawer from "../components/PlayerDetailDrawer.vue";
 import PlayerTagEditPanel from "../components/PlayerTagEditPanel.vue";
 import EncounterDetails from "../components/EncounterDetails.vue";
 import { useEncounters } from "../composables/useEncounters";
+import { useMatchDetail } from "../composables/useMatchDetail";
 import { usePlayerNotes } from "../composables/usePlayerNotes";
 import TeamSummaryCard from "../components/TeamSummaryCard.vue";
 import { backend, isTauri } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { EncounterRecord, LiveLobby, LiveTeam, PlayerProfile } from "../types/domain";
-import { HIGH_WIN_RATE_LABEL, HIGH_WIN_RATE_MIN_SAMPLE, HIGH_WIN_RATE_THRESHOLD } from "../tags/definitions/performance";
-import { POOL_CONCENTRATION_LABEL, POOL_CONCENTRATION_THRESHOLD } from "../tags/definitions/playstyle";
+import { HIGH_WIN_RATE_LABEL, HIGH_WIN_RATE_MIN_SAMPLE, HIGH_WIN_RATE_THRESHOLD } from "../tags/definitions/basic";
 import { deriveTagFacts } from "../tags/facts";
 import { createCoalescedAsyncRunner } from "../utils/coalescedAsync";
 import { roleName } from "../utils/format";
@@ -183,6 +183,20 @@ const hasLobbyPlayers = computed(() => teams.value.some((team) => team.players.l
 const premadeTones = computed(() => assignPremadeTones(teams.value.map((team) => team.players)));
 const premadeTone = (player: PlayerProfile) => premadeTones.value.get(player);
 const localPlayer = computed(() => findLocalPlayer(allyTeam.value.players, app.connection.gameName, app.connection.tagLine));
+/**
+ * 「最近一局回看」那一行的完整十人数据。
+ *
+ * `current.recentMatch` 来自 LCU 战绩列表，通常只带查询者本人一条 `participants`，
+ * 直接展开渲染不出十人阵容；这里按 gameId 单独拉一次完整数据，和首页 / 抽屉同一套逻辑。
+ * 不展开时不发请求（`gameId` 为 null）。
+ */
+const expandedRecentMatchId = computed(() => (recentMatchExpanded.value ? current.value?.recentMatch?.gameId ?? null : null));
+const { matchForRow: recentMatchForRow, loading: recentMatchDetailLoading, error: recentMatchDetailError } = useMatchDetail({
+  gameId: expandedRecentMatchId,
+  subjectPuuid: computed(() => current.value?.recentMatch?.participants?.[0]?.puuid ?? localPlayer.value?.puuid ?? app.connection.puuid ?? ""),
+  selfPuuid: computed(() => app.connection.puuid ?? localPlayer.value?.puuid ?? ""),
+  enabled: computed(() => Boolean(current.value?.recentMatch)),
+});
 const encounterQuery = useEncounters(
   "", () => Boolean(current.value && app.initialized),
   () => Number(current.value?.id) || 0,
@@ -258,14 +272,18 @@ const dangerPoints = computed(() => {
     return facts.sample >= HIGH_WIN_RATE_MIN_SAMPLE && facts.winRate >= HIGH_WIN_RATE_THRESHOLD;
   });
   const premade = enemy.filter((player) => player.isPremade);
-  const concentrated = enemy.find((player) => player.championPoolConcentration >= POOL_CONCENTRATION_THRESHOLD);
+  // 闪现位置忽然变来变去，往往比战绩更能说明「这是不是本人」。
+  const suspiciousFlash = enemy.find((player) => {
+    const facts = deriveTagFacts(player);
+    return facts.flashOnD > 0 && facts.flashOnF > 0;
+  });
   if (hot) {
     const recent = hot.recentMatches.slice(0, recentLimit.value);
     points.push({ tone: "danger", title: `${roleName(hot.assignedPosition)} 位${HIGH_WIN_RATE_LABEL}`, detail: `${hot.gameName} 近${recentLimit.value}场 ${recent.filter((match) => match.win).length} 胜，当前英雄 ${hot.currentChampionGames} 场。` });
   }
   if (premade.length >= 2) points.push({ tone: "warning", title: "敌方存在已知组队", detail: `${premade.slice(0, 2).map((player) => player.gameName).join(" + ")} 有共同组队证据。` });
-  if (concentrated) points.push({ tone: "warning", title: `${roleName(concentrated.assignedPosition)} ${POOL_CONCENTRATION_LABEL}`, detail: `${concentrated.gameName} 的英雄池集中度 ${Math.round(concentrated.championPoolConcentration * 100)}%，可结合 BP 针对。` });
-  if (!points.length) points.push({ tone: "success", title: "暂未发现高风险玩家", detail: `当前局没有触发${HIGH_WIN_RATE_LABEL}、组队或${POOL_CONCENTRATION_LABEL}的规则。` });
+  if (suspiciousFlash) points.push({ tone: "warning", title: `${roleName(suspiciousFlash.assignedPosition)} 闪现位置可疑`, detail: `${suspiciousFlash.gameName} 的闪现既放在 D 位也放在 F 位，可能是换人上号。` });
+  if (!points.length) points.push({ tone: "success", title: "暂未发现高风险玩家", detail: `当前局没有触发${HIGH_WIN_RATE_LABEL}、组队或闪现位置异常的规则。` });
   return points;
 });
 
@@ -476,7 +494,7 @@ onBeforeUnmount(() => {
       </section>
       <section v-else class="game-history-panel">
         <header><div><span class="eyebrow">最近对局 / 回顾</span><h2>当前没有可读取的十人阵容</h2><p>{{ phaseLabel }} 阶段保留对局页；下面显示最近一局完整数据，可展开查看十人阵容与 BP。</p></div><NButton quaternary size="small" :loading="lobby.isFetching.value" @click="refresh"><template #icon><RefreshCw :size="14" /></template>刷新状态</NButton></header>
-        <MatchDetailCard v-if="current.recentMatch" :match="current.recentMatch" :expanded="recentMatchExpanded" compact @toggle="recentMatchExpanded = !recentMatchExpanded" />
+        <MatchDetailCard v-if="current.recentMatch" :match="recentMatchForRow(current.recentMatch)" :expanded="recentMatchExpanded" :expandable="true" :detail-loading="recentMatchExpanded && recentMatchDetailLoading" :detail-error="recentMatchExpanded ? recentMatchDetailError : ''" compact @toggle="recentMatchExpanded = !recentMatchExpanded" />
         <NEmpty v-else description="暂无可回看的历史对局" />
       </section>
     </template>

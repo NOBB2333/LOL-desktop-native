@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ChevronRight, Filter, List, RefreshCw, Search, Trophy } from "@lucide/vue";
+import { ChevronRight, Filter, List, MapPinned, RefreshCw, Search, Trophy } from "@lucide/vue";
 import { NButton, NInput, NSelect, useMessage } from "naive-ui";
 import { computed, ref, watch } from "vue";
 import { useQuery } from "@tanstack/vue-query";
@@ -10,8 +10,8 @@ import MatchHistoryDetail from "../components/MatchHistoryDetail.vue";
 import PageHeader from "../components/PageHeader.vue";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
-import type { MatchSummary } from "../types/domain";
-import { championImage, roleName, shortDate } from "../utils/format";
+import type { MatchSummary, SummonerSearchCandidate, SummonerSearchResult } from "../types/domain";
+import { championImage, platformRegionName, platformRegionOverview, roleName, shortDate } from "../utils/format";
 import { visibleMatches } from "../matches/filters";
 import { matchHistoryQueryKey } from "../matches/query";
 import { useMatchDetail } from "../composables/useMatchDetail";
@@ -26,6 +26,17 @@ const activeSummoner = ref(summonerQuery.value);
 const page = ref(0);
 const pageSize = 10;
 const search = ref("");
+/**
+ * 查询表单的解析结果：候选「名字#TAG」列表 + 是否需要补全标签。
+ *
+ * 本地接口（LCU 的 `lol-summoner/v1/summoners?name=`、Riot Client 的
+ * `player-account/aliases/v1/lookup`）都是**精确匹配**，没有任何 name→tags 的
+ * 反向索引，所以只给名字不一定查得到；把结果留下来才能在界面上把这件事说清楚，
+ * 而不是把「解析失败」伪装成「这个人没有对局」。
+ */
+const searchResult = ref<SummonerSearchResult | null>(null);
+const searchError = ref("");
+const searchPending = ref(false);
 const result = ref("all");
 const queue = ref("all");
 const viewMode = ref<"detail" | "index">(typeof localStorage === "undefined" ? "detail" : localStorage.getItem("lol-desktop-match-view") === "index" ? "index" : "detail");
@@ -87,14 +98,56 @@ const expandedMatchDetail = useMatchDetail({
   selfPuuid: computed(() => app.connection.puuid ?? ""),
 });
 async function searchSummoner() {
-  activeSummoner.value = summonerQuery.value.trim();
+  const query = summonerQuery.value.trim();
+  searchError.value = "";
+  searchResult.value = null;
+  // 留空 = 恢复当前登录账号（原来是直接查，这里保持同一语义）。
+  if (!query) return void applySummoner("");
+  searchPending.value = true;
+  try {
+    const result = await backend.searchSummoner(query);
+    searchResult.value = result;
+    // 唯一候选：直接跳过去查，省掉一次点击。
+    if (result.candidates.length === 1) return void applySummoner(riotIdOf(result.candidates[0]));
+    // 完整的「名字#TAG」即使没解析出候选也值得直接交给 LCU 试一次：
+    // 候选解析失败只说明 Riot Client 不可用，不代表这个人不存在。
+    if (result.candidates.length === 0 && result.hasTag) return void applySummoner(query);
+    // 只给名字又解析不到：不发起注定落空的查询，改为提示补全标签。
+    if (result.candidates.length === 0) {
+      message.warning("客户端只能精确匹配，请补全为「名字#标签」后再试");
+      return;
+    }
+    message.info(`匹配到 ${result.candidates.length} 个账号，请选择要查询的玩家`);
+  } catch (cause) {
+    searchError.value = cause instanceof Error ? cause.message : String(cause);
+  } finally {
+    searchPending.value = false;
+  }
+}
+
+/** `名字#TAG`；没有标签时退化成只用名字。 */
+function riotIdOf(candidate: SummonerSearchCandidate) {
+  return candidate.tagLine ? `${candidate.gameName}#${candidate.tagLine}` : candidate.gameName;
+}
+
+/** 把当前查询切到某位玩家（或空串恢复当前账号）并刷新列表。 */
+async function applySummoner(riotId: string) {
+  summonerQuery.value = riotId;
+  activeSummoner.value = riotId;
   page.value = 0;
   selectedId.value = null;
   detailOpen.value = true;
-  await router.replace({ query: activeSummoner.value ? { summoner: activeSummoner.value } : {} });
+  await router.replace({ query: riotId ? { summoner: riotId } : {} });
   await matches.refetch();
-  message.success(activeSummoner.value ? `已查询召唤师：${activeSummoner.value}` : "已恢复当前账号战绩");
+  message.success(riotId ? `已查询召唤师：${riotId}` : "已恢复当前账号战绩");
 }
+
+function pickCandidate(candidate: SummonerSearchCandidate) {
+  void applySummoner(riotIdOf(candidate));
+}
+
+/** 当前登录大区，用于在大区参考里高亮。 */
+const regionOverview = computed(() => platformRegionOverview(app.connection.platformId || app.connection.region));
 async function refresh() { await matches.refetch(); message.success("已请求最新战绩"); }
 async function goPage(next: number) { if (next < 0 || (next > page.value && !hasNextPage.value)) return; page.value = next; selectedId.value = null; detailOpen.value = true; await matches.refetch(); }
 
@@ -112,10 +165,47 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
 
     <section class="matches-query-panel">
       <form class="matches-query-form" @submit.prevent="searchSummoner">
-        <label class="matches-query-field"><span>查询其他玩家</span><NInput v-model:value="summonerQuery" size="large" placeholder="完整 Riot ID，例如 玩家名#12345" clearable><template #prefix><Search :size="16" /></template></NInput></label>
-        <NButton class="matches-query-submit" type="primary" size="large" attr-type="submit" :loading="matches.isFetching.value">查询战绩</NButton>
-        <p>当前 LCU 要求完整的“名称#标签”；留空则恢复当前登录账号。</p>
+        <label class="matches-query-field"><span>查询其他玩家</span><NInput v-model:value="summonerQuery" size="large" placeholder="名字，或完整的 名字#标签（例如 玩家名#12345）" clearable><template #prefix><Search :size="16" /></template></NInput></label>
+        <NButton class="matches-query-submit" type="primary" size="large" attr-type="submit" :loading="searchPending">查询战绩</NButton>
+        <p>先尝试解析查询：唯一命中会直接跳转；留空则恢复当前登录账号。</p>
       </form>
+
+      <!-- 候选：名字重复时列出所有精确命中，点一下即查询。 -->
+      <div v-if="searchResult && searchResult.candidates.length" class="matches-candidates">
+        <span class="matches-candidates__label">精确匹配 {{ searchResult.candidates.length }} 个账号</span>
+        <button v-for="candidate in searchResult.candidates" :key="candidate.puuid" type="button" class="matches-candidate" @click="pickCandidate(candidate)">
+          <strong>{{ candidate.gameName }}</strong>
+          <small v-if="candidate.tagLine">#{{ candidate.tagLine }}</small>
+          <em v-if="candidate.puuid === app.connection.puuid">当前账号</em>
+        </button>
+      </div>
+
+      <!-- 解释「为什么只给名字查不到」：客户端没有 name→tags 的反向索引。 -->
+      <p v-if="searchResult?.requiresTag" class="matches-query-note" data-tone="warning">
+        客户端只提供精确匹配，没有「按名字列出所有标签」的接口：只给名字时最多在
+        {{ regionOverview.current ? `${regionOverview.current.id} · ${regionOverview.current.name}` : "当前大区" }}
+        解析一个结果。请补全为 <b>名字#标签</b>——补全后即使是别的大区也能查到。
+      </p>
+      <p v-else-if="searchError" class="matches-query-note" data-tone="warning">{{ searchError }}</p>
+
+      <!-- 可选大区：本地 API 只能读当前登录大区，这里是可查询的大区清单与编号。 -->
+      <div class="matches-regions">
+        <div class="matches-regions__head">
+          <MapPinned :size="13" />
+          <span>可选大区</span>
+          <small>当前登录：{{ regionOverview.current ? `${regionOverview.current.id} · ${regionOverview.current.name}` : platformRegionName(app.connection.platformId || app.connection.region) }}</small>
+        </div>
+        <div class="matches-regions__groups">
+          <div v-for="group in regionOverview.groups" :key="group.label" class="matches-regions__group">
+            <span class="matches-regions__group-label">{{ group.label }}</span>
+            <p v-for="region in group.regions" :key="region.id" :data-current="region.id === regionOverview.current?.id" :title="region.servers">
+              <strong>{{ region.id }}</strong><span>{{ region.name }}</span>
+            </p>
+          </div>
+        </div>
+        <p class="matches-regions__note">大区由客户端登录状态决定，切换大区需要在客户端重新登录；跨区查战绩只需在查询框里带上完整的「名字#标签」。</p>
+      </div>
+
       <div class="matches-filter-row">
         <div class="matches-filter-title"><Filter :size="14" /><span>当前页筛选</span></div>
         <NInput v-model:value="search" size="small" placeholder="英雄 / 模式 / 玩家" clearable />
@@ -158,6 +248,9 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
 .matches-page--workspace { width: 100%; max-width: none; }
 .matches-page-actions { display: flex; align-items: center; gap: 5px; }
 .matches-query-panel { display: grid; gap: 11px; margin-bottom: 14px; padding: 14px 16px; border: 1px solid var(--line); background: var(--surface); }.matches-query-form { display: grid; grid-template-columns: minmax(280px, 1fr) auto; align-items: end; gap: 10px 14px; }.matches-query-field { display: grid; gap: 5px; min-width: 0; }.matches-query-field > span { color: var(--text-primary); font-size: 11px; font-weight: 700; }.matches-query-field .n-input { width: min(100%, 620px); }.matches-query-submit { justify-self: end; min-width: 116px; }.matches-query-form > p { grid-column: 1 / -1; margin: 0; color: var(--text-secondary); font-size: 9px; }.matches-filter-row { display: grid; grid-template-columns: auto minmax(190px, 1fr) 120px 150px auto; align-items: center; gap: 7px; padding-top: 10px; border-top: 1px solid var(--line); }.matches-filter-title { display: inline-flex; align-items: center; gap: 5px; color: var(--text-muted); font-size: 9px; }.matches-filter-count { justify-self: end; color: var(--text-secondary); font-size: 9px; font-variant-numeric: tabular-nums; }
+.matches-candidates { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding-top: 10px; border-top: 1px solid var(--line); }.matches-candidates__label { color: var(--text-muted); font-size: 9px; }.matches-candidate { display: inline-flex; align-items: center; gap: 3px; padding: 4px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--text-primary); background: var(--surface-raised); cursor: pointer; font-size: 11px; transition: border-color 140ms ease, background 140ms ease; }.matches-candidate:hover { border-color: var(--accent); background: var(--accent-soft); }.matches-candidate strong { font-weight: 700; }.matches-candidate small { color: var(--text-secondary); font-size: 10px; }.matches-candidate em { padding: 1px 5px; border-radius: 3px; color: var(--accent); background: var(--accent-soft); font-size: 8px; font-style: normal; font-weight: 700; }
+.matches-query-note { margin: 0; padding: 8px 10px; border: 1px dashed var(--line-strong); border-left: 3px solid var(--amber); color: var(--text-secondary); background: var(--surface-raised); font-size: 10px; line-height: 1.5; }.matches-query-note b { color: var(--text-primary); }
+.matches-regions { display: grid; gap: 7px; padding-top: 10px; border-top: 1px solid var(--line); }.matches-regions__head { display: flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 9px; }.matches-regions__head > span { color: var(--text-secondary); font-weight: 700; }.matches-regions__head > small { color: var(--text-muted); }.matches-regions__groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 6px 14px; }.matches-regions__group { display: grid; grid-template-columns: 58px minmax(0, 1fr); align-items: center; gap: 6px; min-width: 0; }.matches-regions__group-label { color: var(--text-muted); font-size: 9px; font-weight: 700; }.matches-regions__group p { display: inline-flex; align-items: baseline; gap: 5px; margin: 0 6px 0 0; padding: 2px 7px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface-raised); font-size: 10px; }.matches-regions__group p[data-current="true"] { border-color: var(--accent); background: var(--accent-soft); }.matches-regions__group p strong { color: var(--text-primary); font-variant-numeric: tabular-nums; }.matches-regions__group p span { color: var(--text-secondary); font-size: 9px; }.matches-regions__note { margin: 0; color: var(--text-muted); font-size: 9px; line-height: 1.5; }
 .matches-summary { display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)) minmax(230px, 1.4fr); gap: 1px; margin-bottom: 14px; border: 1px solid var(--line); background: var(--line); }.matches-summary > div { min-height: 70px; padding: 12px 15px; background: var(--surface); }.matches-summary span, .matches-summary strong { display: block; }.matches-summary span { color: var(--text-secondary); font-size: 10px; }.matches-summary strong { margin-top: 9px; font-size: 20px; font-variant-numeric: tabular-nums; }.matches-summary small { color: var(--text-secondary); font-size: 11px; font-weight: 500; }.matches-summary__result { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 11px; }.matches-summary__result span { display: inline; }
 .match-table-shell { border: 1px solid var(--line); background: var(--surface); }.match-table-heading { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; padding: 13px 15px 10px; border-bottom: 1px solid var(--line); }.match-table-heading h2 { margin: 4px 0 0; font-size: 16px; }.match-table-heading__hint { color: var(--text-muted); font-size: 9px; }.match-list--full { padding: 8px; overflow-x: auto; }
 .matches-workspace { display: grid; grid-template-columns: minmax(184px, .16fr) minmax(0, 1fr); gap: 8px; min-width: 0; align-items: stretch; }.matches-index, .matches-detail-panel { min-width: 0; border: 1px solid var(--line); background: var(--surface); }.matches-index { display: flex; flex-direction: column; overflow: hidden; }.matches-index__header { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; padding: 11px 12px 9px; border-bottom: 1px solid var(--line); }.matches-index__header h2 { margin: 3px 0 0; font-size: 14px; }.matches-index__header > span { color: var(--text-secondary); font-size: 8px; font-variant-numeric: tabular-nums; }.matches-index__list { display: grid; align-content: start; flex: 1; gap: 4px; padding: 5px; overflow: auto; }

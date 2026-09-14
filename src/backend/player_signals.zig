@@ -11,15 +11,16 @@
 //!
 //! | 信号 | 对应前端定义 |
 //! |---|---|
-//! | `极高胜率` | `definitions/performance.ts` `HIGH_WIN_RATE_TAG` |
+//! | `极高胜率` | `definitions/basic.ts` `HIGH_WIN_RATE_TAG` |
 //! | `N 连胜` / `N 连败` | 同上 `WINNING_STREAK_TAG` / `LOSING_STREAK_TAG` |
-//! | `好抓` / `非常好抓` / `难抓` | `definitions/playstyle.ts` `EASY_GANK_TAG` |
-//! | `N 单杀` | 同上 `SOLO_KILLS_TAG` |
-//! | `伤害 N%` | 同上 `DAMAGE_SHARE_TAG` |
-//! | `分均补刀 N` | 同上 `CS_PER_MINUTE_TAG` |
-//! | `阵亡偏多` / `生存稳健` | 同上 `DEATHS_TAG` |
-//! | `参团积极` / `参团偏低` | 同上 `PARTICIPATION_TAG` |
-//! | `英雄池集中` | 同上 `POOL_CONCENTRATION_TAG` |
+//! | `好抓` / `非常好抓` / `难抓` | 同上 `EASY_GANK_TAG` |
+//! | `击杀伤害转化高` / `击杀伤害转化低` | 同上 `AVERAGE_KILL_DAMAGE_EFFICIENCY_TAG` |
+//! | `闪现位置可疑` | `definitions/suspicious-flash-position.ts` |
+//! | `N 单杀` | `definitions/basic.ts` `SOLO_KILLS_TAG` |
+//!
+//! 只保留 LeagueAkari 有的那几档。本项目自创的「阵亡偏多 / 参团偏低 / 英雄池集中」
+//! 以及「伤害占比 / 分均补刀」两条陈述已随标签系统一并删除 —— 它们只报数值、
+//! 不做判断的同类留在了卡片标签里，不再进 `{tag}` / `{risk}` 快捷消息。
 //!
 //! **改任一侧的阈值或文案，必须同步另一侧。** 前端侧的断言在
 //! `frontend/src/tags/tags.test.ts`，后端侧的断言在本文件末尾。
@@ -54,40 +55,36 @@ pub const Bucket = enum {
 /// 单次最多产出的信号数。
 pub const max_signals = 12;
 
-// ── 阈值：与前端 `definitions/` 逐条对齐 ──
+// ── 阈值：与前端 `definitions/basic.ts` 逐条对齐 ──
 const streak_threshold: usize = 3;
-const high_death_threshold: f64 = 6;
-const low_death_threshold: f64 = 3;
-const high_participation_threshold: f64 = 0.62;
-const low_participation_threshold: f64 = 0.4;
-const damage_core_threshold: f64 = 0.27;
-const strong_farm_threshold: f64 = 7.2;
-const pool_concentration_threshold: f64 = 0.7;
 const high_win_rate_min_sample: usize = 16;
 const high_win_rate_threshold: f64 = 0.85;
-/// 场均类判定的样本下限（前端 `AVERAGE_MIN_SAMPLE`）。
-const average_min_sample: usize = 5;
 /// 单杀判定的精确数据样本下限（前端 `SOLO_KILL_MIN_SAMPLE`）。
 const solo_kill_min_sample: usize = 3;
 /// 好抓判定：`> 2` 非常好抓、`>= 1.5` 好抓、`[1, 1.5)` 不标注、`< 1` 难抓。
 const gank_very_easy_threshold: f64 = 2;
 const gank_easy_threshold: f64 = 1.5;
+/// 击杀伤害转化分档：`> 1.35` 高、`< 0.65` 低（前端 `KILL_DAMAGE_EFFICIENCY_*`）。
+const kill_damage_high_threshold: f64 = 1.35;
+const kill_damage_low_threshold: f64 = 0.65;
+/// 闪现（Flash）的法术 id。与前端 `facts.ts` 的 `FLASH_SPELL_ID` 一致。
+const flash_spell_id: i64 = 4;
 
 /// 汇总后的指标。
 pub const Metrics = struct {
     sample: usize = 0,
     wins: usize = 0,
-    deaths_total: i64 = 0,
-    participation_total: f64 = 0,
-    damage_share_total: f64 = 0,
-    cs_per_minute_total: f64 = 0,
+    /// 逐局「击杀伤害转化」之和：`kills / teamKills / damageShare`，退化局记 1。
+    kill_damage_efficiency_total: f64 = 0,
     solo_count: usize = 0,
     solo_total: f64 = 0,
     gank_count: usize = 0,
     gank_total: f64 = 0,
     winning_streak: usize = 0,
     losing_streak: usize = 0,
-    concentration: f64 = 0,
+    /// 闪现放在 D / F 位的对局数。
+    flash_on_d: usize = 0,
+    flash_on_f: usize = 0,
     is_jungler: bool = false,
 
     pub fn winRate(self: Metrics) f64 {
@@ -95,24 +92,10 @@ pub const Metrics = struct {
         return @as(f64, @floatFromInt(self.wins)) / @as(f64, @floatFromInt(self.sample));
     }
 
-    pub fn averageDeaths(self: Metrics) f64 {
-        if (self.sample == 0) return 0;
-        return @as(f64, @floatFromInt(self.deaths_total)) / @as(f64, @floatFromInt(self.sample));
-    }
-
-    pub fn averageParticipation(self: Metrics) f64 {
-        if (self.sample == 0) return 0;
-        return self.participation_total / @as(f64, @floatFromInt(self.sample));
-    }
-
-    pub fn averageDamageShare(self: Metrics) f64 {
-        if (self.sample == 0) return 0;
-        return self.damage_share_total / @as(f64, @floatFromInt(self.sample));
-    }
-
-    pub fn averageCsPerMinute(self: Metrics) f64 {
-        if (self.sample == 0) return 0;
-        return self.cs_per_minute_total / @as(f64, @floatFromInt(self.sample));
+    /// 空样本按 1（对齐前端 `avgOrOne`，也只用于击杀伤害转化）。
+    pub fn averageKillDamageEfficiency(self: Metrics) f64 {
+        if (self.sample == 0) return 1;
+        return self.kill_damage_efficiency_total / @as(f64, @floatFromInt(self.sample));
     }
 
     pub fn averageSoloKills(self: Metrics) ?f64 {
@@ -123,6 +106,11 @@ pub const Metrics = struct {
     pub fn averageEarlyDeathsWithJungler(self: Metrics) ?f64 {
         if (self.gank_count == 0) return null;
         return self.gank_total / @as(f64, @floatFromInt(self.gank_count));
+    }
+
+    /// 一会儿放 D 一会儿放 F：在「是不是本人」这件事上比战绩更有信息量。
+    pub fn suspiciousFlashPosition(self: Metrics) bool {
+        return self.flash_on_d > 0 and self.flash_on_f > 0;
     }
 };
 
@@ -135,23 +123,23 @@ pub fn analyze(player: std.json.Value) Metrics {
     metrics.winning_streak = leadingStreak(recent, true);
     metrics.losing_streak = leadingStreak(recent, false);
 
-    var champion_ids: [32]i64 = .{0} ** 32;
-    var champion_counts: [32]usize = .{0} ** 32;
-    var distinct: usize = 0;
-    var best: usize = 0;
-    var champion_sample: usize = 0;
-
     for (recent) |match| {
         if (match != .object) continue;
         const minutes = jsonInt(match, "durationMinutes");
         if (minutes <= 0) continue;
         metrics.sample += 1;
         if (jsonBool(match, "win")) metrics.wins += 1;
-        metrics.deaths_total += jsonInt(match, "deaths");
-        metrics.participation_total += jsonFloat(match, "killParticipation");
-        metrics.damage_share_total += jsonFloat(match, "damageShare");
-        metrics.cs_per_minute_total += @as(f64, @floatFromInt(jsonInt(match, "cs"))) /
-            @as(f64, @floatFromInt(@max(minutes, 1)));
+
+        // AK: `kills / teamTotalKills / (damage / teamTotalDamage)`；退化局记 1。
+        // 缺 `teamKills`（老缓存）时同样记 1，结果落在「正常」档、不出信号。
+        const kills = jsonInt(match, "kills");
+        const team_kills = jsonInt(match, "teamKills");
+        const damage_share = jsonFloat(match, "damageShare");
+        metrics.kill_damage_efficiency_total += if (team_kills == 0 or damage_share <= 0)
+            1
+        else
+            @as(f64, @floatFromInt(kills)) / @as(f64, @floatFromInt(team_kills)) / damage_share;
+
         if (jsonOptionalFloat(match, "soloKills")) |value| {
             metrics.solo_count += 1;
             metrics.solo_total += value;
@@ -161,31 +149,13 @@ pub fn analyze(player: std.json.Value) Metrics {
             metrics.gank_total += value;
         }
 
-        // 缺 `championId` 的对局不进英雄池统计：否则「全部缺失」会被当成
-        // 「全是同一个英雄」，凭空造出一条「英雄池集中」。
-        if (hasField(match, "championId")) {
-            champion_sample += 1;
-            const champion_id = jsonInt(match, "championId");
-            var slot: ?usize = null;
-            for (champion_ids[0..distinct], 0..) |known, index| if (known == champion_id) {
-                slot = index;
-                break;
-            };
-            if (slot) |index| {
-                champion_counts[index] += 1;
-                best = @max(best, champion_counts[index]);
-            } else if (distinct < champion_ids.len) {
-                champion_ids[distinct] = champion_id;
-                champion_counts[distinct] = 1;
-                distinct += 1;
-                best = @max(best, 1);
-            }
+        // `summonerSpells` 按 [spell1Id, spell2Id] 输出，即索引 0 = D、索引 1 = F。
+        if (nestedArray(match, "summonerSpells")) |spells| {
+            if (spells.len > 0 and jsonInt(spells[0], "id") == flash_spell_id) metrics.flash_on_d += 1;
+            if (spells.len > 1 and jsonInt(spells[1], "id") == flash_spell_id) metrics.flash_on_f += 1;
         }
     }
 
-    if (champion_sample > 0) {
-        metrics.concentration = @as(f64, @floatFromInt(best)) / @as(f64, @floatFromInt(champion_sample));
-    }
     return metrics;
 }
 
@@ -250,7 +220,7 @@ pub fn writeStreak(writer: *std.Io.Writer, player: std.json.Value) !void {
     return writer.writeAll("状态稳定");
 }
 
-/// 遍历全部信号。顺序对齐 `frontend/src/tags/registry.ts`。
+/// 遍历全部信号。顺序对齐 `frontend/src/tags/signals.ts` 的 `playerSignals`。
 fn emitAll(emitter: *Emitter, player: std.json.Value) !void {
     const metrics = analyze(player);
     if (metrics.sample == 0) return;
@@ -275,35 +245,19 @@ fn emitAll(emitter: *Emitter, player: std.json.Value) !void {
             }
         }
     }
+    const kill_damage = metrics.averageKillDamageEfficiency();
+    if (kill_damage > kill_damage_high_threshold) {
+        try emitter.emit(.positive, "击杀伤害转化高", .{});
+    } else if (kill_damage < kill_damage_low_threshold) {
+        try emitter.emit(.negative, "击杀伤害转化低", .{});
+    }
+    if (metrics.suspiciousFlashPosition()) {
+        try emitter.emit(.negative, "闪现位置可疑", .{});
+    }
     if (metrics.solo_count >= solo_kill_min_sample) {
         if (metrics.averageSoloKills()) |average| {
             if (average > 0) try emitter.emit(.neutral, "{d:.1} 单杀", .{average});
         }
-    }
-    if (metrics.sample >= average_min_sample) {
-        const damage_share = metrics.averageDamageShare();
-        if (damage_share >= damage_core_threshold) {
-            try emitter.emit(.positive, "伤害 {d:.0}%", .{damage_share * 100});
-        }
-        const cs = metrics.averageCsPerMinute();
-        if (cs >= strong_farm_threshold) {
-            try emitter.emit(.neutral, "分均补刀 {d:.1}", .{cs});
-        }
-        const deaths = metrics.averageDeaths();
-        if (deaths >= high_death_threshold) {
-            try emitter.emit(.negative, "阵亡偏多", .{});
-        } else if (deaths <= low_death_threshold) {
-            try emitter.emit(.positive, "生存稳健", .{});
-        }
-        const participation = metrics.averageParticipation();
-        if (participation >= high_participation_threshold) {
-            try emitter.emit(.positive, "参团积极", .{});
-        } else if (participation > 0 and participation <= low_participation_threshold) {
-            try emitter.emit(.negative, "参团偏低", .{});
-        }
-    }
-    if (metrics.concentration >= pool_concentration_threshold) {
-        try emitter.emit(.negative, "英雄池集中", .{});
     }
 }
 
@@ -441,29 +395,79 @@ fn writeBucketToBuf(
     return writer.buffered();
 }
 
-test "strengths 与 risks 按卡片标签的阈值分档" {
+test "strengths 与 risks 只按 AK 的信号分档" {
     var output: [512]u8 = undefined;
+    // 4 连胜 + 高击杀伤害转化（8 / 10 / 0.4 = 2.0 > 1.35）。
     const player_json =
         "{\"assignedPosition\":\"MIDDLE\",\"recentMatches\":[" ++
-        "{\"durationMinutes\":30,\"win\":true,\"deaths\":2,\"killParticipation\":0.7,\"damageShare\":0.3,\"cs\":240}," ++
-        "{\"durationMinutes\":30,\"win\":true,\"deaths\":2,\"killParticipation\":0.7,\"damageShare\":0.3,\"cs\":240}," ++
-        "{\"durationMinutes\":30,\"win\":true,\"deaths\":2,\"killParticipation\":0.7,\"damageShare\":0.3,\"cs\":240}," ++
-        "{\"durationMinutes\":30,\"win\":true,\"deaths\":2,\"killParticipation\":0.7,\"damageShare\":0.3,\"cs\":240}," ++
-        "{\"durationMinutes\":30,\"win\":false,\"deaths\":2,\"killParticipation\":0.7,\"damageShare\":0.3,\"cs\":240}" ++
+        "{\"durationMinutes\":30,\"win\":true,\"kills\":8,\"teamKills\":10,\"damageShare\":0.4}," ++
+        "{\"durationMinutes\":30,\"win\":true,\"kills\":8,\"teamKills\":10,\"damageShare\":0.4}," ++
+        "{\"durationMinutes\":30,\"win\":true,\"kills\":8,\"teamKills\":10,\"damageShare\":0.4}," ++
+        "{\"durationMinutes\":30,\"win\":true,\"kills\":8,\"teamKills\":10,\"damageShare\":0.4}," ++
+        "{\"durationMinutes\":30,\"win\":false,\"kills\":8,\"teamKills\":10,\"damageShare\":0.4}" ++
         "]}";
 
     const strengths = try writeBucketToBuf(&output, player_json, .strengths);
     try std.testing.expect(std.mem.indexOf(u8, strengths, "4 连胜") != null);
-    try std.testing.expect(std.mem.indexOf(u8, strengths, "伤害 30%") != null);
-    try std.testing.expect(std.mem.indexOf(u8, strengths, "分均补刀 8.0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, strengths, "生存稳健") != null);
-    try std.testing.expect(std.mem.indexOf(u8, strengths, "参团积极") != null);
+    try std.testing.expect(std.mem.indexOf(u8, strengths, "击杀伤害转化高") != null);
+
+    // 已随标签系统删除的主观信号不再出现。
+    try std.testing.expect(std.mem.indexOf(u8, strengths, "生存稳健") == null);
+    try std.testing.expect(std.mem.indexOf(u8, strengths, "参团积极") == null);
+    try std.testing.expect(std.mem.indexOf(u8, strengths, "伤害 30%") == null);
+    try std.testing.expect(std.mem.indexOf(u8, strengths, "分均补刀") == null);
 
     // 同一份数据没有任何负向信号。
     try std.testing.expectEqualStrings("", try writeBucketToBuf(&output, player_json, .risks));
 
-    // 颜色/文案与前端定义一致：极高胜率要 16 场 85%，这里只有 4 场。
+    // 颜色/文案与前端定义一致：极高胜率要 16 场 85%，这里只有 5 场。
     try std.testing.expect(std.mem.indexOf(u8, strengths, "极高胜率") == null);
+}
+
+test "闪现位置可疑与击杀伤害转化低进 risks" {
+    var output: [256]u8 = undefined;
+    // 1 / 20 / 0.45 = 0.111 < 0.65；第一局闪现在 D、第二局在 F。
+    const player_json =
+        "{\"recentMatches\":[" ++
+        "{\"durationMinutes\":25,\"win\":true,\"kills\":1,\"teamKills\":20,\"damageShare\":0.45,\"summonerSpells\":[{\"id\":4},{\"id\":12}]}," ++
+        "{\"durationMinutes\":25,\"win\":true,\"kills\":1,\"teamKills\":20,\"damageShare\":0.45,\"summonerSpells\":[{\"id\":12},{\"id\":4}]}" ++
+        "]}";
+    const risks = try writeBucketToBuf(&output, player_json, .risks);
+    try std.testing.expect(std.mem.indexOf(u8, risks, "击杀伤害转化低") != null);
+    try std.testing.expect(std.mem.indexOf(u8, risks, "闪现位置可疑") != null);
+}
+
+test "击杀伤害转化按 > 1.35 / < 0.65 分档" {
+    var output: [256]u8 = undefined;
+    // 每局 kills=1、teamKills=2、damageShare=0.5 → 1/2/0.5 = 1.0（正常，不出信号）。
+    const normal =
+        "{\"recentMatches\":[" ++
+        "{\"durationMinutes\":20,\"win\":true,\"kills\":1,\"teamKills\":2,\"damageShare\":0.5}," ++
+        "{\"durationMinutes\":20,\"win\":true,\"kills\":1,\"teamKills\":2,\"damageShare\":0.5}]}";
+    try std.testing.expect(std.mem.indexOf(u8, try writeBucketToBuf(&output, normal, .strengths), "击杀伤害转化") == null);
+    try std.testing.expect(std.mem.indexOf(u8, try writeBucketToBuf(&output, normal, .risks), "击杀伤害转化") == null);
+
+    // 1/1/0.5 = 2.0（> 1.35，高）。
+    const high =
+        "{\"recentMatches\":[" ++
+        "{\"durationMinutes\":20,\"win\":true,\"kills\":1,\"teamKills\":1,\"damageShare\":0.5}," ++
+        "{\"durationMinutes\":20,\"win\":true,\"kills\":1,\"teamKills\":1,\"damageShare\":0.5}]}";
+    try std.testing.expect(std.mem.indexOf(u8, try writeBucketToBuf(&output, high, .strengths), "击杀伤害转化高") != null);
+
+    // 1/8/0.5 = 0.25（< 0.65，低）。
+    const low =
+        "{\"recentMatches\":[" ++
+        "{\"durationMinutes\":20,\"win\":true,\"kills\":1,\"teamKills\":8,\"damageShare\":0.5}," ++
+        "{\"durationMinutes\":20,\"win\":true,\"kills\":1,\"teamKills\":8,\"damageShare\":0.5}]}";
+    try std.testing.expect(std.mem.indexOf(u8, try writeBucketToBuf(&output, low, .risks), "击杀伤害转化低") != null);
+
+    // 缺 `teamKills`（老缓存）时该局记 1 → 结果落在正常档，不误报。
+    const legacy =
+        "{\"recentMatches\":[" ++
+        "{\"durationMinutes\":20,\"win\":true,\"kills\":30,\"damageShare\":0.9}," ++
+        "{\"durationMinutes\":20,\"win\":true,\"kills\":30,\"damageShare\":0.9}]}";
+    try std.testing.expect(std.mem.indexOf(u8, try writeBucketToBuf(&output, legacy, .strengths), "击杀伤害转化") == null);
+    try std.testing.expect(std.mem.indexOf(u8, try writeBucketToBuf(&output, legacy, .risks), "击杀伤害转化") == null);
 }
 
 test "连胜连败阈值与状态稳定回退" {
@@ -493,9 +497,11 @@ test "未结束的对局既不进样本也不打断连胜" {
     var output: [256]u8 = undefined;
     const player_json =
         "{\"recentMatches\":[" ++
-        "{\"durationMinutes\":0,\"win\":false,\"deaths\":9,\"damageShare\":0,\"cs\":0}," ++
-        "{\"durationMinutes\":25,\"win\":true,\"deaths\":2,\"killParticipation\":0.7,\"damageShare\":0.3,\"cs\":240}," ++
-        "{\"durationMinutes\":25,\"win\":true,\"deaths\":2,\"killParticipation\":0.7,\"damageShare\":0.3,\"cs\":240}" ++
+        // 未结束：99 杀 / 100 击杀 / 1% 伤害占比（若被计入会把场均转化拉到 33+），
+        // 并且两个召唤师技能位都带闪现（若被计入会伪造出「闪现位置可疑」）。
+        "{\"durationMinutes\":0,\"win\":false,\"kills\":99,\"teamKills\":100,\"damageShare\":0.01,\"summonerSpells\":[{\"id\":4},{\"id\":4}]}," ++
+        "{\"durationMinutes\":25,\"win\":true,\"kills\":4,\"teamKills\":10,\"damageShare\":0.4}," ++
+        "{\"durationMinutes\":25,\"win\":true,\"kills\":4,\"teamKills\":10,\"damageShare\":0.4}" ++
         "]}";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -504,10 +510,14 @@ test "未结束的对局既不进样本也不打断连胜" {
     const metrics = analyze(player);
     try std.testing.expectEqual(@as(usize, 2), metrics.sample);
     try std.testing.expectEqual(@as(usize, 2), metrics.winning_streak);
-    // 未结束那局的 9 次阵亡不能把场均拉到「阵亡偏多」。
+    try std.testing.expectEqual(@as(usize, 0), metrics.flash_on_d);
+    try std.testing.expectEqual(@as(usize, 0), metrics.flash_on_f);
+    // 已结束的两局转化都是 4/10/0.4 = 1.0，落在正常档。
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metrics.averageKillDamageEfficiency(), 0.0001);
+
     var writer = std.Io.Writer.fixed(&output);
     _ = try writeBucket(&writer, player, .risks, "、", max_signals);
-    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "阵亡偏多") == null);
+    try std.testing.expectEqualStrings("", writer.buffered());
 
     // 全部未结束 → 一条信号都不出。
     const empty_json = "{\"recentMatches\":[{\"durationMinutes\":0,\"win\":true}]}";
@@ -561,47 +571,32 @@ test "好抓判定复用 LeagueAkari 四档阈值" {
     }
 }
 
-test "英雄池集中阈值以卡片标签为准（0.7，而非旧的 0.5）" {
-    var output: [256]u8 = undefined;
-    // 2/3 = 0.667 < 0.7 → 不出信号。
-    const below = "{\"recentMatches\":[" ++
-        "{\"durationMinutes\":20,\"win\":true,\"championId\":1}," ++
-        "{\"durationMinutes\":20,\"win\":true,\"championId\":1}," ++
-        "{\"durationMinutes\":20,\"win\":true,\"championId\":2}]}";
-    try std.testing.expectEqualStrings("", try writeBucketToBuf(&output, below, .risks));
-
-    // 4/5 = 0.8 >= 0.7 → 出信号，且归入 risks。
-    const above = "{\"recentMatches\":[" ++
-        "{\"durationMinutes\":20,\"win\":true,\"championId\":1}," ++
-        "{\"durationMinutes\":20,\"win\":true,\"championId\":1}," ++
-        "{\"durationMinutes\":20,\"win\":true,\"championId\":1}," ++
-        "{\"durationMinutes\":20,\"win\":true,\"championId\":1}," ++
-        "{\"durationMinutes\":20,\"win\":true,\"championId\":2}]}";
-    try std.testing.expectEqualStrings("英雄池集中", try writeBucketToBuf(&output, above, .risks));
-}
-
-test "缺少 championId 不能凭空凑出英雄池集中" {
-    var output: [256]u8 = undefined;
+test "concentrationOf 以最大英雄占比为准，缺 championId 时为 0" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const no_champion = "{\"recentMatches\":[" ++
-        "{\"durationMinutes\":20,\"win\":true}," ++
-        "{\"durationMinutes\":20,\"win\":true}," ++
-        "{\"durationMinutes\":20,\"win\":true}]}";
-    try std.testing.expectEqualStrings("", try writeBucketToBuf(&output, no_champion, .risks));
+    const allocator = arena.allocator();
 
-    const player = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), no_champion, .{});
-    const matches = nestedArray(player, "recentMatches") orelse &.{};
-    try std.testing.expectEqual(@as(f64, 0), concentrationOf(matches));
+    const two_of_three = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        "[{\"durationMinutes\":20,\"championId\":1},{\"durationMinutes\":20,\"championId\":1},{\"durationMinutes\":20,\"championId\":2}]", .{});
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0 / 3.0), concentrationOf(two_of_three.array.items), 0.0001);
+
+    const four_of_five = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        "[{\"durationMinutes\":20,\"championId\":1},{\"durationMinutes\":20,\"championId\":1},{\"durationMinutes\":20,\"championId\":1},{\"durationMinutes\":20,\"championId\":1},{\"durationMinutes\":20,\"championId\":2}]", .{});
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), concentrationOf(four_of_five.array.items), 0.0001);
+
+    // 全部缺 championId → 0，而不是「100% 集中」。
+    const no_champion = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        "[{\"durationMinutes\":20},{\"durationMinutes\":20},{\"durationMinutes\":20}]", .{});
+    try std.testing.expectEqual(@as(f64, 0), concentrationOf(no_champion.array.items));
 }
 
 test "writeFirst 只输出第一条命中信号" {
     var output: [256]u8 = undefined;
     const player_json =
         "{\"recentMatches\":[" ++
-        "{\"durationMinutes\":30,\"win\":false,\"deaths\":9,\"killParticipation\":0.2,\"damageShare\":0.1,\"cs\":100}," ++
-        "{\"durationMinutes\":30,\"win\":false,\"deaths\":9,\"killParticipation\":0.2,\"damageShare\":0.1,\"cs\":100}," ++
-        "{\"durationMinutes\":30,\"win\":false,\"deaths\":9,\"killParticipation\":0.2,\"damageShare\":0.1,\"cs\":100}" ++
+        "{\"durationMinutes\":30,\"win\":false}," ++
+        "{\"durationMinutes\":30,\"win\":false}," ++
+        "{\"durationMinutes\":30,\"win\":false}" ++
         "]}";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
