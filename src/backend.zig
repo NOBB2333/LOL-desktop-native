@@ -3359,12 +3359,21 @@ fn sendShortcut(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
         } else shortcut_service.buildLines(self.config[0..self.config_len], payload.shortcutId, shortcut_lobby, phase, .{ .premade_side = payload.premadeSide, .chat_expanded = true }, &lines_buffer) catch return error.InvalidShortcut;
         const lines = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), lines_json, .{}) catch return error.InvalidShortcut;
         if (lines != .array or lines.array.items.len == 0) return error.ShortcutUnavailable;
+        // 命令回传给页面的是**压缩版**（每人一行）：页面上「最近发送」面板要精简，
+        // 发送到聊天框的展开版只作为发送载荷，不要把多行塞回页面。两者渲染同一份
+        // 模板与同一份大厅数据，不额外发网络请求。
+        const display_buffer = std.heap.page_allocator.alloc(u8, 128 * 1024) catch return error.ResponseTooLarge;
+        defer std.heap.page_allocator.free(display_buffer);
+        const display_json = if (shortcutUsesEncounter(self, payload.shortcutId))
+            lines_json
+        else
+            shortcut_service.buildLines(self.config[0..self.config_len], payload.shortcutId, shortcut_lobby, phase, .{ .premade_side = payload.premadeSide }, display_buffer) catch lines_json;
         const cfg = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.config[0..self.config_len], .{}) catch return error.InvalidConfig;
         const interval_ms = std.math.clamp(configAutomationInt(cfg, "shortcutSendIntervalMs", 250), @as(i64, 250), @as(i64, 5000));
         try verifyActionAccount(self, client);
         if (std.mem.eql(u8, phase, "InProgress") or std.mem.eql(u8, phase, "GameStart")) {
             try native_input.sendChatLines(io, lines, interval_ms, snapshotControl(self));
-            return copyJson(lines_json, output);
+            return copyJson(display_json, output);
         }
         if (!std.mem.eql(u8, phase, "ChampSelect") and !std.mem.eql(u8, phase, "ReadyCheck")) return error.ShortcutUnavailable;
         const conversations_json = client.get("/lol-chat/v1/conversations") catch return error.LcuRequestFailed;
@@ -3377,7 +3386,7 @@ fn sendShortcut(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
         // 选人阶段合并成一次聊天请求，避免多次等待期间会话发生切换。
         const sent = try client.post(path, body_json);
         std.heap.page_allocator.free(sent);
-        return copyJson(lines_json, output);
+        return copyJson(display_json, output);
     }
     return error.LcuNotRunning;
 }

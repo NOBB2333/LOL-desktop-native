@@ -1,5 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { fixtureConfig, fixtureLobby } from "../fixtures/data";
+import { browserChatText } from "./browserBackend";
 
 let backend: typeof import("./backend")["backend"];
 
@@ -35,7 +36,7 @@ describe("browser shortcut preview", () => {
     expect(lines[0].match(/；/g)).toHaveLength(2);
   });
 
-  it("keeps the page preview compact but expands the chat text", async () => {
+  it("页面预览与命令回传都保持一人一行，只有聊天文本逐场展开", async () => {
     const config = structuredClone(fixtureConfig);
     config.automation.shortcutRecentGameCount = 3;
     const ally = config.automation.shortcuts.find((shortcut) => shortcut.id === "ally");
@@ -50,9 +51,16 @@ describe("browser shortcut preview", () => {
     expect(preview[0].match(/；/g)).toHaveLength(2);
 
     const sent = await backend.sendShortcut("ally");
-    // 聊天版本每场单独一行，并在玩家之间补一个空行（5 人 → 4 个分隔）。
-    expect(sent.filter((line) => line === "")).toHaveLength(4);
-    expect(sent.length).toBeGreaterThan(preview.length);
+    // 命令回传给「最近发送」面板的是压缩版：与预览同形，不会被展开版撑成几十行。
+    expect(sent).toEqual(preview);
+
+    // 真正发进聊天框的文本才是展开版：标题独占一行、每场独占一行，
+    // 玩家之间用一条**可见**分隔线（空行会被客户端把连续换行压掉）。
+    const chat = browserChatText("ally");
+    expect(chat.filter((line) => line.endsWith("近3场："))).toHaveLength(5);
+    expect(chat.filter((line) => /^[胜负] /.test(line))).toHaveLength(15);
+    expect(chat.filter((line) => line === "-".repeat(10))).toHaveLength(4);
+    expect(chat).not.toContain("");
   });
 
   it("matches the two-line premade summary", async () => {

@@ -79,12 +79,14 @@ function renderBrowserTemplate(template: string, player: PlayerProfile, team: st
   const currentChampion = player.championId > 0 && player.championName !== "等待选择" ? player.championName : "未选择";
   const recentGameCount = Math.min(10, Math.max(1, browserState.config.automation.shortcutRecentGameCount ?? 5));
   const recentGames = completed.slice(0, recentGameCount).map((match) => `${match.win ? "胜" : "负"} ${match.championName} ${match.kills}/${match.deaths}/${match.assists}`).join(chatExpanded ? "\n" : "；");
+  // 聊天版本里「近N场：」自己占一行，每场再各占一行；压缩版仍是「；」连成一行。
+  const recentGamesBlock = recentGames ? (chatExpanded ? `近${recentGameCount}场：\n${recentGames}` : `近${recentGameCount}场：${recentGames}`) : "暂无近期对局";
   const values: Record<string, string> = {
     name: player.gameName, tag: shortcutPrimaryTag(player), position: roleName(player.assignedPosition),
     main_position: browserMainPosition(player),
     rank: `${player.rankTier} ${player.rankDivision}`.trim(), lp: String(player.leaguePoints), score: player.score.total.toFixed(0),
     recent_wins: String(wins), recent_losses: String(losses), recent_win_rate: `${Math.round(wins / Math.max(1, wins + losses) * 100)}%`,
-    recent_games: recentGames ? `近${recentGameCount}场：${recentGames}` : "暂无近期对局",
+    recent_games: recentGamesBlock,
     streak: shortcutStreakLabel(player), kda: averageKda.toFixed(2),
     current_champion: currentChampion, champion_games: String(player.currentChampionGames), champion_win_rate: `${Math.round(player.currentChampionWinRate * 100)}%`,
     top_champions: player.topChampions.map((item) => `${item.championName} ${Math.round(item.winRate * 100)}%`).join("、"),
@@ -96,20 +98,21 @@ function renderBrowserTemplate(template: string, player: PlayerProfile, team: st
   return template.replace(/\{([^{}]+)\}/g, (_, key: string) => values[key] ?? `{${key}}`);
 }
 
-/** 主玩位置：近期对局里出现最多的分路，与本局被分配到的分路无关。 */
+/** 主玩位置：近期对局里出现最多的**两个**分路，与本局被分配到的分路无关。 */
 function browserMainPosition(player: PlayerProfile) {
+  // 顺序即 AK 的 POSITION_ORDER，同票时按它定序，保证结果稳定。
+  const order = ["上路", "打野", "中路", "下路", "辅助"];
   const counts = new Map<string, number>();
   for (const match of player.recentMatches.slice(0, 20)) {
     const label = roleName(match.position);
-    if (!label || label === "待定") continue;
+    if (!label || label === "待定" || !order.includes(label)) continue;
     counts.set(label, (counts.get(label) ?? 0) + 1);
   }
-  let best = "待定";
-  let bestCount = 0;
-  for (const [label, count] of counts) {
-    if (count > bestCount) { best = label; bestCount = count; }
-  }
-  return best;
+  const picked = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || order.indexOf(a[0]) - order.indexOf(b[0]))
+    .slice(0, 2)
+    .map(([label]) => label);
+  return picked.length ? picked.join("，") : "待定";
 }
 
 function validateBrowserTemplate(template: string): ShortcutValidation {
@@ -231,8 +234,10 @@ export const browserBackend = {
     return validateBrowserTemplate(template);
   },
   sendShortcut(shortcutId: string): string[] {
-    // 发送到聊天框的版本：`{recent_games}` 每场单独一行，玩家之间补一个空行。
-    return renderShortcutLines(shortcutId, true);
+    // 真正发进聊天框的是展开版（每场一行、玩家之间一个空格行），但命令回传给
+    // 页面「最近发送」面板的是压缩版（每人一行）——与 Zig 侧 `send_shortcut`
+    // 的返回口径一致，否则展开版会把页面面板撑成几十行。展开版见 browserChatText。
+    return renderShortcutLines(shortcutId, false);
   },
   previewShortcut(shortcutId: string): string[] {
     // 页面上的「最终发送内容」预览：保持每人一行，省画幅。
@@ -244,10 +249,14 @@ export const browserBackend = {
   },
 };
 
+/** 与 Zig 侧 `chat_player_divider` 保持一致；改一处必须改另一处。 */
+const CHAT_PLAYER_DIVIDER = "----------";
+
 /**
  * 浏览器预览下的快捷消息渲染。`chatExpanded` 对应 Zig 侧的 `chat_expanded`：
- * 聊天版本把 `{recent_games}` 的每一场拆到单独一行，并在两位玩家之间留一个空行；
- * 页面预览保持单行。两个分支必须渲染同一份模板，只有分隔符不同。
+ * 聊天版本把「近N场：」和每一场各拆到单独一行，玩家之间插一条**可见**分隔线
+ * （实机验证：连续两个换行、以及只含空格的「空格行」都会被客户端吃掉，
+ * 空行留不住）；页面预览保持单行。两个分支必须渲染同一份模板，只有分隔符不同。
  */
 function renderShortcutLines(shortcutId: string, chatExpanded: boolean): string[] {
   const lobby = lobbyFixture();
@@ -278,6 +287,11 @@ function renderShortcutLines(shortcutId: string, chatExpanded: boolean): string[
     const team = lobby.ally.some((item) => item.puuid === player.puuid) ? "我方" : "敌方";
     const rendered = renderBrowserTemplate(shortcut.template, player, team, chatExpanded);
     const lines = rendered.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    return chatExpanded && index > 0 ? ["", ...lines] : lines;
+    return chatExpanded && index > 0 ? [CHAT_PLAYER_DIVIDER, ...lines] : lines;
   });
+}
+
+/** 真实后端发进聊天框的文本（含可见分隔线）。浏览器预览下仅用于校验渲染口径。 */
+export function browserChatText(shortcutId: string): string[] {
+  return renderShortcutLines(shortcutId, true);
 }

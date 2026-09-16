@@ -8,7 +8,9 @@ pub fn chatMessageBody(lines: std.json.Value, allocator: std.mem.Allocator) ![]c
     for (lines.array.items) |line| {
         if (line != .string) continue;
         const text = std.mem.trim(u8, line.string, " \t\r\n");
-        // 空字符串元素是**显式空行**：发送路径用它把不同玩家的数据块分开。
+        // 空字符串元素是**显式空行**。注意它只在拼接层有意义：真发到聊天框时
+        // 连续两个换行会被客户端压成一个，所以发送路径绝不依赖它做分隔
+        // （玩家之间用 `chat_player_divider` 那条可见的分隔线）。
         // 只含空白（但本身非空）的元素仍旧跳过，旧模板里的空白噪音不会进消息。
         if (text.len == 0 and line.string.len > 0) continue;
         if (joined.items.len > 0) try joined.append('\n');
@@ -33,6 +35,15 @@ test "选人消息一次提交并保留换行与引号" {
 const max_chat_line_chars = 120;
 const max_premade_players = 16;
 const premade_inference_match_threshold = 5;
+/// 玩家之间的分隔。实机验证过：聊天框会把连续两个换行压成一个，纯空行留不住；
+/// 只含空格的「空格行」也一样被吃掉。所以只能用一行**可见**字符冒充空行。
+/// 这里刻意用 ASCII 连字符而不是制表符/制表线（U+2500）：万一客户端字体缺字形，
+/// 那行会变成一排豆腐块，反而更难看；ASCII 一定渲染得出来。
+const chat_player_divider = "----------";
+
+/// 分路显示名，下标与 `positionIndex` 一致；顺序即 AK 的 `POSITION_ORDER`
+/// （上→野→中→下→辅），主玩位置的同票排序也依赖它。
+const position_labels = [_][]const u8{ "上路", "打野", "中路", "下路", "辅助" };
 const template_fields = [_][]const u8{
     "name",             "tag",            "position",          "rank",
     "lp",               "score",          "recent_wins",       "recent_losses",
@@ -64,9 +75,9 @@ pub const BuildOptions = struct {
     require_enabled: bool = true,
     sample_when_empty: bool = false,
     premade_side: ?[]const u8 = null,
-    /// 发送路径专用。为 true 时 `{recent_games}` 把每一场拆成独立的一行，并在
-    /// 两位玩家之间补一个空行——聊天框里读起来清晰很多。页面上的「最终发送内容」
-    /// 预览走 false，仍然是「每人一行」，避免占用过多画幅。
+    /// 发送路径专用。为 true 时 `{recent_games}` 的「近N场：」自己占一行、每一场
+    /// 再各占一行，玩家之间插一条可见分隔线——聊天框里读起来清晰很多。页面上的
+    /// 「最终发送内容」预览走 false，仍然是「每人一行」，避免占用过多画幅。
     chat_expanded: bool = false,
 };
 
@@ -384,8 +395,8 @@ fn writePlayers(
     var index: usize = 0;
     for (values.array.items) |player| {
         if (player != .object) continue;
-        // 空行只放在两位玩家之间：领头的空行会被聊天框吃掉，末尾的空行则纯属噪音。
-        if (chat_expanded and index > 0) try writeLine(writer, emitted, "");
+        // 分隔线只放在两位玩家之间：领头的那条纯属噪音，末尾的同理。
+        if (chat_expanded and index > 0) try writeLine(writer, emitted, chat_player_divider);
         try writePlayerTemplateLines(writer, emitted, template, player, team, phase, recent_game_count, chat_expanded);
         index += 1;
     }
@@ -438,7 +449,7 @@ fn writeJunglePlayers(
         } else if (!isJunglePosition(playerPosition(player))) {
             continue;
         }
-        if (chat_expanded and index > 0) try writeLine(writer, emitted, "");
+        if (chat_expanded and index > 0) try writeLine(writer, emitted, chat_player_divider);
         try writePlayerTemplateSingleLine(writer, emitted, template, player, team, phase, recent_game_count, chat_expanded);
         index += 1;
     }
@@ -494,8 +505,11 @@ fn writeTemplateValue(writer: *std.Io.Writer, key: []const u8, player: std.json.
     }
     if (std.mem.eql(u8, key, "position")) return writer.writeAll(shortcutPositionLabel(player, phase));
     // 主玩位置：只按近期对局的分路分布判断，与「本局分路」无关，因此位置被
-    // 随机分配或被抢位时也能稳定描述这位玩家平时打什么。
-    if (std.mem.eql(u8, key, "main_position")) return writer.writeAll(recentPrimaryPosition(player) orelse "待定");
+    // 随机分配或被抢位时也能稳定描述这位玩家平时打什么。最多两个（AK 口径）。
+    if (std.mem.eql(u8, key, "main_position")) {
+        var position_buffer: [32]u8 = undefined;
+        return writer.writeAll(recentPrimaryPositions(player, &position_buffer) orelse "待定");
+    }
     if (std.mem.eql(u8, key, "rank")) {
         try writer.writeAll(rankLabel(jsonStringField(player, "rankTier")));
         const division = jsonStringField(player, "rankDivision");
@@ -727,15 +741,15 @@ fn writeRecentGames(writer: *std.Io.Writer, player: std.json.Value, requested: u
     for (recent.array.items) |game| {
         if (game != .object or count == limit) break;
         if (jsonIntField(game, "durationMinutes", 0) <= 0) continue;
-        // 发送到聊天框时每场单独占一行（分隔符仍是「；」时全挤在一行里，
-        // 十个人一起发出去基本没法读）；页面预览保持单行以便省画幅。
+        // 发送到聊天框时每场单独占一行，并且标题「近N场：」自己占第一行——否则
+        // 第一场会跟标题挤在一起、和后面四场对不齐，读起来像是少了一场。页面
+        // 预览保持单行以便省画幅（分隔符仍是「；」）。
         if (count == 0) {
             try writer.print("近{d}场：", .{limit});
-        } else if (chat_expanded) {
-            try writer.writeByte('\n');
-        } else {
+        } else if (!chat_expanded) {
             try writer.writeAll("；");
         }
+        if (chat_expanded) try writer.writeByte('\n');
         try writer.writeAll(if (jsonBoolField(game, "win")) "胜 " else "负 ");
         try writer.writeAll(fallback(jsonStringField(game, "championName"), "未知英雄"));
         try writer.print(" {d}/{d}/{d}", .{ jsonIntField(game, "kills", 0), jsonIntField(game, "deaths", 0), jsonIntField(game, "assists", 0) });
@@ -765,13 +779,20 @@ fn shortcutPositionLabel(player: std.json.Value, phase: []const u8) []const u8 {
     return "等待选择";
 }
 
-fn recentPrimaryPosition(player: std.json.Value) ?[]const u8 {
-    const recent = arrayField(player, "recentMatches") orelse return null;
+/// 近期对局的分路使用次数（最多看 20 场）。下标与 `positionIndex` 一致。
+fn recentPositionCounts(player: std.json.Value) [5]usize {
     var counts = [_]usize{0} ** 5;
+    const recent = arrayField(player, "recentMatches") orelse return counts;
     for (recent.array.items[0..@min(recent.array.items.len, 20)]) |game| {
         const index = positionIndex(jsonStringField(game, "position")) orelse continue;
         counts[index] += 1;
     }
+    return counts;
+}
+
+/// 用得最多的那一路（单数）。`{position}` 缺省时用它兜底，所以只要一个。
+fn recentPrimaryPosition(player: std.json.Value) ?[]const u8 {
+    const counts = recentPositionCounts(player);
     var best_index: usize = 0;
     var best_count: usize = 0;
     for (counts, 0..) |count, index| {
@@ -780,7 +801,46 @@ fn recentPrimaryPosition(player: std.json.Value) ?[]const u8 {
             best_index = index;
         }
     }
-    return if (best_count > 0) ([_][]const u8{ "上路", "打野", "中路", "下路", "辅助" })[best_index] else null;
+    return if (best_count > 0) position_labels[best_index] else null;
+}
+
+/// 主玩位置：按近期对局的分路分布取**最多两个**，用「，」连接（AK 的
+/// `mainPositionNames` + `MAX_MAIN_POSITION_COUNT = 2`，列表分隔符也是「，」）。
+/// 同票时下标小的优先，即固定按「上→野→中→下→辅」——与 AK 的 POSITION_ORDER
+/// 一致，结果稳定可预期。一个分路都没有时返回 null，由调用方给占位。
+///
+/// 偏离 AK 的一处：AK 还要求第一名用量 ≥ 第二名 ×1.5（`MAIN_USAGE_DROP_RATIO`），
+/// 不够就干脆不显示「主玩位置」。我们的模板是扁平占位符，`主玩{main_position}`
+/// 少了值只会剩一个孤零零的「主玩」前缀，所以这里不设阈值、有就取两个。
+fn recentPrimaryPositions(player: std.json.Value, buffer: []u8) ?[]const u8 {
+    const counts = recentPositionCounts(player);
+    var chosen: [2]usize = undefined;
+    var chosen_len: usize = 0;
+    while (chosen_len < 2) {
+        var best: ?usize = null;
+        for (counts, 0..) |count, index| {
+            if (count == 0) continue;
+            var taken = false;
+            for (chosen[0..chosen_len]) |picked| {
+                if (picked == index) {
+                    taken = true;
+                    break;
+                }
+            }
+            if (taken) continue;
+            if (best == null or count > counts[best.?]) best = index;
+        }
+        const pick = best orelse break;
+        chosen[chosen_len] = pick;
+        chosen_len += 1;
+    }
+    if (chosen_len == 0) return null;
+    var writer = std.Io.Writer.fixed(buffer);
+    for (chosen[0..chosen_len], 0..) |index, slot| {
+        if (slot > 0) writer.writeAll("，") catch return null;
+        writer.writeAll(position_labels[index]) catch return null;
+    }
+    return writer.buffered();
 }
 
 fn positionIndex(position: []const u8) ?usize {
@@ -794,7 +854,7 @@ fn positionIndex(position: []const u8) ?usize {
 
 fn positionLabel(position: []const u8) []const u8 {
     const index = positionIndex(std.mem.trim(u8, position, " \t\r\n")) orelse return "待定";
-    return ([_][]const u8{ "上路", "打野", "中路", "下路", "辅助" })[index];
+    return position_labels[index];
 }
 
 fn rankLabel(tier: []const u8) []const u8 {
@@ -1326,12 +1386,19 @@ test "premade summary uses group ids and omits an unlinked single marker" {
     try std.testing.expectEqualStrings("[\"敌方开黑：[]\",\"我方开黑：[未选一、未选二]\"]", result);
 }
 
-test "main_position reports the most played recent role" {
+test "main_position reports the two most played recent roles" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var output: [64]u8 = undefined;
+    // 打野 2 场、中路 1 场 → 两个都列出，按用量降序。
     const laner = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"gameName\":\"玩家\",\"assignedPosition\":\"NONE\",\"recentMatches\":[{\"position\":\"JUNGLE\"},{\"position\":\"JUNGLE\"},{\"position\":\"MIDDLE\"}]}", .{});
-    try std.testing.expectEqualStrings("打野", try renderTemplate("{main_position}", laner, "我方", "ChampSelect", 5, false, &output));
+    try std.testing.expectEqualStrings("打野，中路", try renderTemplate("{main_position}", laner, "我方", "ChampSelect", 5, false, &output));
+    // 只有一个分路时就只输出一个（AK 的 MAX_MAIN_POSITION_COUNT 是上限，不是下限）。
+    const single = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"gameName\":\"玩家\",\"recentMatches\":[{\"position\":\"JUNGLE\"}]}", .{});
+    try std.testing.expectEqualStrings("打野", try renderTemplate("{main_position}", single, "我方", "ChampSelect", 5, false, &output));
+    // 同票按「上→野→中→下→辅」固定顺序（AK 的 POSITION_ORDER），结果稳定。
+    const tied = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"gameName\":\"玩家\",\"recentMatches\":[{\"position\":\"MIDDLE\"},{\"position\":\"TOP\"},{\"position\":\"UTILITY\"}]}", .{});
+    try std.testing.expectEqualStrings("上路，中路", try renderTemplate("{main_position}", tied, "我方", "ChampSelect", 5, false, &output));
     // 「本局分路」仍然是本局的值，主玩位置不会被它带偏。
     const assigned = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"gameName\":\"玩家\",\"assignedPosition\":\"MIDDLE\",\"recentMatches\":[{\"position\":\"JUNGLE\"}]}", .{});
     try std.testing.expectEqualStrings("中路", try renderTemplate("{position}", assigned, "我方", "ChampSelect", 5, false, &output));
@@ -1354,8 +1421,10 @@ test "chat expanded send breaks each recent game onto its own line" {
     );
     var expanded_output: [8192]u8 = undefined;
     const expanded = try buildLines(config, "ally", lobby, "ChampSelect", .{ .chat_expanded = true }, &expanded_output);
+    // 「近2场：」自己占一行，两场各占一行，玩家之间插一条可见分隔线
+    // （空行会被客户端压掉，见 chat_player_divider）。
     try std.testing.expectEqualStrings(
-        "[\"甲：近2场：胜 九尾妖狐 8/2/7\",\"负 发条魔灵 3/5/6\",\"\",\"乙：近2场：胜 九尾妖狐 8/2/7\",\"负 发条魔灵 3/5/6\"]",
+        "[\"甲：近2场：\",\"胜 九尾妖狐 8/2/7\",\"负 发条魔灵 3/5/6\",\"----------\",\"乙：近2场：\",\"胜 九尾妖狐 8/2/7\",\"负 发条魔灵 3/5/6\"]",
         expanded,
     );
 }
@@ -1367,6 +1436,7 @@ test "选人消息保留显式空行并跳过纯空白行" {
     defer std.testing.allocator.free(body);
     const result = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer result.deinit();
+    // 显式空行仍然拼成真正的空行；发送路径靠可见分隔线分段，不依赖这个行为。
     try std.testing.expectEqualStrings("甲：近2场：胜\n负\n\n乙：胜", result.value.object.get("body").?.string);
 }
 
