@@ -211,12 +211,14 @@ describe("身份类标签", () => {
     expect(renderText("self", context({ player: player({ puuid: SELF.puuid }), selfPuuid: null }))).toBeNull();
   });
 
-  it("premade-team 用字母标注分组（AK 的「小队 A」写法），没有分组就不渲染", () => {
+  it("premade-team 用字母标注分组（AK 的「小队 A」写法），分组未解出时与卡片头部一致地标「组队」", () => {
     expect(renderText("premade-team", context({ premadeTone: 1 }))).toBe("小队 B");
     expect(renderText("premade-team", context({ premadeTone: 0 }))).toBe("小队 A");
     expect(renderText("premade-team", context({ premadeTone: 11 }))).toBe("小队 L");
-    // AK 的 premade 只在拿到分组 id 时渲染；仅 isPremade 不足以成标签。
-    expect(renderText("premade-team", context({ player: player({ isPremade: true }) }))).toBeNull();
+    // 客户端已标 isPremade 但分组还没算出来：卡片头部会显示「组队」徽章，
+    // 标签区必须给同样的结论，否则会出现「有徽章、没标签」的时灵时不灵观感。
+    expect(renderText("premade-team", context({ player: player({ isPremade: true }) }))).toBe("组队");
+    // 既没有分组也没有 isPremade：不渲染。
     expect(renderText("premade-team", context())).toBeNull();
   });
 

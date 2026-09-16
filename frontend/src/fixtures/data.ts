@@ -402,7 +402,7 @@ export const fixtureFriends: FriendToolsSnapshot = {
 };
 
 export const fixtureConfig: AppConfig = {
-  version: 19,
+  version: 20,
   appearance: { theme: "mint", colorMode: "light", compact: false },
   playerTags: { ...defaultPlayerTagSettings },
   connection: { kind: "local", sshTarget: "", identityFile: "", forwardedPort: 0 },
@@ -418,14 +418,13 @@ export const fixtureConfig: AppConfig = {
     pickChampionIds: [103, 222, 64],
     banChampionIds: [164, 7, 145],
     shortcutSendIntervalMs: 250,
-    protectChatInput: true,
     shortcutRecentGameCount: 5,
     shortcuts: [
       { id: "encounter", label: "发送遇到记录", key: "Ctrl+F8", target: "encounter", template: "{encounter}", enabled: true },
       { id: "premade", label: "发送已知组队", key: "Ctrl+F9", target: "premade", template: "{position} {name}：组队 {premade}，近10场 {recent_wins}胜{recent_losses}负", enabled: true },
       { id: "jungle-preference", label: "发送打野偏好", key: "Ctrl+F10", target: "jungle", template: "{name}：{jungle_preference}", enabled: true },
-      { id: "enemy", label: "发送敌方评估", key: "Ctrl+F11", target: "enemy", template: "{team}{position} {current_champion}：{rank} {recent_wins}胜{recent_losses}负，{recent_games}", enabled: true },
-      { id: "ally", label: "发送我方评估", key: "Ctrl+F12", target: "ally", template: "{team}{position} {current_champion}：{rank} {recent_wins}胜{recent_losses}负，{recent_games}", enabled: true },
+      { id: "enemy", label: "发送敌方评估", key: "Ctrl+F11", target: "enemy", template: "{team}{position} {current_champion}：{rank} 主玩{main_position} {recent_wins}胜{recent_losses}负，{recent_games}", enabled: true },
+      { id: "ally", label: "发送我方评估", key: "Ctrl+F12", target: "ally", template: "{team}{position} {current_champion}：{rank} 主玩{main_position} {recent_wins}胜{recent_losses}负，{recent_games}", enabled: true },
       { id: "open-game", label: "打开对局速看", key: "Ctrl+F1", target: "lobby", template: "对局速看：{team} {name}，近10场 {recent_wins}胜{recent_losses}负，KDA {kda}", enabled: true },
     ],
   },

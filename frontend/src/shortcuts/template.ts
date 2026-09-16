@@ -19,6 +19,7 @@ export const shortcutTemplateFields: ShortcutTemplateField[] = [
   { key: "name", label: "玩家名", description: "Riot ID 中 # 前的名称", example: "峡谷侦察员" },
   { key: "tag", label: "首要标签", description: "按卡片标签顺序命中的第一条信号", example: "5 连胜" },
   { key: "position", label: "位置", description: "本局分路；未知时使用近期主要位置", example: "中路" },
+  { key: "main_position", label: "主玩位置", description: "按近期对局统计出的最常打的分路，与本局分路无关", example: "打野" },
   { key: "rank", label: "段位", description: "单双排段位和小段", example: "翡翠 II" },
   { key: "lp", label: "胜点", description: "当前单双排胜点，仅输出数字", example: "63" },
   { key: "score", label: "评分", description: "近期表现综合评分，满分 100", example: "82" },

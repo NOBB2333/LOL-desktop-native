@@ -35,6 +35,26 @@ describe("browser shortcut preview", () => {
     expect(lines[0].match(/；/g)).toHaveLength(2);
   });
 
+  it("keeps the page preview compact but expands the chat text", async () => {
+    const config = structuredClone(fixtureConfig);
+    config.automation.shortcutRecentGameCount = 3;
+    const ally = config.automation.shortcuts.find((shortcut) => shortcut.id === "ally");
+    if (!ally) throw new Error("ally shortcut fixture missing");
+    ally.template = "{name} {recent_games}";
+    await backend.saveConfig(config);
+
+    const preview = await backend.previewShortcut("ally");
+    expect(preview).toHaveLength(5);
+    expect(preview[0]).toContain("近3场：");
+    // 页面预览保持「每人一行」，逐场战绩仍用「；」连在一行里。
+    expect(preview[0].match(/；/g)).toHaveLength(2);
+
+    const sent = await backend.sendShortcut("ally");
+    // 聊天版本每场单独一行，并在玩家之间补一个空行（5 人 → 4 个分隔）。
+    expect(sent.filter((line) => line === "")).toHaveLength(4);
+    expect(sent.length).toBeGreaterThan(preview.length);
+  });
+
   it("matches the two-line premade summary", async () => {
     const lines = await backend.previewShortcut("premade");
 

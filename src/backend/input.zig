@@ -13,14 +13,18 @@ const max_message_interval_ms: i64 = 5000;
 var send_mutex: std.atomic.Mutex = .unlocked;
 
 /// 一批消息串行发送；每条消息整行注入，只有游戏窗口处于前台时才允许输入。
-pub fn sendChatLines(io: std.Io, lines: std.json.Value, interval_ms: i64, protect_input: bool, control: RequestControl) !void {
+///
+/// 这里刻意**不**做全局输入屏蔽。曾经的 `BlockInput(1)` 会在打字期间锁住整个
+/// 系统的鼠标和键盘（光标完全无法移动），换来的收益却只是「防误触」。LeagueAkari
+/// 的 `in-game-send/send-executor.ts` 从不拦截输入：它只确认游戏窗口在前台，然后
+/// 回车 → 输入整行 → 回车。对齐它既恢复了鼠标可用性，也顺带去掉了管理员权限要求。
+pub fn sendChatLines(io: std.Io, lines: std.json.Value, interval_ms: i64, control: RequestControl) !void {
     try control.check();
     if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
     if (lines != .array or lines.array.items.len == 0) return error.NoMessages;
 
     if (!send_mutex.tryLock()) return error.SendInProgress;
     defer send_mutex.unlock();
-    if (!try currentProcessIsElevated()) return error.AdministratorRequired;
 
     var valid_line_count: usize = 0;
     for (lines.array.items) |line| {
@@ -39,7 +43,7 @@ pub fn sendChatLines(io: std.Io, lines: std.json.Value, interval_ms: i64, protec
     var sent_count: usize = 0;
     for (lines.array.items) |line| {
         if (line != .string or std.mem.trim(u8, line.string, " \t\r\n").len == 0) continue;
-        sendChatLine(io, line.string, protect_input, control) catch |err| return if (sent_count > 0) error.ChatSendPartiallyCompleted else err;
+        sendChatLine(io, line.string, control) catch |err| return if (sent_count > 0) error.ChatSendPartiallyCompleted else err;
         sent_count += 1;
         if (sent_count < valid_line_count) {
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
@@ -48,17 +52,12 @@ pub fn sendChatLines(io: std.Io, lines: std.json.Value, interval_ms: i64, protec
     std.Io.sleep(io, std.Io.Duration.fromMilliseconds(150), .awake) catch {};
 }
 
-fn sendChatLine(io: std.Io, text: []const u8, protect_input: bool, control: RequestControl) !void {
+fn sendChatLine(io: std.Io, text: []const u8, control: RequestControl) !void {
     if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
     try ensureLeagueGameForeground();
     // 快捷键修饰键尚未松开时，回车可能切换聊天频道，必须先等待释放。
     try waitForModifiers(io);
     try control.check();
-    // 只在单条消息输入期间防误触；任何错误退出都会恢复输入，间隔期间不屏蔽操作。
-    if (protect_input and windows.BlockInput(1) == 0) return error.InputProtectionFailed;
-    defer if (protect_input) {
-        _ = windows.BlockInput(0);
-    };
     try ensureLeagueGameForeground();
     try pressVirtualKey(io, vk_return);
     std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
@@ -237,23 +236,9 @@ const InputProgress = struct {
     }
 };
 
-fn currentProcessIsElevated() !bool {
-    if (builtin.os.tag != .windows) return false;
-    var token: ?*anyopaque = null;
-    if (windows.OpenProcessToken(windows.GetCurrentProcess(), windows.token_query, &token) == 0 or token == null) return error.ProcessQueryFailed;
-    defer _ = windows.CloseHandle(token.?);
-
-    var elevation: windows.TokenElevation = .{ .token_is_elevated = 0 };
-    var returned_length: u32 = 0;
-    if (windows.GetTokenInformation(token.?, windows.token_elevation, &elevation, @sizeOf(windows.TokenElevation), &returned_length) == 0) return error.ProcessQueryFailed;
-    return elevation.token_is_elevated != 0;
-}
-
 const windows = if (builtin.os.tag == .windows) struct {
     const process_query_limited_information: u32 = 0x1000;
     const mapvk_vk_to_vsc: u32 = 0;
-    const token_query: u32 = 0x0008;
-    const token_elevation: u32 = 20;
 
     const MouseInput = extern struct {
         dx: i32,
@@ -273,7 +258,6 @@ const windows = if (builtin.os.tag == .windows) struct {
     const HardwareInput = extern struct { message: u32, param_low: u16, param_high: u16 };
     const InputData = extern union { mouse: MouseInput, keyboard: KeyboardInput, hardware: HardwareInput };
     const Input = extern struct { input_type: u32, data: InputData };
-    const TokenElevation = extern struct { token_is_elevated: u32 };
 
     extern "user32" fn GetForegroundWindow() callconv(.winapi) ?*anyopaque;
     extern "user32" fn SetForegroundWindow(window: *anyopaque) callconv(.winapi) i32;
@@ -285,12 +269,8 @@ const windows = if (builtin.os.tag == .windows) struct {
     extern "user32" fn MapVirtualKeyW(code: u32, map_type: u32) callconv(.winapi) u32;
     extern "user32" fn SendInput(count: u32, inputs: [*]const Input, size: i32) callconv(.winapi) u32;
     extern "user32" fn GetAsyncKeyState(key: i32) callconv(.winapi) i16;
-    extern "user32" fn BlockInput(block: i32) callconv(.winapi) i32;
     extern "kernel32" fn OpenProcess(access: u32, inherit_handle: i32, process_id: u32) callconv(.winapi) ?*anyopaque;
-    extern "kernel32" fn GetCurrentProcess() callconv(.winapi) *anyopaque;
     extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
-    extern "advapi32" fn OpenProcessToken(process: *anyopaque, access: u32, token: *?*anyopaque) callconv(.winapi) i32;
-    extern "advapi32" fn GetTokenInformation(token: *anyopaque, class: u32, information: *anyopaque, information_length: u32, returned_length: *u32) callconv(.winapi) i32;
     extern "kernel32" fn QueryFullProcessImageNameW(process: *anyopaque, flags: u32, path: [*]u16, length: *u32) callconv(.winapi) i32;
     extern "kernel32" fn CloseHandle(handle: *anyopaque) callconv(.winapi) i32;
 } else struct {
@@ -350,8 +330,4 @@ test "消息间隔限制在允许范围内" {
     try std.testing.expectEqual(@as(i64, 250), configuredMessageInterval(20));
     try std.testing.expectEqual(@as(i64, 1000), configuredMessageInterval(1000));
     try std.testing.expectEqual(@as(i64, 5000), configuredMessageInterval(9000));
-}
-
-test "读取当前进程的管理员权限状态" {
-    if (builtin.os.tag == .windows) _ = try currentProcessIsElevated();
 }

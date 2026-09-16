@@ -116,6 +116,24 @@ self → tagged → premade-team → high-win-rate → met → privacy
 > 唯一的故意偏离：`killDamageEfficiency` 在「本人 0 伤害但队伍有伤害」时
 > AK 会算出 `Infinity` 判成「K 头」，我们按 1 处理（不显示）。这个更合理，保留。
 
+### D. 组队标记「有时候能标出来，有时候不能」（第二轮已修）
+
+牌组算法本身早在第一轮就与 AK 等价，所以这次查的是**显示**和**取数时机**，
+最后定位到两个独立原因，各修一个：
+
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 卡片头部已经标「组队」，标签区却是空的 → 看起来像「时灵时不灵」 | 两个 UI 面的判定条件不同：`PlayerCard.vue` 头部是 `player.isPremade \|\| premadeTone !== undefined`，而 `PREMADE_TEAM_TAG` 只在**分组 tone 解出后**才渲染。分组要等双方 `teamParticipantId` 凑齐，于是中间有一段「头部有、标签区没有」的窗口 | `PREMADE_TEAM_TAG` 在 `tone == null` 但 `player.isPremade` 时也渲染一枚 `组队` chip（`premade` tone），与头部文案一致 |
+| 2 | 敌方开黑基本标不出、局内标记会中途消失 | 我们只在选人**本方**侧有 `partyId`（来自 `/lol-lobby/v2/lobby`）；敌方和局内只能靠战绩推测（20 局窗口内共同出场 ≥5 局，`premade_inference_match_threshold = 5`）。窗口是逐局填充的，所以标记会「先没有、后来才有」，或干脆永远凑不够 | 按 AK 的口径补取 `/lol-gameflow/v1/session`：选人阶段把 `teamOne`/`teamTwo` 的 `teamParticipantId` 覆盖到双方名单上；局内把同一份队伍元数据合进 Live Client 的 `allPlayers`。这样组队标记从选人一直维持到结算 |
+
+> 关键点：AK 的 `mergedPremadeTeams` 同时读 `teamParticipantGroups`
+> （gameflow `teamOne`/`teamTwo` 的 `teamParticipantId`，**双方都有**）与
+> `inferredPremadeTeams`（战绩推测）。我们之前只实现了后者 + 本方 partyId，
+> 漏掉了前者 —— 这才是「敌方/局内标不出」的真正原因。
+>
+> 覆盖时靠 `livePlayerMatches`（puuid 优先）做身份对齐，与既有的
+> Live Client ↔ session 名单合并共用同一套匹配逻辑，不引入新的匹配口径。
+
 ---
 
 ## 4. 本轮改动文件
@@ -133,6 +151,15 @@ self → tagged → premade-team → high-win-rate → met → privacy
 
 第一轮（文案与条件对齐）改动的文件见 git 记录，此处不重复。
 
+第二轮（组队标记，见 3.D）改动：
+
+| 文件 | 改动 |
+|---|---|
+| `src/backend.zig` | `liveSessionEnvelopePhaseContext` 新增 `party_session_json` 参数；选人阶段取 `/lol-gameflow/v1/session` 并把 `teamOne`/`teamTwo` 的队伍元数据覆盖到双方名单；`liveClientEnvelope` 把同一份元数据合进 `allPlayers`；新增 2 条用例 |
+| `frontend/src/tags/definitions/basic.ts` | `PREMADE_TEAM_TAG` 在分组未解出但 `isPremade` 时渲染 `组队`，与卡片头部一致 |
+| `frontend/src/tags/tags.test.ts` | 同步该条用例的期望值 |
+| `scripts/run-backend-tests.sh` | 新增：绕过 pnpm shim 直接跑 `zig test` 的脚本（见 5） |
+
 ---
 
 ## 5. 验收
@@ -141,24 +168,30 @@ self → tagged → premade-team → high-win-rate → met → privacy
 |---|---|
 | `npx vue-tsc --noEmit` | 干净（exit 0） |
 | `npx oxlint src` | 0 warnings / 0 errors（98 files） |
-| `npx vitest run` | **165 passed / 27 files** |
+| `npx vitest run` | **166 passed / 27 files**（第二轮 +1，见 3.D） |
 | `npx vite build` | 成功（LiveView 包 122.7 → 126.6 kB） |
-| `zig build test`（本机沙箱内） | 后端 **158/158 passed**；通过 `ast-check` 校验了 `backend.zig` 语法，且 150 条 backend 用例（模块根即 `src/backend.zig`）在改动后仍全绿 → 改动能编译 |
+| `bash scripts/run-backend-tests.sh` | 后端 **154/154 passed**（含本轮新增 2 条组队用例；第一轮为 150 条） |
 | `zig build test`（完整 15/15） | ⚠️ 无法在本次会话的沙箱里跑通，原因见下 |
 
 ### 关于 `zig build test` 跑不满
 
 沙箱内的 PATH 与用户真实终端不同，会命中两个环境坑（与本次代码改动无关）：
 
-1. `frontend.bundle → pnpm`：早先 `findProgram("pnpm")` 命中的是 mise shim
+1. `frontend.bundle → pnpm`：`findProgram("pnpm")` 命中的是 mise shim
    （无扩展名脚本 → `InvalidExe`）。本机另有一份可用的
    `D:\1_Application\5_Coding\Scoop_install\shims\pnpm.exe`。
 2. `migrations.zig` 生成步骤：沙箱 PATH 里排在最前的 `node.exe` 是 22.x，
    而 `@native-sdk/cli` 要求 **Node 24+**。
 
+另外，即使绕开上面两步，直接编译后端也会随机报
+`unable to load '<任意 .zig>': AccessDenied`（每次命中的文件都不同，
+stdlib 和仓库内文件都可能中招）。**这不是权限或沙箱问题，是并行打开文件过多**：
+加 `-j1` 限制并发后立刻稳定全绿。`scripts/run-backend-tests.sh` 因此固定带 `-j1`，
+并把全局缓存放进仓库内（默认的 `%LOCALAPPDATA%\zig` 在沙箱里常不可写）。
+
 试过的修法（**均已回滚**，避免为了迁就沙箱而改动仓库）：
 在 `mise.toml` 声明 `pnpm`、以及让 `build.zig` 优先挑 `.exe` / `.cmd`。
 后者会连带把 `node` 也挑成沙箱里的 22.x，等于用真问题换假问题。
 
-**结论：仓库保持原样。** 上一次会话里同一命令是 15/15 steps、165/165 tests 全绿，
-说明用户自己的终端环境没有这两个坑。
+**结论：仓库保持原样**（只新增了 `scripts/run-backend-tests.sh`）。用户自己的终端环境
+没有这些坑，`zig build test` 可直接跑。

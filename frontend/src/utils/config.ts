@@ -1,10 +1,16 @@
 import type { AppConfig, ShortcutDefinition } from "../types/domain";
 import { normalizePlayerTagSettings } from "../tags/settings";
 
-export const CURRENT_CONFIG_VERSION = 19;
+export const CURRENT_CONFIG_VERSION = 20;
 export const defaultOpenGameShortcutKey = "Ctrl+F1";
 
+/**
+ * `{main_position}`（主玩位置）插在段位与逐场战绩之间。旧版本存下来的默认模板
+ * 会在这个版本号迁移里被替换成下面这一份；用户自己改过的模板不会被覆盖。
+ */
 export const defaultAssessmentTemplate =
+  "{team}{position} {current_champion}：{rank} 主玩{main_position} {recent_wins}胜{recent_losses}负，{recent_games}";
+const previousAssessmentTemplate =
   "{team}{position} {current_champion}：{rank} {recent_wins}胜{recent_losses}负，{recent_games}";
 
 export const junglePreferenceShortcut: ShortcutDefinition = {
@@ -35,10 +41,6 @@ export function migrateAppConfig(config: AppConfig) {
   }
   if (typeof config.providers.rankedOnly !== "boolean") {
     config.providers.rankedOnly = false;
-    changed = true;
-  }
-  if (typeof config.automation.protectChatInput !== "boolean") {
-    config.automation.protectChatInput = true;
     changed = true;
   }
   if (!Number.isFinite(config.automation.autoAcceptDelaySeconds)) {
@@ -101,6 +103,15 @@ export function migrateAppConfig(config: AppConfig) {
       if (shortcut.id === "enemy" || shortcut.id === "ally") shortcut.template = defaultAssessmentTemplate;
     }
     changed = true;
+  }
+  if (config.version < 20) {
+    // 只替换「还是旧默认模板」的那两条，用户自定义过的模板原样保留。
+    for (const shortcut of config.automation.shortcuts) {
+      if (shortcut.id !== "enemy" && shortcut.id !== "ally") continue;
+      if (shortcut.template.trim() !== previousAssessmentTemplate) continue;
+      shortcut.template = defaultAssessmentTemplate;
+      changed = true;
+    }
   }
   if (config.version < CURRENT_CONFIG_VERSION) {
     config.version = CURRENT_CONFIG_VERSION;

@@ -108,7 +108,17 @@ export const PREMADE_TEAM_TAG: PlayerTagDefinition = {
   render: (ctx) => {
     if (!ctx.settings.showPremadeTeamTag) return null;
     const team = premadeGroupLabel(ctx.premadeTone);
-    if (!team) return null;
+    if (!team) {
+      // 客户端已经标了 `isPremade`（腾讯客户端的 `myTeam` 会带上它），但还没
+      // 解出具体分组——比如组员身份被隐藏、或共同标识还没下发。卡片头部此时
+      // 显示「组队」徽章，标签区必须给同一个结论，否则就成了「有徽章、没标签」，
+      // 看起来像组队检测时灵时不灵。
+      if (!ctx.player.isPremade) return null;
+      return {
+        label: chip("组队", { tone: "premade" }),
+        popover: textPopover("客户端已标记这些玩家为预组队，但暂时无法解出具体分组"),
+      };
+    }
 
     const color = premadeGroupColor(ctx.premadeTone);
     return {

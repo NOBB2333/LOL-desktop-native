@@ -8,12 +8,15 @@ pub fn chatMessageBody(lines: std.json.Value, allocator: std.mem.Allocator) ![]c
     for (lines.array.items) |line| {
         if (line != .string) continue;
         const text = std.mem.trim(u8, line.string, " \t\r\n");
-        if (text.len == 0) continue;
+        // 空字符串元素是**显式空行**：发送路径用它把不同玩家的数据块分开。
+        // 只含空白（但本身非空）的元素仍旧跳过，旧模板里的空白噪音不会进消息。
+        if (text.len == 0 and line.string.len > 0) continue;
         if (joined.items.len > 0) try joined.append('\n');
         try joined.appendSlice(text);
     }
-    if (joined.items.len == 0) return error.NoMessages;
-    return std.json.Stringify.valueAlloc(allocator, .{ .body = joined.items, .type = "chat" }, .{});
+    const body = std.mem.trim(u8, joined.items, "\n");
+    if (body.len == 0) return error.NoMessages;
+    return std.json.Stringify.valueAlloc(allocator, .{ .body = body, .type = "chat" }, .{});
 }
 
 test "选人消息一次提交并保留换行与引号" {
@@ -36,7 +39,7 @@ const template_fields = [_][]const u8{
     "recent_win_rate",  "recent_games",   "streak",            "kda",
     "current_champion", "champion_games", "champion_win_rate", "top_champions",
     "premade",          "risk",           "jungle_preference", "team",
-    "horse",            "encounter",
+    "horse",            "encounter",      "main_position",
 };
 
 const validation_player =
@@ -61,6 +64,10 @@ pub const BuildOptions = struct {
     require_enabled: bool = true,
     sample_when_empty: bool = false,
     premade_side: ?[]const u8 = null,
+    /// 发送路径专用。为 true 时 `{recent_games}` 把每一场拆成独立的一行，并在
+    /// 两位玩家之间补一个空行——聊天框里读起来清晰很多。页面上的「最终发送内容」
+    /// 预览走 false，仍然是「每人一行」，避免占用过多画幅。
+    chat_expanded: bool = false,
 };
 
 pub fn buildLines(
@@ -123,18 +130,18 @@ pub fn buildLines(
             try writeChatLine(&writer, &emitted, line.buffered());
         }
     } else if (std.mem.eql(u8, target, "ally")) {
-        try writePlayers(&writer, &emitted, template, arrayField(lobby, "ally"), "我方", phase, recent_game_count);
+        try writePlayers(&writer, &emitted, template, arrayField(lobby, "ally"), "我方", phase, recent_game_count, options.chat_expanded);
     } else if (std.mem.eql(u8, target, "enemy")) {
-        try writePlayers(&writer, &emitted, template, arrayField(lobby, "enemy"), "敌方", phase, recent_game_count);
+        try writePlayers(&writer, &emitted, template, arrayField(lobby, "enemy"), "敌方", phase, recent_game_count, options.chat_expanded);
     } else if (std.mem.eql(u8, target, "jungle")) {
-        try writeJunglePlayers(&writer, &emitted, template, arrayField(lobby, "ally"), "我方", phase, recent_game_count);
-        try writeJunglePlayers(&writer, &emitted, template, arrayField(lobby, "enemy"), "敌方", phase, recent_game_count);
+        try writeJunglePlayers(&writer, &emitted, template, arrayField(lobby, "ally"), "我方", phase, recent_game_count, options.chat_expanded);
+        try writeJunglePlayers(&writer, &emitted, template, arrayField(lobby, "enemy"), "敌方", phase, recent_game_count, options.chat_expanded);
     } else if (std.mem.eql(u8, target, "lobby")) {
-        try writePlayers(&writer, &emitted, template, arrayField(lobby, "ally"), "我方", phase, recent_game_count);
-        try writePlayers(&writer, &emitted, template, arrayField(lobby, "enemy"), "敌方", phase, recent_game_count);
+        try writePlayers(&writer, &emitted, template, arrayField(lobby, "ally"), "我方", phase, recent_game_count, options.chat_expanded);
+        try writePlayers(&writer, &emitted, template, arrayField(lobby, "enemy"), "敌方", phase, recent_game_count, options.chat_expanded);
     } else if (std.mem.eql(u8, target, "custom")) {
         if (arrayField(lobby, "ally")) |players| {
-            if (players.array.items.len > 0) try writePlayerTemplateLines(&writer, &emitted, template, players.array.items[0], "我方", phase, recent_game_count);
+            if (players.array.items.len > 0) try writePlayerTemplateLines(&writer, &emitted, template, players.array.items[0], "我方", phase, recent_game_count, options.chat_expanded);
         }
     } else {
         return error.UnknownTarget;
@@ -143,9 +150,9 @@ pub fn buildLines(
     if (!emitted and options.sample_when_empty and !std.mem.eql(u8, target, "premade")) {
         const sample = std.json.parseFromSliceLeaky(std.json.Value, allocator, validation_player, .{}) catch return error.InvalidLobby;
         if (std.mem.eql(u8, target, "jungle")) {
-            try writePlayerTemplateSingleLine(&writer, &emitted, template, sample, "我方", phase, recent_game_count);
+            try writePlayerTemplateSingleLine(&writer, &emitted, template, sample, "我方", phase, recent_game_count, options.chat_expanded);
         } else {
-            try writePlayerTemplateLines(&writer, &emitted, template, sample, "我方", phase, recent_game_count);
+            try writePlayerTemplateLines(&writer, &emitted, template, sample, "我方", phase, recent_game_count, options.chat_expanded);
         }
     }
     try writer.writeByte(']');
@@ -303,7 +310,7 @@ pub fn validationDto(template: []const u8, output: []u8) ![]const u8 {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const player = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), validation_player, .{}) catch return error.InvalidLobby;
-        preview = try renderTemplate(template, player, "我方", "ChampSelect", 5, &preview_buffer);
+        preview = try renderTemplate(template, player, "我方", "ChampSelect", 5, false, &preview_buffer);
     }
 
     var writer = std.Io.Writer.fixed(output);
@@ -330,6 +337,7 @@ pub fn renderTemplate(
     team: []const u8,
     phase: []const u8,
     recent_game_count: usize,
+    chat_expanded: bool,
     output: []u8,
 ) ![]const u8 {
     var writer = std.Io.Writer.fixed(output);
@@ -338,7 +346,7 @@ pub fn renderTemplate(
     const joined_fields = "{position}-{current_champion}";
     while (cursor < template.len) {
         if (current_unselected and std.mem.startsWith(u8, template[cursor..], joined_fields)) {
-            try writeTemplateValue(&writer, "position", player, team, phase, recent_game_count);
+            try writeTemplateValue(&writer, "position", player, team, phase, recent_game_count, chat_expanded);
             cursor += joined_fields.len;
             continue;
         }
@@ -353,7 +361,7 @@ pub fn renderTemplate(
         };
         const key = template[open + 1 .. close];
         if (knownField(key)) {
-            try writeTemplateValue(&writer, key, player, team, phase, recent_game_count);
+            try writeTemplateValue(&writer, key, player, team, phase, recent_game_count, chat_expanded);
         } else {
             try writer.writeAll(template[open .. close + 1]);
         }
@@ -370,11 +378,16 @@ fn writePlayers(
     team: []const u8,
     phase: []const u8,
     recent_game_count: usize,
+    chat_expanded: bool,
 ) !void {
     const values = players orelse return;
+    var index: usize = 0;
     for (values.array.items) |player| {
         if (player != .object) continue;
-        try writePlayerTemplateLines(writer, emitted, template, player, team, phase, recent_game_count);
+        // 空行只放在两位玩家之间：领头的空行会被聊天框吃掉，末尾的空行则纯属噪音。
+        if (chat_expanded and index > 0) try writeLine(writer, emitted, "");
+        try writePlayerTemplateLines(writer, emitted, template, player, team, phase, recent_game_count, chat_expanded);
+        index += 1;
     }
 }
 
@@ -386,9 +399,10 @@ fn writePlayerTemplateSingleLine(
     team: []const u8,
     phase: []const u8,
     recent_game_count: usize,
+    chat_expanded: bool,
 ) !void {
     var rendered_buffer: [64 * 1024]u8 = undefined;
-    const rendered = try renderTemplate(template, player, team, phase, recent_game_count, &rendered_buffer);
+    const rendered = try renderTemplate(template, player, team, phase, recent_game_count, chat_expanded, &rendered_buffer);
     var normalized_buffer: [64 * 1024]u8 = undefined;
     var normalized = std.Io.Writer.fixed(&normalized_buffer);
     try writeSingleLine(&normalized, rendered);
@@ -404,6 +418,7 @@ fn writeJunglePlayers(
     team: []const u8,
     phase: []const u8,
     recent_game_count: usize,
+    chat_expanded: bool,
 ) !void {
     const values = players orelse return;
     // During champ-select position fields can be copied from the first seat
@@ -415,6 +430,7 @@ fn writeJunglePlayers(
         if (player == .object and hasSmite(player)) smite_count += 1;
     }
     const use_smite = smite_count > 0;
+    var index: usize = 0;
     for (values.array.items) |player| {
         if (player != .object) continue;
         if (use_smite) {
@@ -422,7 +438,9 @@ fn writeJunglePlayers(
         } else if (!isJunglePosition(playerPosition(player))) {
             continue;
         }
-        try writePlayerTemplateSingleLine(writer, emitted, template, player, team, phase, recent_game_count);
+        if (chat_expanded and index > 0) try writeLine(writer, emitted, "");
+        try writePlayerTemplateSingleLine(writer, emitted, template, player, team, phase, recent_game_count, chat_expanded);
+        index += 1;
     }
 }
 
@@ -434,9 +452,10 @@ fn writePlayerTemplateLines(
     team: []const u8,
     phase: []const u8,
     recent_game_count: usize,
+    chat_expanded: bool,
 ) !void {
     var rendered_buffer: [64 * 1024]u8 = undefined;
-    const rendered = try renderTemplate(template, player, team, phase, recent_game_count, &rendered_buffer);
+    const rendered = try renderTemplate(template, player, team, phase, recent_game_count, chat_expanded, &rendered_buffer);
     var lines = std.mem.splitScalar(u8, rendered, '\n');
     while (lines.next()) |line| try writeChatLine(writer, emitted, line);
 }
@@ -466,7 +485,7 @@ fn writeLine(writer: *std.Io.Writer, emitted: *bool, line: []const u8) !void {
     try writeJsonString(writer, line);
 }
 
-fn writeTemplateValue(writer: *std.Io.Writer, key: []const u8, player: std.json.Value, team: []const u8, phase: []const u8, recent_game_count: usize) !void {
+fn writeTemplateValue(writer: *std.Io.Writer, key: []const u8, player: std.json.Value, team: []const u8, phase: []const u8, recent_game_count: usize, chat_expanded: bool) !void {
     if (std.mem.eql(u8, key, "name")) return writer.writeAll(fallback(jsonStringField(player, "gameName"), "未知玩家"));
     if (std.mem.eql(u8, key, "tag")) {
         // 首要标签：按卡片标签注册表顺序取第一条命中信号。
@@ -474,6 +493,9 @@ fn writeTemplateValue(writer: *std.Io.Writer, key: []const u8, player: std.json.
         return;
     }
     if (std.mem.eql(u8, key, "position")) return writer.writeAll(shortcutPositionLabel(player, phase));
+    // 主玩位置：只按近期对局的分路分布判断，与「本局分路」无关，因此位置被
+    // 随机分配或被抢位时也能稳定描述这位玩家平时打什么。
+    if (std.mem.eql(u8, key, "main_position")) return writer.writeAll(recentPrimaryPosition(player) orelse "待定");
     if (std.mem.eql(u8, key, "rank")) {
         try writer.writeAll(rankLabel(jsonStringField(player, "rankTier")));
         const division = jsonStringField(player, "rankDivision");
@@ -492,7 +514,7 @@ fn writeTemplateValue(writer: *std.Io.Writer, key: []const u8, player: std.json.
     if (std.mem.eql(u8, key, "recent_wins")) return writer.print("{d}", .{recent.wins});
     if (std.mem.eql(u8, key, "recent_losses")) return writer.print("{d}", .{recent.losses});
     if (std.mem.eql(u8, key, "recent_win_rate")) return writer.print("{d:.0}%", .{@as(f64, @floatFromInt(recent.wins)) / @as(f64, @floatFromInt(@max(@as(usize, 1), recent.wins + recent.losses))) * 100.0});
-    if (std.mem.eql(u8, key, "recent_games")) return writeRecentGames(writer, player, recent_game_count);
+    if (std.mem.eql(u8, key, "recent_games")) return writeRecentGames(writer, player, recent_game_count, chat_expanded);
     if (std.mem.eql(u8, key, "streak")) return player_signals.writeStreak(writer, player);
     if (std.mem.eql(u8, key, "kda")) return writer.print("{d:.2}", .{recent.average_kda});
     if (std.mem.eql(u8, key, "current_champion")) {
@@ -698,13 +720,22 @@ fn horseLabel(player: std.json.Value, recent: RecentStats) []const u8 {
     return "中等马";
 }
 
-fn writeRecentGames(writer: *std.Io.Writer, player: std.json.Value, requested: usize) !void {
+fn writeRecentGames(writer: *std.Io.Writer, player: std.json.Value, requested: usize, chat_expanded: bool) !void {
     const recent = arrayField(player, "recentMatches") orelse return writer.writeAll("暂无近期对局");
+    const limit = std.math.clamp(requested, @as(usize, 1), @as(usize, 10));
     var count: usize = 0;
     for (recent.array.items) |game| {
-        if (game != .object or count == std.math.clamp(requested, @as(usize, 1), @as(usize, 10))) break;
+        if (game != .object or count == limit) break;
         if (jsonIntField(game, "durationMinutes", 0) <= 0) continue;
-        if (count == 0) try writer.print("近{d}场：", .{std.math.clamp(requested, @as(usize, 1), @as(usize, 10))}) else try writer.writeAll("；");
+        // 发送到聊天框时每场单独占一行（分隔符仍是「；」时全挤在一行里，
+        // 十个人一起发出去基本没法读）；页面预览保持单行以便省画幅。
+        if (count == 0) {
+            try writer.print("近{d}场：", .{limit});
+        } else if (chat_expanded) {
+            try writer.writeByte('\n');
+        } else {
+            try writer.writeAll("；");
+        }
         try writer.writeAll(if (jsonBoolField(game, "win")) "胜 " else "负 ");
         try writer.writeAll(fallback(jsonStringField(game, "championName"), "未知英雄"));
         try writer.print(" {d}/{d}/{d}", .{ jsonIntField(game, "kills", 0), jsonIntField(game, "deaths", 0), jsonIntField(game, "assists", 0) });
@@ -1120,16 +1151,16 @@ test "risk 变量只输出负向信号，tag 取第一条命中" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const player = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), validation_player, .{});
-    try std.testing.expectEqualStrings("闪现位置可疑", try renderTemplate("{risk}", player, "我方", "ChampSelect", 5, &output));
-    try std.testing.expectEqualStrings("5 连胜", try renderTemplate("{tag}", player, "我方", "ChampSelect", 5, &output));
-    try std.testing.expectEqualStrings("5 连胜", try renderTemplate("{streak}", player, "我方", "ChampSelect", 5, &output));
+    try std.testing.expectEqualStrings("闪现位置可疑", try renderTemplate("{risk}", player, "我方", "ChampSelect", 5, false, &output));
+    try std.testing.expectEqualStrings("5 连胜", try renderTemplate("{tag}", player, "我方", "ChampSelect", 5, false, &output));
+    try std.testing.expectEqualStrings("5 连胜", try renderTemplate("{streak}", player, "我方", "ChampSelect", 5, false, &output));
 
     // 一位数据不足的玩家：不出任何信号，risk / tag 为空，streak 回退到「状态稳定」。
     const sparse_buf = try std.fmt.allocPrint(arena.allocator(), "{{\"gameName\":\"新手\",\"recentMatches\":[{{\"durationMinutes\":20,\"win\":true,\"deaths\":5}}]}}", .{});
     const sparse = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), sparse_buf, .{});
-    try std.testing.expectEqualStrings("", try renderTemplate("{risk}", sparse, "我方", "ChampSelect", 5, &output));
-    try std.testing.expectEqualStrings("", try renderTemplate("{tag}", sparse, "我方", "ChampSelect", 5, &output));
-    try std.testing.expectEqualStrings("状态稳定", try renderTemplate("{streak}", sparse, "我方", "ChampSelect", 5, &output));
+    try std.testing.expectEqualStrings("", try renderTemplate("{risk}", sparse, "我方", "ChampSelect", 5, false, &output));
+    try std.testing.expectEqualStrings("", try renderTemplate("{tag}", sparse, "我方", "ChampSelect", 5, false, &output));
+    try std.testing.expectEqualStrings("状态稳定", try renderTemplate("{streak}", sparse, "我方", "ChampSelect", 5, false, &output));
 }
 
 test "horse template field classifies recent performance with a neutral small sample" {
@@ -1141,19 +1172,19 @@ test "horse template field classifies recent performance with a neutral small sa
 
     const upper_json = try std.fmt.bufPrint(&player_buffer, "{{\"score\":{{\"total\":80}},\"recentMatches\":{s}}}", .{games});
     const upper = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), upper_json, .{});
-    try std.testing.expectEqualStrings("上等马", try renderTemplate("{horse}", upper, "我方", "ChampSelect", 5, &output));
+    try std.testing.expectEqualStrings("上等马", try renderTemplate("{horse}", upper, "我方", "ChampSelect", 5, false, &output));
 
     const middle_json = try std.fmt.bufPrint(&player_buffer, "{{\"score\":{{\"total\":65}},\"recentMatches\":{s}}}", .{games});
     const middle = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), middle_json, .{});
-    try std.testing.expectEqualStrings("中等马", try renderTemplate("{horse}", middle, "我方", "ChampSelect", 5, &output));
+    try std.testing.expectEqualStrings("中等马", try renderTemplate("{horse}", middle, "我方", "ChampSelect", 5, false, &output));
 
     const lower_games = "[{\"durationMinutes\":25,\"win\":false,\"kills\":1,\"deaths\":8,\"assists\":2},{\"durationMinutes\":26,\"win\":false,\"kills\":2,\"deaths\":7,\"assists\":3},{\"durationMinutes\":27,\"win\":true,\"kills\":2,\"deaths\":6,\"assists\":2}]";
     const lower_json = try std.fmt.bufPrint(&player_buffer, "{{\"score\":{{\"total\":50}},\"recentMatches\":{s}}}", .{lower_games});
     const lower = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), lower_json, .{});
-    try std.testing.expectEqualStrings("下等马", try renderTemplate("{horse}", lower, "我方", "ChampSelect", 5, &output));
+    try std.testing.expectEqualStrings("下等马", try renderTemplate("{horse}", lower, "我方", "ChampSelect", 5, false, &output));
 
     const small = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"score\":{\"total\":90},\"recentMatches\":[{\"durationMinutes\":25,\"win\":true},{\"durationMinutes\":25,\"win\":true}]}", .{});
-    try std.testing.expectEqualStrings("中等马", try renderTemplate("{horse}", small, "我方", "ChampSelect", 5, &output));
+    try std.testing.expectEqualStrings("中等马", try renderTemplate("{horse}", small, "我方", "ChampSelect", 5, false, &output));
 }
 
 test "jungle shortcut targets only assigned junglers" {
@@ -1293,6 +1324,50 @@ test "premade summary uses group ids and omits an unlinked single marker" {
     var output: [4096]u8 = undefined;
     const result = try buildLines(config, "premade", lobby, "ChampSelect", .{}, &output);
     try std.testing.expectEqualStrings("[\"敌方开黑：[]\",\"我方开黑：[未选一、未选二]\"]", result);
+}
+
+test "main_position reports the most played recent role" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var output: [64]u8 = undefined;
+    const laner = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"gameName\":\"玩家\",\"assignedPosition\":\"NONE\",\"recentMatches\":[{\"position\":\"JUNGLE\"},{\"position\":\"JUNGLE\"},{\"position\":\"MIDDLE\"}]}", .{});
+    try std.testing.expectEqualStrings("打野", try renderTemplate("{main_position}", laner, "我方", "ChampSelect", 5, false, &output));
+    // 「本局分路」仍然是本局的值，主玩位置不会被它带偏。
+    const assigned = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"gameName\":\"玩家\",\"assignedPosition\":\"MIDDLE\",\"recentMatches\":[{\"position\":\"JUNGLE\"}]}", .{});
+    try std.testing.expectEqualStrings("中路", try renderTemplate("{position}", assigned, "我方", "ChampSelect", 5, false, &output));
+    try std.testing.expectEqualStrings("打野", try renderTemplate("{main_position}", assigned, "我方", "ChampSelect", 5, false, &output));
+    // 没有近期对局时给出占位，避免模板里只剩一个孤零零的「主玩」前缀。
+    const empty = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"gameName\":\"新手\",\"recentMatches\":[]}", .{});
+    try std.testing.expectEqualStrings("待定", try renderTemplate("{main_position}", empty, "我方", "ChampSelect", 5, false, &output));
+}
+
+test "chat expanded send breaks each recent game onto its own line" {
+    const config = "{\"automation\":{\"shortcutRecentGameCount\":2,\"shortcuts\":[{\"id\":\"ally\",\"target\":\"ally\",\"template\":\"{name}：{recent_games}\",\"enabled\":true}]}}";
+    const games = "[{\"durationMinutes\":20,\"win\":true,\"championName\":\"九尾妖狐\",\"kills\":8,\"deaths\":2,\"assists\":7},{\"durationMinutes\":21,\"win\":false,\"championName\":\"发条魔灵\",\"kills\":3,\"deaths\":5,\"assists\":6}]";
+    var lobby_buffer: [4096]u8 = undefined;
+    const lobby = try std.fmt.bufPrint(&lobby_buffer, "{{\"ally\":[{{\"gameName\":\"甲\",\"recentMatches\":{s}}},{{\"gameName\":\"乙\",\"recentMatches\":{s}}}],\"enemy\":[]}}", .{ games, games });
+    var compact_output: [8192]u8 = undefined;
+    const compact = try buildLines(config, "ally", lobby, "ChampSelect", .{}, &compact_output);
+    try std.testing.expectEqualStrings(
+        "[\"甲：近2场：胜 九尾妖狐 8/2/7；负 发条魔灵 3/5/6\",\"乙：近2场：胜 九尾妖狐 8/2/7；负 发条魔灵 3/5/6\"]",
+        compact,
+    );
+    var expanded_output: [8192]u8 = undefined;
+    const expanded = try buildLines(config, "ally", lobby, "ChampSelect", .{ .chat_expanded = true }, &expanded_output);
+    try std.testing.expectEqualStrings(
+        "[\"甲：近2场：胜 九尾妖狐 8/2/7\",\"负 发条魔灵 3/5/6\",\"\",\"乙：近2场：胜 九尾妖狐 8/2/7\",\"负 发条魔灵 3/5/6\"]",
+        expanded,
+    );
+}
+
+test "选人消息保留显式空行并跳过纯空白行" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "[\"甲：近2场：胜\",\"负\",\"\",\"乙：胜\",\"  \"]", .{});
+    defer parsed.deinit();
+    const body = try chatMessageBody(parsed.value, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    const result = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("甲：近2场：胜\n负\n\n乙：胜", result.value.object.get("body").?.string);
 }
 
 test "splits rendered chat lines by unicode character count" {

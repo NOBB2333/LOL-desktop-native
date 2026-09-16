@@ -71,16 +71,17 @@ function lobbyFixture(): LiveLobby {
 }
 
 /** 浏览器预览下的模板渲染：占位符 → 该玩家的实际值。 */
-function renderBrowserTemplate(template: string, player: PlayerProfile, team: string): string {
+function renderBrowserTemplate(template: string, player: PlayerProfile, team: string, chatExpanded = false): string {
   const completed = player.recentMatches.filter((match) => match.durationMinutes > 0).slice(0, 10);
   const wins = completed.filter((match) => match.win).length;
   const losses = completed.length - wins;
   const averageKda = completed.length ? completed.reduce((sum, match) => sum + (match.kills + match.assists) / Math.max(1, match.deaths), 0) / completed.length : 0;
   const currentChampion = player.championId > 0 && player.championName !== "等待选择" ? player.championName : "未选择";
   const recentGameCount = Math.min(10, Math.max(1, browserState.config.automation.shortcutRecentGameCount ?? 5));
-  const recentGames = completed.slice(0, recentGameCount).map((match) => `${match.win ? "胜" : "负"} ${match.championName} ${match.kills}/${match.deaths}/${match.assists}`).join("；");
+  const recentGames = completed.slice(0, recentGameCount).map((match) => `${match.win ? "胜" : "负"} ${match.championName} ${match.kills}/${match.deaths}/${match.assists}`).join(chatExpanded ? "\n" : "；");
   const values: Record<string, string> = {
     name: player.gameName, tag: shortcutPrimaryTag(player), position: roleName(player.assignedPosition),
+    main_position: browserMainPosition(player),
     rank: `${player.rankTier} ${player.rankDivision}`.trim(), lp: String(player.leaguePoints), score: player.score.total.toFixed(0),
     recent_wins: String(wins), recent_losses: String(losses), recent_win_rate: `${Math.round(wins / Math.max(1, wins + losses) * 100)}%`,
     recent_games: recentGames ? `近${recentGameCount}场：${recentGames}` : "暂无近期对局",
@@ -93,6 +94,22 @@ function renderBrowserTemplate(template: string, player: PlayerProfile, team: st
     encounter: "暂无本地遇到记录",
   };
   return template.replace(/\{([^{}]+)\}/g, (_, key: string) => values[key] ?? `{${key}}`);
+}
+
+/** 主玩位置：近期对局里出现最多的分路，与本局被分配到的分路无关。 */
+function browserMainPosition(player: PlayerProfile) {
+  const counts = new Map<string, number>();
+  for (const match of player.recentMatches.slice(0, 20)) {
+    const label = roleName(match.position);
+    if (!label || label === "待定") continue;
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  let best = "待定";
+  let bestCount = 0;
+  for (const [label, count] of counts) {
+    if (count > bestCount) { best = label; bestCount = count; }
+  }
+  return best;
 }
 
 function validateBrowserTemplate(template: string): ShortcutValidation {
@@ -214,34 +231,53 @@ export const browserBackend = {
     return validateBrowserTemplate(template);
   },
   sendShortcut(shortcutId: string): string[] {
-    const lobby = lobbyFixture();
-    const shortcut = browserState.config.automation.shortcuts.find((item) => item.id === shortcutId);
-    if (!shortcut) throw new Error("快捷消息不存在");
-    const allPlayers = [...lobby.ally, ...lobby.enemy];
-    if (shortcut.target === "premade") {
-      return [
-        `敌方开黑：${browserPremadeGroups(lobby.enemy)}`,
-        `我方开黑：${browserPremadeGroups(lobby.ally)}`,
-      ];
-    }
-    if (shortcut.target === "encounter") {
-      const records = fixtureEncounters.slice(0, 3);
-      return records.map((record) => {
-        const date = new Date(record.encounteredAt);
-        const stamp = `${String(date.getMonth() + 1).padStart(2, "0")}月${String(date.getDate()).padStart(2, "0")}日 ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
-        const selfId = `${record.selfGameName || "未知玩家"}${record.selfTagLine ? `#${record.selfTagLine}` : ""}`;
-        const targetId = `${record.gameName || "未知玩家"}${record.tagLine ? `#${record.tagLine}` : ""}`;
-        const selfKda = record.selfKills === undefined ? "战绩待结算" : `${record.selfKills}/${record.selfDeaths ?? 0}/${record.selfAssists ?? 0}${record.selfWin === undefined ? "" : record.selfWin ? " 胜" : " 负"}`;
-        const targetKda = record.kills === undefined ? "战绩待结算" : `${record.kills}/${record.deaths ?? 0}/${record.assists ?? 0}${record.win === undefined ? "" : record.win ? " 胜" : " 负"}`;
-        return `遇到过：${stamp}，我（${selfId}）使用 ${record.selfChampionName || "未知英雄"} ${selfKda}；${record.side === "ally" ? "队友" : "对方"}（${targetId}）使用 ${record.championName || "未知英雄"} ${targetKda}`;
-      });
-    }
-    const jungleShortcut = shortcut.target === "jungle" || (shortcut.target === "custom" && shortcut.template.includes("{jungle_preference}"));
-    const players = shortcut.target === "ally" ? lobby.ally : shortcut.target === "enemy" ? lobby.enemy : jungleShortcut ? allPlayers.filter((player) => player.assignedPosition.toUpperCase() === "JUNGLE" || player.summonerSpells?.some((spell) => spell.id === 11)) : shortcut.target === "lobby" ? allPlayers : [lobby.ally[0]];
-    return players.map((player) => renderBrowserTemplate(shortcut.template, player, lobby.ally.some((item) => item.puuid === player.puuid) ? "我方" : "敌方"));
+    // 发送到聊天框的版本：`{recent_games}` 每场单独一行，玩家之间补一个空行。
+    return renderShortcutLines(shortcutId, true);
+  },
+  previewShortcut(shortcutId: string): string[] {
+    // 页面上的「最终发送内容」预览：保持每人一行，省画幅。
+    return renderShortcutLines(shortcutId, false);
   },
   premadeSide(side: "ally" | "enemy"): string[] {
     const group = side === "ally" ? fixtureLobby.ally : fixtureLobby.enemy;
     return [`${side === "ally" ? "我方" : "敌方"}开黑：${browserPremadeGroups(group)}`];
   },
 };
+
+/**
+ * 浏览器预览下的快捷消息渲染。`chatExpanded` 对应 Zig 侧的 `chat_expanded`：
+ * 聊天版本把 `{recent_games}` 的每一场拆到单独一行，并在两位玩家之间留一个空行；
+ * 页面预览保持单行。两个分支必须渲染同一份模板，只有分隔符不同。
+ */
+function renderShortcutLines(shortcutId: string, chatExpanded: boolean): string[] {
+  const lobby = lobbyFixture();
+  const shortcut = browserState.config.automation.shortcuts.find((item) => item.id === shortcutId);
+  if (!shortcut) throw new Error("快捷消息不存在");
+  const allPlayers = [...lobby.ally, ...lobby.enemy];
+  if (shortcut.target === "premade") {
+    return [
+      `敌方开黑：${browserPremadeGroups(lobby.enemy)}`,
+      `我方开黑：${browserPremadeGroups(lobby.ally)}`,
+    ];
+  }
+  if (shortcut.target === "encounter") {
+    const records = fixtureEncounters.slice(0, 3);
+    return records.map((record) => {
+      const date = new Date(record.encounteredAt);
+      const stamp = `${String(date.getMonth() + 1).padStart(2, "0")}月${String(date.getDate()).padStart(2, "0")}日 ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+      const selfId = `${record.selfGameName || "未知玩家"}${record.selfTagLine ? `#${record.selfTagLine}` : ""}`;
+      const targetId = `${record.gameName || "未知玩家"}${record.tagLine ? `#${record.tagLine}` : ""}`;
+      const selfKda = record.selfKills === undefined ? "战绩待结算" : `${record.selfKills}/${record.selfDeaths ?? 0}/${record.selfAssists ?? 0}${record.selfWin === undefined ? "" : record.selfWin ? " 胜" : " 负"}`;
+      const targetKda = record.kills === undefined ? "战绩待结算" : `${record.kills}/${record.deaths ?? 0}/${record.assists ?? 0}${record.win === undefined ? "" : record.win ? " 胜" : " 负"}`;
+      return `遇到过：${stamp}，我（${selfId}）使用 ${record.selfChampionName || "未知英雄"} ${selfKda}；${record.side === "ally" ? "队友" : "对方"}（${targetId}）使用 ${record.championName || "未知英雄"} ${targetKda}`;
+    });
+  }
+  const jungleShortcut = shortcut.target === "jungle" || (shortcut.target === "custom" && shortcut.template.includes("{jungle_preference}"));
+  const players = shortcut.target === "ally" ? lobby.ally : shortcut.target === "enemy" ? lobby.enemy : jungleShortcut ? allPlayers.filter((player) => player.assignedPosition.toUpperCase() === "JUNGLE" || player.summonerSpells?.some((spell) => spell.id === 11)) : shortcut.target === "lobby" ? allPlayers : [lobby.ally[0]];
+  return players.flatMap((player, index) => {
+    const team = lobby.ally.some((item) => item.puuid === player.puuid) ? "我方" : "敌方";
+    const rendered = renderBrowserTemplate(shortcut.template, player, team, chatExpanded);
+    const lines = rendered.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    return chatExpanded && index > 0 ? ["", ...lines] : lines;
+  });
+}

@@ -230,7 +230,7 @@ export const backend = {
     return lines;
   },
   async previewShortcut(shortcutId: string): Promise<string[]> {
-    if (usesFixtureData()) return this.sendShortcut(shortcutId);
+    if (usesFixtureData()) return browserBackend.previewShortcut(shortcutId);
     return command("preview_shortcut", { shortcutId });
   },
   async previewAssessments(kind: "ally" | "enemy" | "premade" = "ally"): Promise<string[]> {

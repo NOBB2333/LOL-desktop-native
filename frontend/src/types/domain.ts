@@ -461,7 +461,6 @@ export interface AppConfig {
     pickChampionIds: number[];
     banChampionIds: number[];
     shortcutSendIntervalMs: number;
-    protectChatInput?: boolean;
     shortcutRecentGameCount: number;
     shortcuts: ShortcutDefinition[];
   };

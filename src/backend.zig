@@ -181,10 +181,8 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.PlayerTagUnavailable => "玩家标记暂不可用，请稍后重试",
         error.ShortcutUnavailable => "当前阶段或资料不足，暂时无法发送",
         error.ChatUnavailable => "当前聊天会话不可用",
-        error.AdministratorRequired => "游戏内发送需要以管理员身份运行辅助程序",
         error.GameWindowNotForeground => "游戏窗口不在前台，已停止发送",
         error.ModifierKeyHeld => "修饰键尚未松开，已取消发送",
-        error.InputProtectionFailed => "无法启用发送防误触，请检查管理员权限或关闭该设置",
         error.InputSimulationFailed => "游戏未完整接收输入，已停止发送",
         error.ChatSendPartiallyCompleted => "已有部分消息发送，输入中断后已停止后续消息",
         error.SendInProgress => "上一批消息仍在发送，请稍后再试",
@@ -282,7 +280,7 @@ pub const command_names = [_][]const u8{
 const default_config =
     "{\"version\":18,\"appearance\":{\"theme\":\"system\",\"colorMode\":\"dark\",\"compact\":false}," ++
     "\"connection\":{\"kind\":\"local\",\"sshTarget\":\"\",\"identityFile\":\"\",\"forwardedPort\":0}," ++
-    "\"automation\":{\"enabled\":false,\"advisoryMode\":true,\"autoAccept\":false,\"autoAcceptDelaySeconds\":0,\"autoPick\":false,\"autoPickDelaySeconds\":1,\"autoPickStrategy\":\"show-and-lock-in\",\"autoBan\":false,\"pickChampionIds\":[],\"banChampionIds\":[],\"shortcutSendIntervalMs\":250,\"shortcutRecentGameCount\":5,\"shortcuts\":[{\"id\":\"encounter\",\"label\":\"发送遇到记录\",\"key\":\"Ctrl+F8\",\"target\":\"encounter\",\"template\":\"{encounter}\",\"enabled\":true},{\"id\":\"premade\",\"label\":\"发送已知组队\",\"key\":\"Ctrl+F9\",\"target\":\"premade\",\"template\":\"{position} {name}：组队 {premade}\",\"enabled\":true},{\"id\":\"jungle-preference\",\"label\":\"发送打野偏好\",\"key\":\"Ctrl+F10\",\"target\":\"jungle\",\"template\":\"{name}：{jungle_preference}\",\"enabled\":true},{\"id\":\"enemy\",\"label\":\"发送敌方评估\",\"key\":\"Ctrl+F11\",\"target\":\"enemy\",\"template\":\"{team}{position} {current_champion}：{rank} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"ally\",\"label\":\"发送我方评估\",\"key\":\"Ctrl+F12\",\"target\":\"ally\",\"template\":\"{team}{position} {current_champion}：{rank} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"open-game\",\"label\":\"打开对局速看\",\"key\":\"Ctrl+F1\",\"target\":\"lobby\",\"template\":\"对局速看：{team} {name}\",\"enabled\":true}]}," ++
+    "\"automation\":{\"enabled\":false,\"advisoryMode\":true,\"autoAccept\":false,\"autoAcceptDelaySeconds\":0,\"autoPick\":false,\"autoPickDelaySeconds\":1,\"autoPickStrategy\":\"show-and-lock-in\",\"autoBan\":false,\"pickChampionIds\":[],\"banChampionIds\":[],\"shortcutSendIntervalMs\":250,\"shortcutRecentGameCount\":5,\"shortcuts\":[{\"id\":\"encounter\",\"label\":\"发送遇到记录\",\"key\":\"Ctrl+F8\",\"target\":\"encounter\",\"template\":\"{encounter}\",\"enabled\":true},{\"id\":\"premade\",\"label\":\"发送已知组队\",\"key\":\"Ctrl+F9\",\"target\":\"premade\",\"template\":\"{position} {name}：组队 {premade}\",\"enabled\":true},{\"id\":\"jungle-preference\",\"label\":\"发送打野偏好\",\"key\":\"Ctrl+F10\",\"target\":\"jungle\",\"template\":\"{name}：{jungle_preference}\",\"enabled\":true},{\"id\":\"enemy\",\"label\":\"发送敌方评估\",\"key\":\"Ctrl+F11\",\"target\":\"enemy\",\"template\":\"{team}{position} {current_champion}：{rank} 主玩{main_position} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"ally\",\"label\":\"发送我方评估\",\"key\":\"Ctrl+F12\",\"target\":\"ally\",\"template\":\"{team}{position} {current_champion}：{rank} 主玩{main_position} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"open-game\",\"label\":\"打开对局速看\",\"key\":\"Ctrl+F1\",\"target\":\"lobby\",\"template\":\"对局速看：{team} {name}\",\"enabled\":true}]}," ++
     "\"providers\":{\"statsProvider\":\"auto\",\"requestTimeoutSeconds\":6,\"cacheTtlMinutes\":120,\"hideUnfinishedMatches\":false,\"rankedOnly\":false,\"clearLobbyAfterGame\":true}," ++
     "\"ai\":{\"enabled\":false,\"provider\":\"deepseek\",\"protocol\":\"openai\",\"baseUrl\":\"https://api.deepseek.com\",\"model\":\"deepseek-v4-flash\",\"apiKey\":\"\",\"automaticPregameAnalysis\":false}}";
 
@@ -1666,11 +1664,19 @@ fn getLiveLobbyInternal(context: *anyopaque, invocation: native_sdk.bridge.Invoc
                     else
                         null;
                     defer if (custom_lobby) |custom_json| std.heap.page_allocator.free(custom_json);
+                    // 选人 session 只带本方的 partyId；双方（含敌方）的
+                    // `teamParticipantId` 只在 gameflow session 里，AK 就是用
+                    // 它来分组，所以选人阶段必须额外取这一份。
+                    const party_session = if (std.mem.eql(u8, phase, "ChampSelect") or std.mem.eql(u8, phase, "ReadyCheck"))
+                        client.get("/lol-gameflow/v1/session") catch null
+                    else
+                        null;
+                    defer if (party_session) |party_json| std.heap.page_allocator.free(party_json);
                     if (std.mem.eql(u8, phase, "ChampSelect") or std.mem.eql(u8, phase, "ReadyCheck")) {
                         persistBpSnapshot(self, value, catalog orelse "[]");
                     }
                     const session_phase = if (isActiveLivePhase(phase) or !should_probe_live) phase else "InProgress";
-                    const result = liveSessionEnvelopePhaseContext(self, client, value, custom_lobby, session_phase, current, catalog orelse "[]", queues orelse "[]", output, enrich) catch return error.LcuInvalidResponse;
+                    const result = liveSessionEnvelopePhaseContext(self, client, value, custom_lobby, party_session, session_phase, current, catalog orelse "[]", queues orelse "[]", output, enrich) catch return error.LcuInvalidResponse;
                     if (std.mem.eql(u8, phase, "ChampSelect") or std.mem.eql(u8, phase, "ReadyCheck")) {
                         // Fast roster refreshes must not overwrite a richer
                         // enriched snapshot with the same ten placeholders.
@@ -1690,7 +1696,7 @@ fn getLiveLobbyInternal(context: *anyopaque, invocation: native_sdk.bridge.Invoc
                             defer std.heap.page_allocator.free(spectator);
                             if (rawRosterCount(spectator) <= lobbyRosterCount(result)) continue;
                             const spectator_phase = if (isActiveLivePhase(phase)) phase else "WatchInProgress";
-                            const spectator_result = liveSessionEnvelopePhaseContext(self, client, spectator, null, spectator_phase, current, catalog orelse "[]", queues orelse "[]", output, enrich) catch continue;
+                            const spectator_result = liveSessionEnvelopePhaseContext(self, client, spectator, null, null, spectator_phase, current, catalog orelse "[]", queues orelse "[]", output, enrich) catch continue;
                             const merged = mergeWithBestLiveCache(self, spectator_result, enrich, output) catch spectator_result;
                             self.live_lobby_enriched = enrich;
                             cacheLiveLobby(self, merged);
@@ -3350,15 +3356,14 @@ fn sendShortcut(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
             defer if (owner) |value| std.heap.page_allocator.free(value);
             const current_owner = if (self.live_owner_puuid_len > 0) self.live_owner_puuid[0..self.live_owner_puuid_len] else owner orelse "";
             break :blk shortcut_service.buildEncounterLinesOwned(archive orelse "[]", shortcut_lobby, current_owner, &lines_buffer) catch return error.InvalidShortcut;
-        } else shortcut_service.buildLines(self.config[0..self.config_len], payload.shortcutId, shortcut_lobby, phase, .{ .premade_side = payload.premadeSide }, &lines_buffer) catch return error.InvalidShortcut;
+        } else shortcut_service.buildLines(self.config[0..self.config_len], payload.shortcutId, shortcut_lobby, phase, .{ .premade_side = payload.premadeSide, .chat_expanded = true }, &lines_buffer) catch return error.InvalidShortcut;
         const lines = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), lines_json, .{}) catch return error.InvalidShortcut;
         if (lines != .array or lines.array.items.len == 0) return error.ShortcutUnavailable;
         const cfg = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.config[0..self.config_len], .{}) catch return error.InvalidConfig;
         const interval_ms = std.math.clamp(configAutomationInt(cfg, "shortcutSendIntervalMs", 250), @as(i64, 250), @as(i64, 5000));
-        const protect_input = if (configAutomation(cfg)) |automation| if (automation.object.get("protectChatInput")) |value| value != .bool or value.bool else true else true;
         try verifyActionAccount(self, client);
         if (std.mem.eql(u8, phase, "InProgress") or std.mem.eql(u8, phase, "GameStart")) {
-            try native_input.sendChatLines(io, lines, interval_ms, protect_input, snapshotControl(self));
+            try native_input.sendChatLines(io, lines, interval_ms, snapshotControl(self));
             return copyJson(lines_json, output);
         }
         if (!std.mem.eql(u8, phase, "ChampSelect") and !std.mem.eql(u8, phase, "ReadyCheck")) return error.ShortcutUnavailable;
@@ -4966,7 +4971,7 @@ fn liveClientEnvelope(self: *Runtime, client: lcu.Client, live_json: []const u8,
     const allocator = arena.allocator();
     const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, live_json, .{}) catch return error.LcuInvalidResponse;
     if (root != .object) return error.LcuInvalidResponse;
-    const players = root.object.get("allPlayers") orelse return error.LcuInvalidResponse;
+    var players = root.object.get("allPlayers") orelse return error.LcuInvalidResponse;
     if (players != .array or players.array.items.len == 0) return error.LcuInvalidResponse;
     const current_value = if (current_json) |value| std.json.parseFromSliceLeaky(std.json.Value, allocator, value, .{}) catch std.json.Value{ .null = {} } else std.json.Value{ .null = {} };
     const current = firstJsonValue(current_value);
@@ -4999,6 +5004,19 @@ fn liveClientEnvelope(self: *Runtime, client: lcu.Client, live_json: []const u8,
     // it with the prior same-game snapshot instead of blanking the live page.
     if (current != .null and !current_player_found) return error.LcuInvalidResponse;
     if (current_team.len == 0) return error.LcuInvalidResponse;
+
+    // `/liveclientdata/allgamedata` 完全不含组队字段，所以游戏进行中如果只看这
+    // 份名单，就只能靠战绩推测开黑。gameflow session 的 teamOne/teamTwo 在整局
+    // 里都带着 `teamParticipantId`，LeagueAkari 正是靠它把组队标记维持到结算；
+    // 按身份把这份队伍元数据合进 Live Client 名单，两边就一致了。
+    if (session != .null) {
+        if (sessionTeamValue(session, "teamOne", "ally")) |session_ally| {
+            players = try mergeRosterPartyMetadata(allocator, players, session_ally) orelse players;
+        }
+        if (sessionTeamValue(session, "teamTwo", "enemy")) |session_enemy| {
+            players = try mergeRosterPartyMetadata(allocator, players, session_enemy) orelse players;
+        }
+    }
 
     // Build each team once so the same normalized roster can be exposed both
     // through the legacy ally/enemy fields and the Rust-compatible `teams`
@@ -6232,10 +6250,15 @@ fn writeRecentScore(writer: *std.Io.Writer, matches: []const std.json.Value) !vo
 }
 
 fn liveSessionEnvelopePhase(session_json: []const u8, phase: []const u8, current_json: ?[]const u8, output: []u8) ![]const u8 {
-    return liveSessionEnvelopePhaseContext(null, null, session_json, null, phase, current_json, "[]", "[]", output, true);
+    return liveSessionEnvelopePhaseContext(null, null, session_json, null, null, phase, current_json, "[]", "[]", output, true);
 }
 
-fn liveSessionEnvelopePhaseContext(self: ?*Runtime, client: ?lcu.Client, session_json: []const u8, custom_lobby_json: ?[]const u8, phase: []const u8, current_json: ?[]const u8, catalog_json: []const u8, queue_catalog_json: []const u8, output: []u8, enrich: bool) ![]const u8 {
+/// `party_session_json` 是 `/lol-gameflow/v1/session`：选人阶段的
+/// `/lol-champ-select/v1/session` 只带本方的队伍标识，而 gameflow 的
+/// `teamOne`/`teamTwo` 对**双方**都给出 `teamParticipantId`。LeagueAkari 的
+/// `getGameflowTeamParticipantGroups` 正是只读这一份数据来分组，所以选人阶段
+/// 要额外传进来，否则敌方组队只能靠战绩推测，时灵时不灵。
+fn liveSessionEnvelopePhaseContext(self: ?*Runtime, client: ?lcu.Client, session_json: []const u8, custom_lobby_json: ?[]const u8, party_session_json: ?[]const u8, phase: []const u8, current_json: ?[]const u8, catalog_json: []const u8, queue_catalog_json: []const u8, output: []u8, enrich: bool) ![]const u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -6332,6 +6355,25 @@ fn liveSessionEnvelopePhaseContext(self: ?*Runtime, client: ?lcu.Client, session
     try injectCurrentPlayerValue(allocator, &ally, enemy, current, isSpectatorPhase(phase));
     ally_count = if (ally) |team| if (arrayLike(team)) |array_value| array_value.array.items.len else 0 else 0;
     enemy_count = if (enemy) |team| if (arrayLike(team)) |array_value| array_value.array.items.len else 0 else 0;
+    // 选人阶段补上双方的组队标识。`myTeam`/`theirTeam` 里没有
+    // `teamParticipantId`，只有 `/lol-lobby/v2/lobby` 的本方 partyId；把
+    // gameflow 的 teamOne/teamTwo 覆盖上去之后，敌方开黑也能像 AK 一样直接
+    // 分组，而不必等战绩推测凑够阈值。
+    if (party_session_json) |party_text| {
+        const party = std.json.parseFromSliceLeaky(std.json.Value, allocator, party_text, .{}) catch std.json.Value{ .null = {} };
+        if (party == .object) {
+            var party_ally = sessionTeamValue(party, "teamOne", "ally");
+            var party_enemy = sessionTeamValue(party, "teamTwo", "enemy");
+            // teamOne 恒为本地玩家所在方；观战或镜像数据下可能需要换个方向。
+            if (current != .null and !arrayContainsIdentity(party_ally, current) and arrayContainsIdentity(party_enemy, current)) {
+                const swapped = party_ally;
+                party_ally = party_enemy;
+                party_enemy = swapped;
+            }
+            ally = try mergeRosterPartyMetadata(allocator, ally, party_ally);
+            enemy = try mergeRosterPartyMetadata(allocator, enemy, party_enemy);
+        }
+    }
     // A flat game-start selection list is also supported when only one side
     // exists, but it must not replace an already populated topology.
     const ally_from_flat = flat_selections != null and ally_count == 0;
@@ -7499,7 +7541,7 @@ test "custom lobby topology overrides fixed ten-slot champ select data" {
         "}}";
     const current = "{\"puuid\":\"self\",\"gameName\":\"我的账号\",\"tagLine\":\"HN1\"}";
     var output: [64 * 1024]u8 = undefined;
-    const result = try liveSessionEnvelopePhaseContext(null, null, session, custom, "ChampSelect", current, "[]", "[]", &output, false);
+    const result = try liveSessionEnvelopePhaseContext(null, null, session, custom, null, "ChampSelect", current, "[]", "[]", &output, false);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
     defer parsed.deinit();
     const ally = parsed.value.object.get("ally").?.array.items;
@@ -7531,7 +7573,7 @@ test "champ select premade overlay keeps the local player in the party" {
     const current = "{\"puuid\":\"self\",\"gameName\":\"我的账号\",\"tagLine\":\"HN1\"}";
     const catalog = "[{\"id\":103,\"name\":\"九尾妖狐\"},{\"id\":64,\"name\":\"盲僧\"},{\"id\":86,\"name\":\"德玛西亚之力\"}]";
     var lobby_output: [32 * 1024]u8 = undefined;
-    const result = try liveSessionEnvelopePhaseContext(null, null, session, lobby, "ChampSelect", current, catalog, "[]", &lobby_output, false);
+    const result = try liveSessionEnvelopePhaseContext(null, null, session, lobby, null, "ChampSelect", current, catalog, "[]", &lobby_output, false);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
     defer parsed.deinit();
     const ally = parsed.value.object.get("ally").?.array.items;
@@ -7558,11 +7600,58 @@ test "champ select premade overlay reads the account from localMember" {
     const current = "{\"puuid\":\"self\",\"gameName\":\"我的账号\",\"tagLine\":\"HN1\"}";
     const catalog = "[{\"id\":103,\"name\":\"九尾妖狐\"},{\"id\":64,\"name\":\"盲僧\"}]";
     var lobby_output: [32 * 1024]u8 = undefined;
-    const result = try liveSessionEnvelopePhaseContext(null, null, session, lobby, "ChampSelect", current, catalog, "[]", &lobby_output, false);
+    const result = try liveSessionEnvelopePhaseContext(null, null, session, lobby, null, "ChampSelect", current, catalog, "[]", &lobby_output, false);
     var shortcut_output: [4096]u8 = undefined;
     const config = "{\"automation\":{\"shortcuts\":[{\"id\":\"premade\",\"target\":\"premade\",\"template\":\"{name}\",\"enabled\":true}]}}";
     const lines = try shortcut_service.buildLines(config, "premade", result, "ChampSelect", .{ .premade_side = "ally" }, &shortcut_output);
     try std.testing.expectEqualStrings("[\"我方开黑：[九尾妖狐、盲僧]\"]", lines);
+}
+
+test "champ select groups both teams from the gameflow party session" {
+    // 选人 session 只有英雄和位置，没有 teamParticipantId；gameflow session 才
+    // 同时给出双方的队伍标识，LeagueAkari 的分组完全依赖后者。
+    const session =
+        "{\"queueId\":420,\"myTeam\":[" ++
+        "{\"puuid\":\"self\",\"gameName\":\"我的账号\",\"championId\":103,\"cellId\":0}," ++
+        "{\"puuid\":\"friend\",\"gameName\":\"双排队友\",\"championId\":64,\"cellId\":1}," ++
+        "{\"puuid\":\"solo\",\"gameName\":\"路人队友\",\"championId\":86,\"cellId\":2}]," ++
+        "\"theirTeam\":[" ++
+        "{\"puuid\":\"enemy-a\",\"gameName\":\"敌方甲\",\"championId\":1,\"cellId\":5}," ++
+        "{\"puuid\":\"enemy-b\",\"gameName\":\"敌方乙\",\"championId\":2,\"cellId\":6}," ++
+        "{\"puuid\":\"enemy-c\",\"gameName\":\"敌方丙\",\"championId\":3,\"cellId\":7}]}";
+    const party_session =
+        "{\"gameData\":{\"gameId\":42,\"teamOne\":[" ++
+        "{\"puuid\":\"self\",\"teamParticipantId\":10,\"isPremade\":true}," ++
+        "{\"puuid\":\"friend\",\"teamParticipantId\":10,\"isPremade\":true}," ++
+        "{\"puuid\":\"solo\",\"teamParticipantId\":11}]," ++
+        "\"teamTwo\":[" ++
+        "{\"puuid\":\"enemy-a\",\"teamParticipantId\":20,\"isPremade\":true}," ++
+        "{\"puuid\":\"enemy-b\",\"teamParticipantId\":20,\"isPremade\":true}," ++
+        "{\"puuid\":\"enemy-c\",\"teamParticipantId\":21}]}}";
+    const current = "{\"puuid\":\"self\",\"gameName\":\"我的账号\",\"tagLine\":\"HN1\"}";
+    var output: [64 * 1024]u8 = undefined;
+    const result = try liveSessionEnvelopePhaseContext(null, null, session, null, party_session, "ChampSelect", current, "[]", "[]", &output, false);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    const ally = parsed.value.object.get("ally").?.array.items;
+    const enemy = parsed.value.object.get("enemy").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), ally.len);
+    try std.testing.expectEqual(@as(usize, 3), enemy.len);
+    // 本方双排：local 侧本来就能从 /lol-lobby/v2/lobby 拿到，这里改由 gameflow 提供。
+    try std.testing.expectEqualStrings("10", jsonField(ally[0], "premadeGroup"));
+    try std.testing.expectEqualStrings("10", jsonField(ally[1], "premadeGroup"));
+    try std.testing.expect(jsonBool(ally[0], "isPremade"));
+    try std.testing.expectEqual(@as(usize, 1), ally[0].object.get("premadeWith").?.array.items.len);
+    try std.testing.expectEqualStrings("双排队友", ally[0].object.get("premadeWith").?.array.items[0].string);
+    // 单独一人：既没有共同标识，也不会被标成组队。
+    try std.testing.expectEqualStrings("", jsonField(ally[2], "premadeGroup"));
+    try std.testing.expect(!jsonBool(ally[2], "isPremade"));
+    // 敌方双排：以前只能靠战绩推测，现在直接来自 gameflow 的 teamTwo。
+    try std.testing.expectEqualStrings("20", jsonField(enemy[0], "premadeGroup"));
+    try std.testing.expectEqualStrings("20", jsonField(enemy[1], "premadeGroup"));
+    try std.testing.expect(jsonBool(enemy[0], "isPremade"));
+    try std.testing.expectEqualStrings("", jsonField(enemy[2], "premadeGroup"));
+    try std.testing.expect(!jsonBool(enemy[2], "isPremade"));
 }
 
 fn containsProfilePuuid(players: []const std.json.Value, puuid: []const u8) bool {
@@ -7609,6 +7698,45 @@ test "maps a realistic ten-player Live Client envelope and orients the current t
     try std.testing.expectEqualStrings("单双排", jsonField(parsed.value, "gameMode"));
     try std.testing.expectEqualStrings("InProgress", jsonField(parsed.value, "phase"));
     try std.testing.expect(std.mem.indexOf(u8, result, "\"championName\":\"愁云使者\"") != null);
+}
+
+test "in-game roster keeps party ids from the gameflow session" {
+    // Live Client 的 allPlayers 完全不含组队字段；gameflow session 的
+    // teamOne/teamTwo 才带着 `teamParticipantId`，LeagueAkari 靠它把组队标记
+    // 一直维持到结算，否则游戏里就只能等战绩推测凑够阈值，时灵时不灵。
+    const live =
+        "{\"activePlayer\":{\"puuid\":\"self\",\"riotId\":\"Current Player#HN1\"},\"gameData\":{\"gameId\":77},\"allPlayers\":[" ++
+        "{\"puuid\":\"self\",\"riotId\":\"Current Player#HN1\",\"team\":\"ORDER\",\"championName\":\"Vex\"}," ++
+        "{\"puuid\":\"friend\",\"riotId\":\"Duo#HN1\",\"team\":\"ORDER\",\"championName\":\"Garen\"}," ++
+        "{\"puuid\":\"solo\",\"riotId\":\"Solo#HN1\",\"team\":\"ORDER\",\"championName\":\"Jinx\"}," ++
+        "{\"puuid\":\"enemy-a\",\"riotId\":\"Enemy A#HN1\",\"team\":\"CHAOS\",\"championName\":\"Ahri\"}," ++
+        "{\"puuid\":\"enemy-b\",\"riotId\":\"Enemy B#HN1\",\"team\":\"CHAOS\",\"championName\":\"Camille\"}]}";
+    const current = "{\"puuid\":\"self\",\"gameName\":\"Current Player\",\"tagLine\":\"HN1\"}";
+    const session =
+        "{\"gameData\":{\"gameId\":77,\"teamOne\":[" ++
+        "{\"puuid\":\"self\",\"teamParticipantId\":7,\"isPremade\":true}," ++
+        "{\"puuid\":\"friend\",\"teamParticipantId\":7,\"isPremade\":true}," ++
+        "{\"puuid\":\"solo\",\"teamParticipantId\":8}]," ++
+        "\"teamTwo\":[" ++
+        "{\"puuid\":\"enemy-a\",\"teamParticipantId\":9,\"isPremade\":true}," ++
+        "{\"puuid\":\"enemy-b\",\"teamParticipantId\":9,\"isPremade\":true}]}}";
+    var state = Runtime.init();
+    var output: [64 * 1024]u8 = undefined;
+    const result = try liveClientEnvelope(&state, undefined, live, session, "InProgress", current, "[]", "[]", &output, false);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    const ally = parsed.value.object.get("ally").?.array.items;
+    const enemy = parsed.value.object.get("enemy").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), ally.len);
+    try std.testing.expectEqual(@as(usize, 2), enemy.len);
+    try std.testing.expectEqualStrings("7", jsonField(ally[0], "premadeGroup"));
+    try std.testing.expectEqualStrings("7", jsonField(ally[1], "premadeGroup"));
+    try std.testing.expect(jsonBool(ally[0], "isPremade"));
+    try std.testing.expectEqual(@as(usize, 1), ally[0].object.get("premadeWith").?.array.items.len);
+    try std.testing.expectEqualStrings("", jsonField(ally[2], "premadeGroup"));
+    try std.testing.expectEqualStrings("9", jsonField(enemy[0], "premadeGroup"));
+    try std.testing.expectEqualStrings("9", jsonField(enemy[1], "premadeGroup"));
+    try std.testing.expect(jsonBool(enemy[0], "isPremade"));
 }
 
 test "does not orient a Live Client roster from array order when current account is absent" {
