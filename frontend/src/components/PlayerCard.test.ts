@@ -96,7 +96,22 @@ describe("PlayerCard", () => {
     expect(wrapper.classes()).toContain("bp-player-card--premade");
     expect(wrapper.classes()).toContain("bp-player-card--premade-unresolved");
     expect(wrapper.find(".bp-player-card__premade").text()).toContain("组队");
-    expect(wrapper.get("[data-testid='player-tags']").text()).toContain("开黑");
+    // LeagueAkari 标准：预组队标签必须绑定到分组 id，分组未解析时不渲染该标签。
+    expect(wrapper.get("[data-testid='player-tags']").text()).not.toContain("小队");
+  });
+
+  it("以 AK 的字母分组渲染预组队标签", () => {
+    const player = {
+      ...fixtureLobby.ally[0],
+      isPremade: true,
+      premadeGroup: null,
+      premadeWith: [],
+    };
+    const wrapper = mount(PlayerCard, { props: { player, premadeTone: 1 } });
+
+    const tags = wrapper.get("[data-testid='player-tags']");
+    expect(tags.text()).toContain("小队 B");
+    expect(wrapper.classes()).toContain("bp-player-card--premade-1");
   });
 
   it("以统一 chip 呈现「遇到过」，次数收进弹层而不是挤在标签上", () => {

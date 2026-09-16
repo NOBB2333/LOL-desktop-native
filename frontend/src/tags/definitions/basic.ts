@@ -1,24 +1,30 @@
 import { chip, textPopover } from "../chip";
-import { EASY_GANK_TONES, premadeGroupColor } from "../tones";
+import { EASY_GANK_TONES, premadeGroupColor, premadeGroupLabel } from "../tones";
 import type { PlayerTagDefinition } from "../types";
 
 /**
  * LeagueAkari `basic.tsx` 的移植。
  *
- * 一条原则必须守住：**场均类标签只报数值，不做「偏高 / 偏低」判断。**
- * AK 只对少数几项做分档（好抓难抓、击杀伤害转化、极高胜率、连胜连败、优异表现），
- * 其余场均指标都是「打开开关就显示那个数」。本项目此前给存活、参团、视野、
- * 伤害占比都加了主观高低阈值，是噪声的主要来源，这里全部去掉。
+ * 两条原则必须守住：
+ *
+ * 1. **标签文案逐字对齐 AK 的 zh-CN 词条**
+ *    （`src/shared/i18n/zh-CN/renderer/ongoing-game.yaml` 的
+ *    `ongoingGame.playerCard.*`）。这里是「一模一样」的关键：AK 用的是
+ *    「K 头 / 打工 / 伤转率 / 问号 N 次 / 小队 A」这类专有说法，
+ *    换成自己组织的措辞就不算对齐了。
+ * 2. **场均类标签只报数值，不做「偏高 / 偏低」判断。**
+ *    AK 只对少数几项做分档（好抓难抓、击杀伤害转化、极高胜率、连胜连败、优异表现），
+ *    其余场均指标都是「打开开关就显示那个数」。
  */
 
 const TAG_LABELS = {
   self: "自己",
-  premade: "开黑",
   highWinRate: "极高胜率",
-  private: "战绩隐藏",
+  private: "生涯隐藏",
   easyGank: { "hard-gank": "难抓", "easy-gank": "好抓", "very-easy-gank": "非常好抓" },
-  killDamageHigh: "击杀伤害转化高",
-  killDamageLow: "击杀伤害转化低",
+  /** AK `killDamageEfficiencyHigh` / `Low`：击杀多伤害少叫「K 头」，反之叫「打工」。 */
+  killDamageHigh: "K 头",
+  killDamageLow: "打工",
 } as const;
 
 /** 好抓 / 难抓文案；卡片标签与 `signals.ts` 的快捷消息变量共用，避免两套说法。 */
@@ -33,7 +39,7 @@ export function streakLabel(facts: { winningStreak: number; losingStreak: number
   return "状态稳定";
 }
 
-/** 场均单杀文案：`{n} 单杀`。 */
+/** 场均单杀文案：AK `soloKills` = `{{times}} 单杀`。 */
 export function soloKillsLabel(average: number): string {
   return `${average.toFixed(1)} 单杀`;
 }
@@ -90,24 +96,24 @@ export const SELF_TAG: PlayerTagDefinition = {
   },
 };
 
-/** 预组队：按分组编号取色，同组同色。 */
+/**
+ * 预组队。
+ *
+ * AK 用**字母**标识分组（`premade: '小队 {{team}}'`，team 取 `A`~`L`），
+ * 颜色也按字母取 `PREMADE_TEAM_TAG_CLASSES[team]`。这里同样把分组的序号
+ * 换算成字母再展示，保证 chip 上是「小队 A」而不是「小队 1」。
+ */
 export const PREMADE_TEAM_TAG: PlayerTagDefinition = {
   id: "premade-team",
   render: (ctx) => {
     if (!ctx.settings.showPremadeTeamTag) return null;
-    const tone = ctx.premadeTone;
-    if (tone === undefined && !ctx.player.isPremade) return null;
+    const team = premadeGroupLabel(ctx.premadeTone);
+    if (!team) return null;
 
-    const color = premadeGroupColor(tone);
-    const members = ctx.player.premadeWith.filter(Boolean);
-    const labelText = tone === undefined ? TAG_LABELS.premade : `${TAG_LABELS.premade} ${tone + 1}`;
-    const detail = members.length
-      ? `与 ${members.join("、")} 开黑`
-      : "检测到已知组队（选人阶段可能尚未公开队友名称）";
-
+    const color = premadeGroupColor(ctx.premadeTone);
     return {
-      label: chip(labelText, { tone: "premade", bg: color?.bg, fg: color?.fg }),
-      popover: textPopover(detail),
+      label: chip(`小队 ${team}`, { tone: "premade", bg: color?.bg, fg: color?.fg }),
+      popover: textPopover(`这些玩家是预组队玩家，标记为小队 ${team}`),
     };
   },
 };
@@ -137,7 +143,10 @@ export const PRIVACY_TAG: PlayerTagDefinition = {
     if (ctx.player.privacy !== "PRIVATE") return null;
     return {
       label: chip(TAG_LABELS.private, { tone: "privacy" }),
-      popover: textPopover("该玩家把战绩设为私密，客户端不会返回他的对局列表"),
+      popover: textPopover(
+        "该玩家设置了生涯为隐藏。这意味着他人无法查看该玩家的个人主页，包括战绩、成就点数等。另外，也不能观战该玩家",
+        300,
+      ),
     };
   },
 };
@@ -185,20 +194,26 @@ export const EASY_GANK_TAG: PlayerTagDefinition = {
       popover: textPopover(
         () =>
           `在最近已分析的 ${tag.count} 场召唤师峡谷对局中，该玩家 15 分钟前被敌方打野参与击杀的场均次数为 ${tag.times.toFixed(2)} 次`,
+        320,
       ),
     };
   },
 };
 
-/** 场均单杀：chip 直接给次数，不做「威胁 / 有能力」这类主观分档。 */
+/**
+ * 场均单杀。
+ *
+ * AK 的条件是 `!analysis || !avgSoloKills`——**只要样本里算出了非 0 的值就显示**，
+ * 没有最小场次门槛。此前本项目额外加了「至少 3 场」与「必须 > 0」，
+ * 会在样本偏少时把 AK 会显示的标签吃掉，这里去掉。
+ */
 export const SOLO_KILLS_TAG: PlayerTagDefinition = {
   id: "solo-kills",
   render: (ctx) => {
     const { facts } = ctx;
     if (!ctx.settings.showSoloKillsTag) return null;
     const average = facts.averageSoloKills;
-    if (average === null || average <= 0) return null;
-    if (facts.soloKillsSample < 3) return null;
+    if (average === null || !average) return null;
     return {
       label: chip(() => `${average.toFixed(1)} 单杀`, { tone: "solo" }),
       popover: textPopover(
@@ -210,7 +225,10 @@ export const SOLO_KILLS_TAG: PlayerTagDefinition = {
 
 /**
  * 以下为 AK 的 `AVERAGE_*` 系列：**只报数值，不做高低判断**，
- * 且多数默认关闭（见 `settings.ts`）。数值缺失时不渲染，而不是显示 0。
+ * 且多数默认关闭（见 `settings.ts`）。
+ *
+ * 条件一律对齐 AK 的 `!settings.showX || !analysis`：只要样本存在就渲染，
+ * 数值缺失按 0 参与（AK 的 `avgOrZero`），而不是把整条标签藏起来。
  */
 
 /** 场均队伍伤害占比。 */
@@ -223,7 +241,7 @@ export const AVERAGE_TEAM_DAMAGE_TAG: PlayerTagDefinition = {
       label: chip(() => `伤害 ${(facts.avgChampionDamagePercentageOfTeam * 100).toFixed(0)}%`, { tone: "damage" }),
       popover: textPopover(
         () =>
-          `在近期 ${facts.sample} 场对局中，该玩家的平均团队伤害占比为 ${(facts.avgChampionDamagePercentageOfTeam * 100).toFixed(2)}%`,
+          `在最近的 ${facts.sample} 场对局中，该玩家的平均队伍伤害占比为 ${(facts.avgChampionDamagePercentageOfTeam * 100).toFixed(2)}%`,
       ),
     };
   },
@@ -234,12 +252,12 @@ export const AVERAGE_TEAM_DAMAGE_TAKEN_TAG: PlayerTagDefinition = {
   id: "average-team-damage-taken",
   render: (ctx) => {
     const { facts } = ctx;
-    const share = facts.avgDamageTakenPercentageOfTeam;
-    if (!ctx.settings.showAverageTeamDamageTakenTag || share === null) return null;
+    if (!ctx.settings.showAverageTeamDamageTakenTag || facts.sample === 0) return null;
+    const share = facts.avgDamageTakenPercentageOfTeam ?? 0;
     return {
       label: chip(() => `承伤 ${(share * 100).toFixed(0)}%`, { tone: "damage-taken" }),
       popover: textPopover(
-        () => `在近期 ${facts.sample} 场对局中，该玩家的平均团队承伤占比为 ${(share * 100).toFixed(2)}%`,
+        () => `在最近的 ${facts.sample} 场对局中，该玩家的平均队伍承伤占比为 ${(share * 100).toFixed(2)}%`,
       ),
     };
   },
@@ -250,12 +268,12 @@ export const AVERAGE_TEAM_GOLD_TAG: PlayerTagDefinition = {
   id: "average-team-gold",
   render: (ctx) => {
     const { facts } = ctx;
-    const share = facts.avgGoldPercentageOfTeam;
-    if (!ctx.settings.showAverageTeamGoldTag || share === null) return null;
+    if (!ctx.settings.showAverageTeamGoldTag || facts.sample === 0) return null;
+    const share = facts.avgGoldPercentageOfTeam ?? 0;
     return {
       label: chip(() => `经济 ${(share * 100).toFixed(0)}%`, { tone: "gold" }),
       popover: textPopover(
-        () => `在近期 ${facts.sample} 场对局中，该玩家的平均团队经济占比为 ${(share * 100).toFixed(2)}%`,
+        () => `在最近的 ${facts.sample} 场对局中，该玩家的平均队伍经济占比为 ${(share * 100).toFixed(2)}%`,
       ),
     };
   },
@@ -268,16 +286,14 @@ export const AVERAGE_CS_PER_MINUTE_TAG: PlayerTagDefinition = {
     const { facts } = ctx;
     if (!ctx.settings.showAverageCsPerMinuteTag || facts.sample === 0) return null;
     return {
-      label: chip(() => `分均补刀 ${facts.avgCsPerMinute.toFixed(1)}`, { tone: "cs" }),
-      popover: textPopover(() => {
-        const lines = [
-          `在近期 ${facts.sample} 场对局中，该玩家平均每分钟补兵 ${facts.avgCsPerMinute.toFixed(2)} 个`,
-        ];
-        if (facts.avgCsPercentageOfTeam !== null) {
-          lines.push(`补刀占队伍总量 ${(facts.avgCsPercentageOfTeam * 100).toFixed(2)}%`);
-        }
-        return lines.join("\n");
-      }),
+      label: chip(() => `${facts.avgCsPerMinute.toFixed(1)} 补兵 / 分`, { tone: "cs" }),
+      popover: textPopover(
+        () =>
+          [
+            `在最近的 ${facts.sample} 场对局中，该玩家平均每分钟补兵 ${facts.avgCsPerMinute.toFixed(2)} 个。`,
+            `平均补兵队伍占比为 ${((facts.avgCsPercentageOfTeam ?? 0) * 100).toFixed(2)}%。`,
+          ].join("\n"),
+      ),
     };
   },
 };
@@ -289,15 +305,16 @@ export const AVERAGE_DAMAGE_GOLD_EFFICIENCY_TAG: PlayerTagDefinition = {
     const { facts } = ctx;
     if (!ctx.settings.showAverageDamageGoldEfficiencyTag || facts.sample === 0) return null;
     const rate = facts.avgDamageGoldEfficiency;
-    if (!Number.isFinite(rate) || rate <= 0) return null;
     return {
-      label: chip(() => `伤害经济 ${(rate * 100).toFixed(0)}%`, { tone: "damage-gold" }),
+      label: chip(() => `伤转率 ${(rate * 100).toFixed(0)}%`, { tone: "damage-gold" }),
       popover: textPopover(
         () =>
           [
-            `在近期 ${facts.sample} 场对局中，该玩家的平均伤害经济转化为 ${(rate * 100).toFixed(2)}%`,
-            "定义：对英雄伤害 ÷ 获得经济。数值越高，说明同样多的经济打出的伤害越多。",
+            `在最近的 ${facts.sample} 场对局中，该玩家的平均伤害转化率为 ${(rate * 100).toFixed(2)}%`,
+            "伤转率 = 对英雄造成的总伤害 ÷ 获得金币，表示每 1 金币转化出的英雄伤害。",
+            "用于判断玩家把经济转化为英雄伤害的效率。",
           ].join("\n"),
+        320,
       ),
     };
   },
@@ -311,9 +328,9 @@ export const AVERAGE_ENEMY_MISSING_PINGS_TAG: PlayerTagDefinition = {
     const pings = facts.avgEnemyMissingPings;
     if (!ctx.settings.showAverageEnemyMissingPingsTag || pings === null) return null;
     return {
-      label: chip(() => `消失信号 ${truncateTailingZeros(pings)}`, { tone: "pings" }),
+      label: chip(() => `问号 ${truncateTailingZeros(pings)} 次`, { tone: "pings" }),
       popover: textPopover(
-        () => `该玩家平均每局发出 ${pings.toFixed(3)} 次「敌人消失」信号`,
+        () => `该玩家平均每局发送敌方消失信号 ${pings.toFixed(3)} 次`,
       ),
     };
   },
@@ -344,11 +361,15 @@ export const AVERAGE_KILL_DAMAGE_EFFICIENCY_TAG: PlayerTagDefinition = {
     const kind = resolveKillDamageEfficiency(value);
     if (kind === "normal") return null;
     const label = kind === "high" ? TAG_LABELS.killDamageHigh : TAG_LABELS.killDamageLow;
+    const count = facts.sample;
     return {
       label: chip(label, { tone: "kill-damage" }),
       popover: textPopover(
         () =>
-          `${kind === "high" ? "击杀份额高于伤害份额" : "伤害份额高于击杀份额"}：${(value * 100).toFixed(2)}%（近期 ${facts.sample} 场均值）`,
+          kind === "high"
+            ? `在最近的 ${count} 场对局中，该玩家的平均击杀伤害比率为 ${(value * 100).toFixed(2)}%，以较少的队伍伤害换取了较多的击杀数`
+            : `在最近的 ${count} 场对局中，该玩家的平均击杀伤害比率为 ${(value * 100).toFixed(2)}%，以较多的队伍伤害换取了较少的击杀数`,
+        340,
       ),
     };
   },

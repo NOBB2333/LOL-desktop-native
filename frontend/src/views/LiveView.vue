@@ -9,6 +9,7 @@ import PageHeader from "../components/PageHeader.vue";
 import PlayerCard from "../components/PlayerCard.vue";
 import PlayerDetailDrawer from "../components/PlayerDetailDrawer.vue";
 import PlayerTagEditPanel from "../components/PlayerTagEditPanel.vue";
+import TeamTagsArea from "../live/components/TeamTagsArea.vue";
 import EncounterDetails from "../components/EncounterDetails.vue";
 import { useEncounters } from "../composables/useEncounters";
 import { useMatchDetail } from "../composables/useMatchDetail";
@@ -24,6 +25,7 @@ import { roleName } from "../utils/format";
 import { enrichedRosterCoversOverlay, mergeRosterSnapshot, playerCardKey } from "../live/roster";
 import { isActiveGamePhase, isCurrentLiveSnapshot, isVisibleGamePhase, shouldAutoHideLivePanel, shouldResetClearedLivePanel } from "../live/panel";
 import { assignPremadeTones, findLocalPlayer, isLocalPartyMember } from "../live/premadeGroups";
+import { premadeGroupLabel } from "../tags/tones";
 import { queueLabel } from "../utils/queue";
 
 const app = useAppStore();
@@ -182,6 +184,23 @@ const enemyPlayers = computed(() => enemyTeam.value.players);
 const hasLobbyPlayers = computed(() => teams.value.some((team) => team.players.length > 0));
 const premadeTones = computed(() => assignPremadeTones(teams.value.map((team) => team.players)));
 const premadeTone = (player: PlayerProfile) => premadeTones.value.get(player);
+/**
+ * 把一支队伍里「同 tone」的玩家收成一个预组队分组，并把内部序号换算成 AK 的字母。
+ * 卡片上的「小队 X」chip 与队伍标签条上的「N 黑」药丸共用这一份分组结果。
+ */
+const teamPremadeGroups = (team: LiveTeam) => {
+  const byTone = new Map<number, string[]>();
+  for (const player of team.players) {
+    const tone = premadeTones.value.get(player);
+    if (tone === undefined || !player.puuid) continue;
+    const members = byTone.get(tone) ?? [];
+    members.push(player.puuid);
+    byTone.set(tone, members);
+  }
+  return [...byTone.entries()]
+    .filter(([, puuids]) => puuids.length > 1)
+    .map(([tone, puuids]) => ({ id: premadeGroupLabel(tone) ?? "A", tone, puuids }));
+};
 const localPlayer = computed(() => findLocalPlayer(allyTeam.value.players, app.connection.gameName, app.connection.tagLine));
 /**
  * 「最近一局回看」那一行的完整十人数据。
@@ -479,14 +498,14 @@ onBeforeUnmount(() => {
       <section v-if="lastSentLines.length" class="sent-message-preview" aria-live="polite"><div><span class="eyebrow">{{ lastSentLabel.includes("仅生成") ? "评估结果" : "最近发送" }}</span><strong>{{ lastSentLabel }} · {{ lastSentLines.length }} 条</strong></div><pre>{{ lastSentLines.join("\n") }}</pre><NButton size="tiny" quaternary @click="lastSentLines = []">清除</NButton></section>
       <section v-if="hasLobbyPlayers" class="game-board" :data-layout="current.layoutKind || 'classic'">
         <div v-if="classicLayout" class="game-teams">
-          <header class="game-team-heading game-team-heading--ally"><div><span class="side-kicker ally">我方 · {{ allyTeam.players.length }} 人</span><h2>{{ allyTeam.label }}</h2></div><strong>{{ (allyTeam.summary?.score ?? current.allySummary.score).toFixed(1) }}<small> 队伍评分</small></strong></header>
+          <header class="game-team-heading game-team-heading--ally"><div><span class="side-kicker ally">我方 · {{ allyTeam.players.length }} 人</span><h2>{{ allyTeam.label }}</h2></div><TeamTagsArea :players="allyTeam.players" :groups="teamPremadeGroups(allyTeam)" /><strong>{{ (allyTeam.summary?.score ?? current.allySummary.score).toFixed(1) }}<small> 队伍评分</small></strong></header>
           <div class="game-player-row" :style="{ '--player-columns': playerColumnCount(allyTeam.players.length) }"><PlayerCard v-for="(player, index) in allyTeam.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :suppress-encounters="isMyPartyMember(player)" data-side="ally" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" :player-notes="playerNotes.notesFor(player.puuid)" :can-edit-notes="playerNotes.canEdit(player.puuid)" @edit-notes="openTagEditor" /></div>
-          <header class="game-team-heading game-team-heading--enemy"><div><span class="side-kicker enemy">敌方 · {{ enemyTeam.players.length }} 人</span><h2>{{ enemyTeam.label }}</h2></div><strong>{{ (enemyTeam.summary?.score ?? current.enemySummary.score).toFixed(1) }}<small> 队伍评分</small></strong></header>
+          <header class="game-team-heading game-team-heading--enemy"><div><span class="side-kicker enemy">敌方 · {{ enemyTeam.players.length }} 人</span><h2>{{ enemyTeam.label }}</h2></div><TeamTagsArea :players="enemyTeam.players" :groups="teamPremadeGroups(enemyTeam)" /><strong>{{ (enemyTeam.summary?.score ?? current.enemySummary.score).toFixed(1) }}<small> 队伍评分</small></strong></header>
           <div class="game-player-row" :style="{ '--player-columns': playerColumnCount(enemyTeam.players.length) }"><PlayerCard v-for="(player, index) in enemyTeam.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" data-side="enemy" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" :player-notes="playerNotes.notesFor(player.puuid)" :can-edit-notes="playerNotes.canEdit(player.puuid)" @edit-notes="openTagEditor" /></div>
         </div>
         <div v-else class="game-teams game-teams--generic">
           <section v-for="team in teams" :key="team.id" class="game-team-group" :data-side="team.side">
-            <header class="game-team-heading"><div><span class="side-kicker" :class="team.side">{{ team.side === 'enemy' ? '敌方' : '我方' }} · {{ team.players.length }} 人</span><h2>{{ team.label }}</h2></div><strong v-if="team.summary">{{ team.summary.score.toFixed(1) }}<small> 队伍评分</small></strong></header>
+            <header class="game-team-heading"><div><span class="side-kicker" :class="team.side">{{ team.side === 'enemy' ? '敌方' : '我方' }} · {{ team.players.length }} 人</span><h2>{{ team.label }}</h2></div><TeamTagsArea :players="team.players" :groups="teamPremadeGroups(team)" /><strong v-if="team.summary">{{ team.summary.score.toFixed(1) }}<small> 队伍评分</small></strong></header>
             <div class="game-player-row" :class="{ 'game-player-row--sparse': team.players.length < 5 }" :style="{ '--player-columns': playerColumnCount(team.players.length) }"><PlayerCard v-for="(player, index) in team.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :suppress-encounters="team.side === 'ally' && isMyPartyMember(player)" :data-side="team.side" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" :player-notes="playerNotes.notesFor(player.puuid)" :can-edit-notes="playerNotes.canEdit(player.puuid)" @edit-notes="openTagEditor" /></div>
           </section>
         </div>

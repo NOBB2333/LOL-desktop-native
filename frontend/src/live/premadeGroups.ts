@@ -1,6 +1,10 @@
 import type { PlayerProfile } from "../types/domain";
 
-export const PREMADE_TONE_COUNT = 8;
+/**
+ * 与 `tags/tones.ts` 的 `PREMADE_GROUP_COLORS`（A~L，共 12 组）保持同长：
+ * 分组序号超出调色板就会绕回 A 的颜色，之前是 8 组，第 9 组起会撞色。
+ */
+export const PREMADE_TONE_COUNT = 12;
 export const PREMADE_INFERENCE_MATCH_THRESHOLD = 5;
 
 function normalizedName(value: string) {

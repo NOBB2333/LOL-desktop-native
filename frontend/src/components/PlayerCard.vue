@@ -3,6 +3,7 @@ import { Link2, MapPinned } from "@lucide/vue";
 import type { EncounterRecord, PlayerProfile, RankQueueSummary } from "../types/domain";
 import AssetIcon from "./AssetIcon.vue";
 import PlayerTagArea from "../tags/components/PlayerTagArea.vue";
+import { premadeGroupLabel } from "../tags/tones";
 import { championImage, rankName, roleName, shortDate, shortDay } from "../utils/format";
 
 type RecentColumns = 1 | 2;
@@ -122,7 +123,11 @@ const premadeClass = () => {
     ? "bp-player-card--premade bp-player-card--premade-unresolved"
     : `bp-player-card--premade bp-player-card--premade-${props.premadeTone}`;
 };
-const premadeLabel = () => (props.premadeTone === undefined ? "组队" : `开黑 ${props.premadeTone + 1}`);
+const premadeLabel = () => {
+  // 与标签区共用 AK 的字母分组（`小队 A`~`小队 L`），避免头部显示序号、标签显示字母。
+  const team = premadeGroupLabel(props.premadeTone);
+  return team === null ? "组队" : `小队 ${team}`;
+};
 function selectFromKeyboard(event: KeyboardEvent) {
   if (event.target !== event.currentTarget) return;
   emit("select", props.player);

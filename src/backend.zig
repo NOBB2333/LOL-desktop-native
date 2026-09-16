@@ -2541,17 +2541,19 @@ fn appendAliasCandidates(
 ///
 /// ## 平台现实（决定了这个命令能做什么、不能做什么）
 ///
-/// 本机只有两个查询入口，**都要求完整的 `名字#TAG`**：
-/// - LCU `lol-summoner/v1/summoners?name=`：只覆盖**当前大区**；
-/// - Riot Client `player-account/aliases/v1/lookup?gameName=&tagLine=`：跨区通用，
-///   但同样要 gameName **和** tagLine 两个字段（见 `rank-analysis` 的
+/// 本机有两个查询入口，覆盖面不同：
+/// - LCU `lol-summoner/v1/summoners?name=`：**只覆盖当前登录大区**，且只回一个人；
+///   裸名和完整 `名字#TAG` 它都收。
+/// - Riot Client `player-account/aliases/v1/lookup?gameName=&tagLine=`：**全局**，
+///   但必须同时给 gameName **和** tagLine 两个字段（见 `rank-analysis` 的
 ///   `resolve_puuid_by_riot_id`，注释里明确写了「全区查询必须带 TAG」）。
 ///
-/// 所以「只给一个名字、把某个名字的所有 TAG 枚举出来」在本地 API 上做不到——没有任何
-/// 接口提供 name→tags 的反向索引。这个命令能提供的是：
-/// - 带 `#TAG` 时走 RC 跨区解析，**不再局限于当前大区**；
+/// 所以「只给一个名字、把某个名字在所有大区的所有 TAG 枚举出来」在本地 API 上做不到
+/// ——没有任何接口提供 name→tags 的反向索引（WeGame 那种同名全服搜索是服务端聚合，
+/// 本机拿不到）。这个命令能提供的是：
+/// - 带 `#TAG` 时走 RC 全局解析，**不受当前大区限制**；
 /// - 只给名字时退化成一次 LCU 裸名查询（少数版本能解析唯一名字），失败就回空候选并
-///   置 `requiresTag`，由前端提示「需要完整 Riot ID」并列出可选大区。
+///   置 `requiresTag`，由前端提示「需要完整 Riot ID」。
 fn searchSummoner(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
     const request_json = parsePayload(struct { query: []const u8 = "" }, invocation.request.payload) catch return error.InvalidRequest;
@@ -4312,6 +4314,19 @@ fn runtimeRankedOnly(self: *Runtime) bool {
     return jsonBool(nestedObject(config, "providers") orelse .null, "rankedOnly");
 }
 
+/// 「好抓 / 难抓」标签的开关（前端 `playerTags.showEasyGankTag`，默认开）。
+/// 关掉时整段跳过 `enrichRecentGankMetrics`，不做没必要的网络请求。
+fn runtimeEasyGankEnabled(self: *Runtime) bool {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const config = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.config[0..self.config_len], .{}) catch return true;
+    const tags = nestedObject(config, "playerTags") orelse return true;
+    // 字段缺失时按前端默认值（开）处理，避免老配置把标签悄悄关掉。
+    if (tags != .object) return true;
+    if (tags.object.get("showEasyGankTag") == null) return true;
+    return jsonBool(tags, "showEasyGankTag");
+}
+
 fn isRankedHistoryGame(game: std.json.Value) bool {
     const queue = jsonInt(game, "queueId");
     return queue == 420 or queue == 440;
@@ -5473,10 +5488,15 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
 
     var gank_metrics_owned: ?[]u8 = null;
     defer if (gank_metrics_owned) |value| std.heap.page_allocator.free(value);
-    if (enrich and !is_bot and puuid.len > 0 and recent_count > 0 and !isJunglePosition(position)) {
+    // 「好抓 / 难抓」标签吃 `earlyDeathsWithEnemyJungler`，而这个字段只有
+    // DETAILS / timeline 里才有，必须先联网取一次。这里放开网络以对齐 LeagueAkari
+    // 的显示效果；成本有上界（每位玩家最多看 5 场候选、凑够 3 场就停，见
+    // `enrichRecentGankMetrics`），且命中过的 `gankMetric` / `jungleDetails`
+    // 都会落盘缓存，同一局只付一次。标签被关掉时整段跳过，不做无谓请求。
+    if (enrich and runtimeEasyGankEnabled(self) and !is_bot and puuid.len > 0 and recent_count > 0 and !isJunglePosition(position)) {
         gank_metrics_owned = std.heap.page_allocator.alloc(u8, 256 * 1024) catch null;
         if (gank_metrics_owned) |buffer| {
-            if (enrichRecentGankMetrics(self, client, sgp_context, recent_json, puuid, buffer, false) catch null) |enriched| {
+            if (enrichRecentGankMetrics(self, client, sgp_context, recent_json, puuid, buffer, true) catch null) |enriched| {
                 recent_json = enriched;
             }
         }

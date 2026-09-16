@@ -21,7 +21,7 @@ export const SUSPICIOUS_FLASH_POSITION_TAG: PlayerTagDefinition = {
     if (!flashOnD || !flashOnF) return null;
 
     return {
-      label: chip("闪现位置可疑", { tone: "flash" }),
+      label: chip("闪现异位", { tone: "flash" }),
       popover: {
         content: () => h(PlayerTagFlashPositionPopover, { flashOnD, flashOnF }),
       },

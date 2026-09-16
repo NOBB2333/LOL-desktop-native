@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ChevronRight, Filter, List, MapPinned, RefreshCw, Search, Trophy } from "@lucide/vue";
+import { ChevronRight, Filter, List, RefreshCw, Search, Trophy } from "@lucide/vue";
 import { NButton, NInput, NSelect, useMessage } from "naive-ui";
 import { computed, ref, watch } from "vue";
 import { useQuery } from "@tanstack/vue-query";
@@ -11,7 +11,7 @@ import PageHeader from "../components/PageHeader.vue";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { MatchSummary, SummonerSearchCandidate, SummonerSearchResult } from "../types/domain";
-import { championImage, platformRegionName, platformRegionOverview, roleName, shortDate } from "../utils/format";
+import { championImage, roleName, shortDate } from "../utils/format";
 import { visibleMatches } from "../matches/filters";
 import { matchHistoryQueryKey } from "../matches/query";
 import { useMatchDetail } from "../composables/useMatchDetail";
@@ -146,8 +146,24 @@ function pickCandidate(candidate: SummonerSearchCandidate) {
   void applySummoner(riotIdOf(candidate));
 }
 
-/** 当前登录大区，用于在大区参考里高亮。 */
-const regionOverview = computed(() => platformRegionOverview(app.connection.platformId || app.connection.region));
+/**
+ * 同一个「名字#标签」命中多个账号时，光看名字分不出候选，补个序号。
+ *
+ * 国服一个 `名字#标签` 正常只对应一个账号（puuid 全局唯一），所以这个集合在正常
+ * 情况下是空的；一旦接口真的回了多条同名同标签的结果，界面必须能把它们区分开，
+ * 否则用户面对的是两个长得一模一样的按钮。
+ */
+const duplicatedCandidateNames = computed(() => {
+  const counts = new Map<string, number>();
+  for (const candidate of searchResult.value?.candidates ?? []) {
+    const key = riotIdOf(candidate).toLowerCase();
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return new Set([...counts].filter(([, count]) => count > 1).map(([key]) => key));
+});
+
+const isDuplicatedCandidate = (candidate: SummonerSearchCandidate) => duplicatedCandidateNames.value.has(riotIdOf(candidate).toLowerCase());
+
 async function refresh() { await matches.refetch(); message.success("已请求最新战绩"); }
 async function goPage(next: number) { if (next < 0 || (next > page.value && !hasNextPage.value)) return; page.value = next; selectedId.value = null; detailOpen.value = true; await matches.refetch(); }
 
@@ -173,38 +189,27 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
       <!-- 候选：名字重复时列出所有精确命中，点一下即查询。 -->
       <div v-if="searchResult && searchResult.candidates.length" class="matches-candidates">
         <span class="matches-candidates__label">精确匹配 {{ searchResult.candidates.length }} 个账号</span>
-        <button v-for="candidate in searchResult.candidates" :key="candidate.puuid" type="button" class="matches-candidate" @click="pickCandidate(candidate)">
+        <button v-for="(candidate, index) in searchResult.candidates" :key="candidate.puuid" type="button" class="matches-candidate" @click="pickCandidate(candidate)">
           <strong>{{ candidate.gameName }}</strong>
           <small v-if="candidate.tagLine">#{{ candidate.tagLine }}</small>
           <em v-if="candidate.puuid === app.connection.puuid">当前账号</em>
+          <em v-else-if="isDuplicatedCandidate(candidate)" class="matches-candidate__ordinal">候选 {{ index + 1 }}</em>
         </button>
       </div>
+      <p v-if="duplicatedCandidateNames.size" class="matches-query-note">
+        有 {{ duplicatedCandidateNames.size }} 组同名同标签的结果：名称无法区分它们，请逐个点选确认哪一个是你要找的人。
+      </p>
 
-      <!-- 解释「为什么只给名字查不到」：客户端没有 name→tags 的反向索引。 -->
+      <!--
+        只说「为什么只给名字查不到」：本地客户端没有 name→tags 的反向索引。
+        这里**不再列大区清单**——大区根本不需要选，列出编号只会让人以为要选。
+      -->
       <p v-if="searchResult?.requiresTag" class="matches-query-note" data-tone="warning">
-        客户端只提供精确匹配，没有「按名字列出所有标签」的接口：只给名字时最多在
-        {{ regionOverview.current ? `${regionOverview.current.id} · ${regionOverview.current.name}` : "当前大区" }}
-        解析一个结果。请补全为 <b>名字#标签</b>——补全后即使是别的大区也能查到。
+        本地客户端只有精确匹配，没有「按名字列出所有标签」的接口：只给名字时只会去当前大区里找，
+        而且只回一个人。同名的人散在不同大区时，光凭名字没法把他们列出来。请补全为
+        <b>名字#标签</b>后再查。
       </p>
       <p v-else-if="searchError" class="matches-query-note" data-tone="warning">{{ searchError }}</p>
-
-      <!-- 可选大区：本地 API 只能读当前登录大区，这里是可查询的大区清单与编号。 -->
-      <div class="matches-regions">
-        <div class="matches-regions__head">
-          <MapPinned :size="13" />
-          <span>可选大区</span>
-          <small>当前登录：{{ regionOverview.current ? `${regionOverview.current.id} · ${regionOverview.current.name}` : platformRegionName(app.connection.platformId || app.connection.region) }}</small>
-        </div>
-        <div class="matches-regions__groups">
-          <div v-for="group in regionOverview.groups" :key="group.label" class="matches-regions__group">
-            <span class="matches-regions__group-label">{{ group.label }}</span>
-            <p v-for="region in group.regions" :key="region.id" :data-current="region.id === regionOverview.current?.id" :title="region.servers">
-              <strong>{{ region.id }}</strong><span>{{ region.name }}</span>
-            </p>
-          </div>
-        </div>
-        <p class="matches-regions__note">大区由客户端登录状态决定，切换大区需要在客户端重新登录；跨区查战绩只需在查询框里带上完整的「名字#标签」。</p>
-      </div>
 
       <div class="matches-filter-row">
         <div class="matches-filter-title"><Filter :size="14" /><span>当前页筛选</span></div>
@@ -248,9 +253,8 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
 .matches-page--workspace { width: 100%; max-width: none; }
 .matches-page-actions { display: flex; align-items: center; gap: 5px; }
 .matches-query-panel { display: grid; gap: 11px; margin-bottom: 14px; padding: 14px 16px; border: 1px solid var(--line); background: var(--surface); }.matches-query-form { display: grid; grid-template-columns: minmax(280px, 1fr) auto; align-items: end; gap: 10px 14px; }.matches-query-field { display: grid; gap: 5px; min-width: 0; }.matches-query-field > span { color: var(--text-primary); font-size: 11px; font-weight: 700; }.matches-query-field .n-input { width: min(100%, 620px); }.matches-query-submit { justify-self: end; min-width: 116px; }.matches-query-form > p { grid-column: 1 / -1; margin: 0; color: var(--text-secondary); font-size: 9px; }.matches-filter-row { display: grid; grid-template-columns: auto minmax(190px, 1fr) 120px 150px auto; align-items: center; gap: 7px; padding-top: 10px; border-top: 1px solid var(--line); }.matches-filter-title { display: inline-flex; align-items: center; gap: 5px; color: var(--text-muted); font-size: 9px; }.matches-filter-count { justify-self: end; color: var(--text-secondary); font-size: 9px; font-variant-numeric: tabular-nums; }
-.matches-candidates { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding-top: 10px; border-top: 1px solid var(--line); }.matches-candidates__label { color: var(--text-muted); font-size: 9px; }.matches-candidate { display: inline-flex; align-items: center; gap: 3px; padding: 4px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--text-primary); background: var(--surface-raised); cursor: pointer; font-size: 11px; transition: border-color 140ms ease, background 140ms ease; }.matches-candidate:hover { border-color: var(--accent); background: var(--accent-soft); }.matches-candidate strong { font-weight: 700; }.matches-candidate small { color: var(--text-secondary); font-size: 10px; }.matches-candidate em { padding: 1px 5px; border-radius: 3px; color: var(--accent); background: var(--accent-soft); font-size: 8px; font-style: normal; font-weight: 700; }
+.matches-candidates { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding-top: 10px; border-top: 1px solid var(--line); }.matches-candidates__label { color: var(--text-muted); font-size: 9px; }.matches-candidate { display: inline-flex; align-items: center; gap: 3px; padding: 4px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--text-primary); background: var(--surface-raised); cursor: pointer; font-size: 11px; transition: border-color 140ms ease, background 140ms ease; }.matches-candidate:hover { border-color: var(--accent); background: var(--accent-soft); }.matches-candidate strong { font-weight: 700; }.matches-candidate small { color: var(--text-secondary); font-size: 10px; }.matches-candidate em { padding: 1px 5px; border-radius: 3px; color: var(--accent); background: var(--accent-soft); font-size: 8px; font-style: normal; font-weight: 700; }.matches-candidate em.matches-candidate__ordinal { color: var(--text-secondary); background: var(--surface-muted); }
 .matches-query-note { margin: 0; padding: 8px 10px; border: 1px dashed var(--line-strong); border-left: 3px solid var(--amber); color: var(--text-secondary); background: var(--surface-raised); font-size: 10px; line-height: 1.5; }.matches-query-note b { color: var(--text-primary); }
-.matches-regions { display: grid; gap: 7px; padding-top: 10px; border-top: 1px solid var(--line); }.matches-regions__head { display: flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 9px; }.matches-regions__head > span { color: var(--text-secondary); font-weight: 700; }.matches-regions__head > small { color: var(--text-muted); }.matches-regions__groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 6px 14px; }.matches-regions__group { display: grid; grid-template-columns: 58px minmax(0, 1fr); align-items: center; gap: 6px; min-width: 0; }.matches-regions__group-label { color: var(--text-muted); font-size: 9px; font-weight: 700; }.matches-regions__group p { display: inline-flex; align-items: baseline; gap: 5px; margin: 0 6px 0 0; padding: 2px 7px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface-raised); font-size: 10px; }.matches-regions__group p[data-current="true"] { border-color: var(--accent); background: var(--accent-soft); }.matches-regions__group p strong { color: var(--text-primary); font-variant-numeric: tabular-nums; }.matches-regions__group p span { color: var(--text-secondary); font-size: 9px; }.matches-regions__note { margin: 0; color: var(--text-muted); font-size: 9px; line-height: 1.5; }
 .matches-summary { display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)) minmax(230px, 1.4fr); gap: 1px; margin-bottom: 14px; border: 1px solid var(--line); background: var(--line); }.matches-summary > div { min-height: 70px; padding: 12px 15px; background: var(--surface); }.matches-summary span, .matches-summary strong { display: block; }.matches-summary span { color: var(--text-secondary); font-size: 10px; }.matches-summary strong { margin-top: 9px; font-size: 20px; font-variant-numeric: tabular-nums; }.matches-summary small { color: var(--text-secondary); font-size: 11px; font-weight: 500; }.matches-summary__result { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 11px; }.matches-summary__result span { display: inline; }
 .match-table-shell { border: 1px solid var(--line); background: var(--surface); }.match-table-heading { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; padding: 13px 15px 10px; border-bottom: 1px solid var(--line); }.match-table-heading h2 { margin: 4px 0 0; font-size: 16px; }.match-table-heading__hint { color: var(--text-muted); font-size: 9px; }.match-list--full { padding: 8px; overflow-x: auto; }
 .matches-workspace { display: grid; grid-template-columns: minmax(184px, .16fr) minmax(0, 1fr); gap: 8px; min-width: 0; align-items: stretch; }.matches-index, .matches-detail-panel { min-width: 0; border: 1px solid var(--line); background: var(--surface); }.matches-index { display: flex; flex-direction: column; overflow: hidden; }.matches-index__header { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; padding: 11px 12px 9px; border-bottom: 1px solid var(--line); }.matches-index__header h2 { margin: 3px 0 0; font-size: 14px; }.matches-index__header > span { color: var(--text-secondary); font-size: 8px; font-variant-numeric: tabular-nums; }.matches-index__list { display: grid; align-content: start; flex: 1; gap: 4px; padding: 5px; overflow: auto; }

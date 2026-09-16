@@ -17,7 +17,7 @@ const dWidth = computed(() => (total.value === 0 ? 0 : (props.flashOnD / total.v
   <div class="flash-popover">
     <p class="flash-popover__title">闪现位置分布</p>
     <p class="flash-popover__description">
-      该玩家在最近的对局里既把闪现放在 D 位、也放在 F 位。正常玩家通常会固定一个位置。
+      该玩家近期在 D / F 两个位置都放置过闪现，按键习惯不稳定。
     </p>
     <div class="flash-popover__bar">
       <i class="flash-popover__seg flash-popover__seg--d" :style="{ width: `${dWidth}%` }" />
@@ -31,7 +31,7 @@ const dWidth = computed(() => (total.value === 0 ? 0 : (props.flashOnD / total.v
       <span class="flash-popover__dot flash-popover__dot--f" />
       <span>F 位 {{ flashOnF }} 次（{{ rate(flashOnF) }}%）</span>
     </div>
-    <div class="flash-popover__total">合计有闪现的样本 {{ total }} 场</div>
+    <div class="flash-popover__total">基于最近 {{ total }} 场已分析对局统计</div>
   </div>
 </template>
 

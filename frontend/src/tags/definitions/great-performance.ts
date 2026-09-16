@@ -18,7 +18,7 @@ export const GREAT_PERFORMANCE_TAG: PlayerTagDefinition = {
     if (!score.outstanding && !score.extraordinary) return null;
 
     const detail = score.extraordinary
-      ? "该玩家在近期对局中表现极其突出，属于可以主导比赛的水平"
+      ? "该玩家的水平远远超过当前段位"
       : "该玩家在近期对局中表现优异";
 
     return {

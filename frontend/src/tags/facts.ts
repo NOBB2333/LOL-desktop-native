@@ -6,7 +6,11 @@ const SMITE_SPELL_ID = 11;
 /** Flash（闪现）的法术 id。 */
 const FLASH_SPELL_ID = 4;
 
-/** 单杀判定：需要至少 3 场提供精确数据的对局。 */
+/**
+ * 单杀判定的最小样本数：**仅用于快捷消息变量** `{soloKills}`
+ * （见 `signals.ts`）。卡片上的「场均单杀」标签对齐 AK 没有这道门槛，
+ * 只要算出非 0 值就显示。
+ */
 export const SOLO_KILL_MIN_SAMPLE = 3;
 
 /**
@@ -24,7 +28,7 @@ export interface PlayerTagFacts {
   sample: number;
   wins: number;
   winRate: number;
-  /** `analysis.summary.avgKda`：逐局 KDA 的均值；Akari 的 KDA 项吃这个数。 */
+  /** `analysis.summary.avgKda`：**总(击杀+助攻)/总死亡**，不是逐局 KDA 求平均。 */
   averageKda: number;
 
   /** `analysis.summary.avgChampionDamagePercentageOfTeam` */
@@ -200,8 +204,6 @@ export function deriveTagFacts(player: PlayerProfile): PlayerTagFacts {
   if (sample === 0) return emptyFacts(player);
 
   let wins = 0;
-  let soloSum = 0;
-  let soloSample = 0;
   let earlyDeathsSum = 0;
   let earlyDeathsSample = 0;
   let currentChampionGames = 0;
@@ -211,10 +213,6 @@ export function deriveTagFacts(player: PlayerProfile): PlayerTagFacts {
 
   for (const match of matches) {
     if (match.win) wins += 1;
-    if (typeof match.soloKills === "number" && Number.isFinite(match.soloKills) && match.soloKills >= 0) {
-      soloSum += match.soloKills;
-      soloSample += 1;
-    }
     if (
       typeof match.earlyDeathsWithEnemyJungler === "number" &&
       Number.isFinite(match.earlyDeathsWithEnemyJungler) &&
@@ -241,8 +239,29 @@ export function deriveTagFacts(player: PlayerProfile): PlayerTagFacts {
   const csShares = matches
     .map((match) => numberOrNull(match.csShare))
     .filter((value): value is number => value !== null);
+  /**
+   * 单杀样本。
+   *
+   * AK 的 `avgSoloKills` 是 `avgIfAllNonNull`：**任一场缺 `soloKills` 就整体为 null**，
+   * 而不是「只对有值的场次求平均」。数据齐全时两种写法结果相同，
+   * 只有 LCU 部分对局没带 `challenges` 时才会分叉 —— 按 AK 的口径走，保持一致。
+   * `soloKillsSample` 仍按「有值的场次数」统计，供快捷消息变量使用。
+   */
+  const soloKillsValues = matches.map((match) => numberOrNull(match.soloKills));
+  const soloKillsSample = soloKillsValues.filter((value) => value !== null).length;
 
-  const averageKda = avgOrZero(matches.map(kdaOf));
+  /**
+   * 聚合 KDA。
+   *
+   * 必须用**总击杀/总死亡/总助攻**相除（AK `computeAggregatedSummary` 的
+   * `(kills + assists) / noZero(deaths)`），**不是**「逐局 KDA 求平均」：
+   * 两种算法在同一份样本上会给出不同的数，而 Akari 评分的 KDA 项直接吃这个值，
+   * 用错算法会让总分与 AK 对不上。
+   */
+  const totalKills = matches.reduce((sum, match) => sum + match.kills, 0);
+  const totalDeaths = matches.reduce((sum, match) => sum + match.deaths, 0);
+  const totalAssists = matches.reduce((sum, match) => sum + match.assists, 0);
+  const averageKda = (totalKills + totalAssists) / Math.max(1, totalDeaths);
   const winRate = wins / sample;
 
   return {
@@ -268,8 +287,8 @@ export function deriveTagFacts(player: PlayerProfile): PlayerTagFacts {
     ),
     avgVisionScore: avgOrZero(matches.map(visionScoreValue)),
     avgEnemyMissingPings: avgIfAllNonNull(matches.map((match) => numberOrNull(match.enemyMissingPings))),
-    averageSoloKills: optionalAverage(soloSum, soloSample),
-    soloKillsSample: soloSample,
+    averageSoloKills: avgIfAllNonNull(soloKillsValues),
+    soloKillsSample,
     averageEarlyDeathsWithJungler: optionalAverage(earlyDeathsSum, earlyDeathsSample),
     earlyDeathsSample,
     winningStreak: streakOf(matches, true),

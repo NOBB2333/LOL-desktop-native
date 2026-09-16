@@ -66,7 +66,10 @@ export type TagTone =
   | "info"
   | "neutral";
 
-/** 开黑分组配色（对齐 LeagueAkari 的 A~L 分组色板，此处收敛为 8 组循环）。 */
+/**
+ * 开黑分组配色（浅色模式）：LeagueAkari `PREMADE_TEAM_COLORS_LIGHT` 的 A~L 十二组，
+ * 一组不漏（此前只抄了 8 组，第 9 组起会绕回 A 的颜色）。
+ */
 export const PREMADE_GROUP_COLORS: { bg: string; fg: string }[] = [
   { bg: "#0f6f68", fg: "#ffffff" }, // A
   { bg: "#1f3fa6", fg: "#ffffff" }, // B
@@ -76,11 +79,46 @@ export const PREMADE_GROUP_COLORS: { bg: string; fg: string }[] = [
   { bg: "#8a2a00", fg: "#ffffff" }, // F
   { bg: "#6a0d6a", fg: "#ffffff" }, // G
   { bg: "#a2133f", fg: "#ffffff" }, // H
+  { bg: "#0b3d91", fg: "#ffffff" }, // I
+  { bg: "#7f0000", fg: "#ffffff" }, // J
+  { bg: "#5a2a0b", fg: "#ffffff" }, // K
+  { bg: "#333333", fg: "#ffffff" }, // L
 ];
 
-export function premadeGroupColor(tone: number | undefined): { bg: string; fg: string } | null {
+/** 深色模式：LeagueAkari `PREMADE_TEAM_COLORS`，同序同长度。 */
+export const PREMADE_GROUP_COLORS_DARK: { bg: string; fg: string }[] = [
+  { bg: "#48e5db", fg: "#000000" }, // A
+  { bg: "#628aff", fg: "#000000" }, // B
+  { bg: "#d4de17", fg: "#000000" }, // C
+  { bg: "#2eda3e", fg: "#000000" }, // D
+  { bg: "#ff9f1c", fg: "#000000" }, // E
+  { bg: "#da4e2e", fg: "#ffffff" }, // F
+  { bg: "#bc2ebc", fg: "#ffffff" }, // G
+  { bg: "#fa4e80", fg: "#000000" }, // H
+  { bg: "#0b3d91", fg: "#ffffff" }, // I
+  { bg: "#7f0000", fg: "#ffffff" }, // J
+  { bg: "#8b4513", fg: "#ffffff" }, // K
+  { bg: "#555555", fg: "#ffffff" }, // L
+];
+
+export function premadeGroupColor(
+  tone: number | undefined,
+  dark = false,
+): { bg: string; fg: string } | null {
   if (tone === undefined || tone < 0) return null;
-  return PREMADE_GROUP_COLORS[tone % PREMADE_GROUP_COLORS.length];
+  const palette = dark ? PREMADE_GROUP_COLORS_DARK : PREMADE_GROUP_COLORS;
+  return palette[tone % palette.length];
+}
+
+/**
+ * 分组序号 → 分组字母。
+ *
+ * AK 的预组队标签与弹层都用字母（`小队 {{team}}`，team 取 `A`~`L`），
+ * 因此内部用序号的分组在展示前必须先换算成字母，否则会出现「小队 1」这种文案。
+ */
+export function premadeGroupLabel(tone: number | undefined): string | null {
+  if (tone === undefined || tone < 0) return null;
+  return String.fromCharCode("A".charCodeAt(0) + (tone % PREMADE_GROUP_COLORS.length));
 }
 
 /** `easy-gank` 三档色值，与 LeagueAkari 的 `EASY_GANK_TAG_CLASSES` 一一对应。 */

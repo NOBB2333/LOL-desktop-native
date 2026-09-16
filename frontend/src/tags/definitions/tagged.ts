@@ -11,17 +11,28 @@ import type { PlayerTagDefinition } from "../types";
 export const TAGGED_TAG: PlayerTagDefinition = {
   id: "tagged",
   render: (ctx) => {
-    if (!ctx.settings.showTaggedTag || !ctx.canEditNotes) return null;
+    if (!ctx.settings.showTaggedTag) return null;
+    // AK：自己身上不标「已标记」。
+    if (ctx.selfPuuid && ctx.player.puuid === ctx.selfPuuid) return null;
     const notes = ctx.playerNotes.filter((note) => note.trim().length > 0);
     if (notes.length === 0) return null;
-    if (!ctx.onEditNotes) return null;
+
+    /**
+     * 能编辑时是可点击 chip、点击进入编辑；不能编辑时退化成静态 chip。
+     *
+     * 对齐 AK：不可编辑的场景（独立窗口等）同样是**照常显示**「已标记」，
+     * 只是不能点。此前本项目在不可编辑时直接不渲染，会把 AK 有的标签吃掉。
+     */
+    const editable = ctx.canEditNotes && Boolean(ctx.onEditNotes);
 
     return {
-      label: clickable(
-        chip("已标记", { tone: "note", interactive: true }),
-        () => ctx.onEditNotes?.(),
-        `编辑 ${ctx.player.gameName} 的玩家标记`,
-      ),
+      label: editable
+        ? clickable(
+            chip("已标记", { tone: "note", interactive: true }),
+            () => ctx.onEditNotes?.(),
+            `编辑 ${ctx.player.gameName} 的玩家标记`,
+          )
+        : chip("已标记", { tone: "note" }),
       popover: {
         content: () => h(NotesPopover, { notes }),
         keepAliveOnHover: true,

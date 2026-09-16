@@ -211,20 +211,28 @@ describe("身份类标签", () => {
     expect(renderText("self", context({ player: player({ puuid: SELF.puuid }), selfPuuid: null }))).toBeNull();
   });
 
-  it("premade-team 在已知分组时带组号，未知分组时退化为「开黑」", () => {
-    expect(renderText("premade-team", context({ premadeTone: 1 }))).toBe("开黑 2");
-    expect(renderText("premade-team", context({ player: player({ isPremade: true }) }))).toBe("开黑");
+  it("premade-team 用字母标注分组（AK 的「小队 A」写法），没有分组就不渲染", () => {
+    expect(renderText("premade-team", context({ premadeTone: 1 }))).toBe("小队 B");
+    expect(renderText("premade-team", context({ premadeTone: 0 }))).toBe("小队 A");
+    expect(renderText("premade-team", context({ premadeTone: 11 }))).toBe("小队 L");
+    // AK 的 premade 只在拿到分组 id 时渲染；仅 isPremade 不足以成标签。
+    expect(renderText("premade-team", context({ player: player({ isPremade: true }) }))).toBeNull();
     expect(renderText("premade-team", context())).toBeNull();
   });
 
-  it("tagged 只有存在备注且允许编辑时才渲染", () => {
+  it("tagged 有备注就渲染；不可编辑时退化为静态 chip（对齐 AK）", () => {
     expect(renderText("tagged", context({ playerNotes: ["   "], canEditNotes: true }))).toBeNull();
-    expect(renderText("tagged", context({ playerNotes: ["爱打野"], canEditNotes: false }))).toBeNull();
+    // 不可编辑也要照常显示（AK 在不可编辑场景同样给「已标记」，只是不能点）。
+    expect(renderText("tagged", context({ playerNotes: ["爱打野"], canEditNotes: false }))).toBe("已标记");
     expect(renderText("tagged", context({ playerNotes: ["爱打野"], canEditNotes: true }))).toBe("已标记");
+    // 自己身上不标「已标记」。
+    expect(
+      renderText("tagged", context({ player: player({ puuid: SELF.puuid }), selfPuuid: SELF.puuid, playerNotes: ["备注"] })),
+    ).toBeNull();
   });
 
   it("privacy 只在客户端把战绩设为私密时出现", () => {
-    expect(renderText("privacy", context({ player: player({ privacy: "PRIVATE" }) }))).toBe("战绩隐藏");
+    expect(renderText("privacy", context({ player: player({ privacy: "PRIVATE" }) }))).toBe("生涯隐藏");
     expect(renderText("privacy", context({ player: player({ privacy: "PUBLIC" }) }))).toBeNull();
     expect(renderText("privacy", context({ player: player({ privacy: null }) }))).toBeNull();
   });
@@ -310,8 +318,8 @@ describe("状态类标签", () => {
     expect(renderText("great-performance", extraordinary)).toBe("通天代");
     expect(renderText("great-performance", context())).toBeNull();
 
-    // akari-score 默认关闭，打开后直接给数值。
-    expect(renderText("akari-score", { ...outstanding, settings: withAverageTags() })).toBe("Akari 6.8");
+    // akari-score 默认关闭，打开后直接给数值；AK 的标签保留 2 位小数。
+    expect(renderText("akari-score", { ...outstanding, settings: withAverageTags() })).toBe("Akari 6.80");
     expect(renderText("akari-score", outstanding)).toBeNull();
     expect(
       renderText("akari-score", { ...outstanding, settings: withAverageTags(), facts: facts({ sample: 0 }) }),
@@ -335,11 +343,14 @@ describe("打野与场均指标标签", () => {
     expect(renderText("easy-gank", context({ facts: facts({ averageEarlyDeathsWithJungler: 2.5, isJungler: true }) }))).toBeNull();
   });
 
-  it("solo-kills 需要精确样本，chip 直接给出场均次数", () => {
-    const ctx = (average: number, sample: number) => context({ facts: facts({ averageSoloKills: average, soloKillsSample: sample }) });
+  it("solo-kills 只要算出非 0 值就渲染，没有额外最小场次门槛（对齐 AK）", () => {
+    const ctx = (average: number | null, sample: number) =>
+      context({ facts: facts({ averageSoloKills: average, soloKillsSample: sample }) });
     expect(renderText("solo-kills", ctx(0.9, 5))).toBe("0.9 单杀");
     expect(renderText("solo-kills", ctx(0, 5))).toBeNull();
-    expect(renderText("solo-kills", ctx(0.9, 2))).toBeNull();
+    // AK 的 `!avgSoloKills` 只排除 0；样本少不构成隐藏理由。
+    expect(renderText("solo-kills", ctx(0.9, 2))).toBe("0.9 单杀");
+    expect(renderText("solo-kills", ctx(null, 0))).toBeNull();
   });
 
   it("场均指标只报数值，不做「偏高 / 偏低」判断", () => {
@@ -357,27 +368,30 @@ describe("打野与场均指标标签", () => {
 
     expect(renderText("average-team-damage-taken", context({ settings, facts: facts({ avgDamageTakenPercentageOfTeam: 0.31 }) }))).toBe("承伤 31%");
     expect(renderText("average-team-gold", context({ settings, facts: facts({ avgGoldPercentageOfTeam: 0.26 }) }))).toBe("经济 26%");
-    expect(renderText("average-cs-per-minute", context({ settings, facts: facts({ avgCsPerMinute: 8 }) }))).toBe("分均补刀 8.0");
-    expect(renderText("average-damage-gold-efficiency", context({ settings, facts: facts({ avgDamageGoldEfficiency: 1.25 }) }))).toBe("伤害经济 125%");
+    // AK 的 csPerMinute 文案是「{{value}} 补兵 / 分」。
+    expect(renderText("average-cs-per-minute", context({ settings, facts: facts({ avgCsPerMinute: 8 }) }))).toBe("8.0 补兵 / 分");
+    // AK 叫「伤转率」。
+    expect(renderText("average-damage-gold-efficiency", context({ settings, facts: facts({ avgDamageGoldEfficiency: 1.25 }) }))).toBe("伤转率 125%");
   });
 
-  it("缺少十人数据时队伍占比类标签不渲染（而不是显示 0）", () => {
+  it("缺少十人数据时占比按 0 参与（对齐 AK 的 avgOrZero）", () => {
     const settings = withAverageTags();
-    expect(renderText("average-team-damage-taken", context({ settings, facts: facts({ avgDamageTakenPercentageOfTeam: null }) }))).toBeNull();
-    expect(renderText("average-team-gold", context({ settings, facts: facts({ avgGoldPercentageOfTeam: null }) }))).toBeNull();
+    expect(renderText("average-team-damage-taken", context({ settings, facts: facts({ avgDamageTakenPercentageOfTeam: null }) }))).toBe("承伤 0%");
+    expect(renderText("average-team-gold", context({ settings, facts: facts({ avgGoldPercentageOfTeam: null }) }))).toBe("经济 0%");
+    // 消失信号是唯一「缺数据就整条不渲染」的场均指标（AK 同为 avgIfAllNonNull + null 判断）。
     expect(renderText("average-enemy-missing-pings", context({ settings, facts: facts({ avgEnemyMissingPings: null }) }))).toBeNull();
   });
 
   it("敌方消失信号有数据时才显示", () => {
     const settings = withAverageTags();
-    expect(renderText("average-enemy-missing-pings", context({ settings, facts: facts({ avgEnemyMissingPings: 1.25 }) }))).toBe("消失信号 1.3");
+    expect(renderText("average-enemy-missing-pings", context({ settings, facts: facts({ avgEnemyMissingPings: 1.25 }) }))).toBe("问号 1.3 次");
   });
 
-  it("击杀伤害转化按 0.65 / 1.35 分档", () => {
+  it("击杀伤害转化按 0.65 / 1.35 分档，文案为 AK 的「K 头 / 打工」", () => {
     const kde = (value: number) =>
       renderText("average-kill-damage-efficiency", context({ facts: facts({ avgKillDamageEfficiency: value }) }));
-    expect(kde(1.6)).toBe("击杀伤害转化高");
-    expect(kde(0.4)).toBe("击杀伤害转化低");
+    expect(kde(1.6)).toBe("K 头");
+    expect(kde(0.4)).toBe("打工");
     expect(kde(1)).toBeNull();
     // 等于阈值时算 normal，与 AK 的 `>` / `<` 严格比较一致。
     expect(kde(1.35)).toBeNull();
@@ -387,7 +401,7 @@ describe("打野与场均指标标签", () => {
   it("可疑闪现位置要求 D / F 两边都放过闪现", () => {
     const flash = (onD: number, onF: number) =>
       renderText("suspicious-flash-position", context({ facts: facts({ flashOnD: onD, flashOnF: onF }) }));
-    expect(flash(3, 2)).toBe("闪现位置可疑");
+    expect(flash(3, 2)).toBe("闪现异位");
     expect(flash(5, 0)).toBeNull();
     expect(flash(0, 5)).toBeNull();
   });
