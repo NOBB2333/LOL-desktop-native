@@ -11,11 +11,11 @@ describe("config migration", () => {
 
     expect(migrateAppConfig(config)).toBe(true);
     expect(config.version).toBe(CURRENT_CONFIG_VERSION);
-    expect(config.automation.shortcuts.find((shortcut) => shortcut.id === "jungle-preference")).toMatchObject({ target: "jungle", key: "Ctrl+F10" });
+    expect(config.automation.shortcuts.find((shortcut) => shortcut.id === "jungle-preference")).toMatchObject({ target: "jungle", key: "Ctrl+F7" });
     expect(config.automation.shortcuts.find((shortcut) => shortcut.id === "mine")?.template).toBe("hello");
     expect(config.automation.shortcuts.find((shortcut) => shortcut.id === "enemy")?.template).toBe(defaultAssessmentTemplate);
     expect(config.automation.shortcuts.find((shortcut) => shortcut.id === "ally")?.template).toBe(defaultAssessmentTemplate);
-    expect(config.automation.shortcutSendIntervalMs).toBe(250);
+    expect(config.automation.shortcutSendIntervalMs).toBe(65);
     expect(migrateAppConfig(config)).toBe(false);
   });
 
@@ -61,5 +61,36 @@ describe("config migration", () => {
     customized.automation.shortcuts.find((item) => item.id === "open-game")!.key = "Ctrl+F2";
     expect(migrateAppConfig(customized)).toBe(false);
     expect(customized.automation.shortcuts.find((item) => item.id === "open-game")?.key).toBe("Ctrl+F2");
+  });
+
+  it("moves the legacy F8 / F10 defaults to F5 / F7 without touching custom keys", () => {
+    const legacy = structuredClone(fixtureConfig);
+    legacy.automation.shortcuts.find((item) => item.id === "encounter")!.key = "Ctrl+F8";
+    legacy.automation.shortcuts.find((item) => item.id === "jungle-preference")!.key = "Ctrl+F10";
+
+    expect(migrateAppConfig(legacy)).toBe(true);
+    expect(legacy.automation.shortcuts.find((item) => item.id === "encounter")?.key).toBe("Ctrl+F5");
+    expect(legacy.automation.shortcuts.find((item) => item.id === "jungle-preference")?.key).toBe("Ctrl+F7");
+
+    const customized = structuredClone(fixtureConfig);
+    customized.automation.shortcuts.find((item) => item.id === "encounter")!.key = "Alt+Z";
+    expect(migrateAppConfig(customized)).toBe(false);
+    expect(customized.automation.shortcuts.find((item) => item.id === "encounter")?.key).toBe("Alt+Z");
+  });
+
+  it("lowers only the legacy 250ms send interval to the 65ms default", () => {
+    const legacy = structuredClone(fixtureConfig);
+    legacy.version = 20;
+    legacy.automation.shortcutSendIntervalMs = 250;
+
+    expect(migrateAppConfig(legacy)).toBe(true);
+    expect(legacy.automation.shortcutSendIntervalMs).toBe(65);
+
+    const customized = structuredClone(fixtureConfig);
+    customized.version = 20;
+    customized.automation.shortcutSendIntervalMs = 120;
+
+    expect(migrateAppConfig(customized)).toBe(true);
+    expect(customized.automation.shortcutSendIntervalMs).toBe(120);
   });
 });

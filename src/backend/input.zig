@@ -7,8 +7,16 @@ const keyeventf_keyup: u32 = 0x0002;
 const keyeventf_unicode: u32 = 0x0004;
 const input_keyboard: u32 = 1;
 const max_text_utf16_units: usize = 2048;
-const min_message_interval_ms: i64 = 250;
-const max_message_interval_ms: i64 = 5000;
+/// 多条消息之间的间隔。数值与 LeagueAkari 的 `in-game-send` 对齐：
+/// 默认 65ms、下限也取 65ms，上限 3500ms（AK `state.ts` 的 `sendInterval`
+/// 与 `InGameSend.vue` 的 `:min/:max`）。
+const min_message_interval_ms: i64 = 65;
+const max_message_interval_ms: i64 = 3500;
+/// 单条消息内部的固定停顿：回车开聊天框后、整行文字注入后，各等这么久。
+/// 对齐 AK 的 `IN_GAME_SEND_ENTER_KEY_INTERNAL_DELAY = 20`——AK 的每行节奏是
+/// 「回车 → 20 → 打字 → 20 → 回车」，我们原来在这里各等 100 / 80，所以每行比
+/// AK 多花约 160ms，发十条就能感觉出「有点延迟」。
+const send_step_delay_ms: i64 = 20;
 
 var send_mutex: std.atomic.Mutex = .unlocked;
 
@@ -60,7 +68,7 @@ fn sendChatLine(io: std.Io, text: []const u8, control: RequestControl) !void {
     try control.check();
     try ensureLeagueGameForeground();
     try pressVirtualKey(io, vk_return);
-    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(send_step_delay_ms), .awake) catch {};
     // 失败时不补发回车，防止提交残缺文本或向切换后的窗口输入。
     try sendOpenChatLine(io, text, control);
 }
@@ -87,7 +95,7 @@ fn sendOpenChatLine(io: std.Io, text: []const u8, control: RequestControl) !void
     try control.check();
     try ensureLeagueGameForeground();
     try sendUnicodeText(io, text);
-    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(80), .awake) catch {};
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(send_step_delay_ms), .awake) catch {};
     try control.check();
     try ensureLeagueGameForeground();
     try pressVirtualKey(io, vk_return);
@@ -327,7 +335,8 @@ test "发送前拒绝控制字符并保留完整中文编码" {
 }
 
 test "消息间隔限制在允许范围内" {
-    try std.testing.expectEqual(@as(i64, 250), configuredMessageInterval(20));
+    try std.testing.expectEqual(@as(i64, 65), configuredMessageInterval(1));
+    try std.testing.expectEqual(@as(i64, 65), configuredMessageInterval(65));
     try std.testing.expectEqual(@as(i64, 1000), configuredMessageInterval(1000));
-    try std.testing.expectEqual(@as(i64, 5000), configuredMessageInterval(9000));
+    try std.testing.expectEqual(@as(i64, 3500), configuredMessageInterval(9000));
 }

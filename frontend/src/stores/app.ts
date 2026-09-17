@@ -91,12 +91,14 @@ export const useAppStore = defineStore("app", () => {
 
   async function openGameView() {
     if (isTauri()) {
-      await invokeNative("lol.open_game_view");
-      // The Native bridge has no implicit router access; mirror the event
-      // emitted by the former Tauri command after the host accepts the action.
-      window.dispatchEvent(new CustomEvent("open-game-view"));
-      return;
+      try {
+        await invokeNative("lol.open_game_view");
+      } catch {
+        // 前置窗口失败也要把路由切过去，否则用户按了快捷键看不到任何反馈。
+      }
     }
+    // The Native bridge has no implicit router access; mirror the event
+    // emitted by the former Tauri command after the host accepts the action.
     window.dispatchEvent(new CustomEvent("open-game-view"));
   }
 

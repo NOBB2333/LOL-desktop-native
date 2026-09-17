@@ -181,12 +181,11 @@ async function pollShortcutEvents() {
   shortcutPollRunning = true;
   try {
     const events = await backend.shortcutEvents();
+    // 全部交给 store 分发：`open-game` 在那里会先调 `lol.open_game_view`
+    // 把窗口显示/前置，再派发 `open-game-view`。以前这里对 open-game 只做
+    // `router.push("/game")`，窗口留在游戏后面，按了等于没反应。
     for (const shortcutId of new Set(events)) {
-      if (shortcutId === "open-game") {
-        openGameView();
-      } else {
-        void app.dispatchShortcut(shortcutId);
-      }
+      void app.dispatchShortcut(shortcutId);
     }
   } catch {
     // Shortcut polling is best-effort; configuration errors remain visible

@@ -1,7 +1,7 @@
 import type { AppConfig, ShortcutDefinition } from "../types/domain";
 import { normalizePlayerTagSettings } from "../tags/settings";
 
-export const CURRENT_CONFIG_VERSION = 20;
+export const CURRENT_CONFIG_VERSION = 21;
 export const defaultOpenGameShortcutKey = "Ctrl+F1";
 
 /**
@@ -16,7 +16,7 @@ const previousAssessmentTemplate =
 export const junglePreferenceShortcut: ShortcutDefinition = {
   id: "jungle-preference",
   label: "发送打野偏好",
-  key: "Ctrl+F10",
+  key: "Ctrl+F7",
   target: "jungle",
   template: "{name}：{jungle_preference}",
   enabled: true,
@@ -25,10 +25,17 @@ export const junglePreferenceShortcut: ShortcutDefinition = {
 export const encounterShortcut: ShortcutDefinition = {
   id: "encounter",
   label: "发送遇到记录",
-  key: "Ctrl+F8",
+  key: "Ctrl+F5",
   target: "encounter",
   template: "{encounter}",
   enabled: true,
+};
+
+/// 因为和系统/游戏按键冲突而被换掉的旧默认键。只对「按键仍是这个旧默认值」的
+/// 条目生效，用户自己录的键不会被覆盖。
+const legacyShortcutKeys: Record<string, { from: string; to: string }> = {
+  encounter: { from: "Ctrl+F8", to: encounterShortcut.key },
+  "jungle-preference": { from: "Ctrl+F10", to: junglePreferenceShortcut.key },
 };
 
 export function migrateAppConfig(config: AppConfig) {
@@ -52,7 +59,7 @@ export function migrateAppConfig(config: AppConfig) {
     changed = true;
   }
   if (!Number.isFinite(config.automation.shortcutSendIntervalMs)) {
-    config.automation.shortcutSendIntervalMs = 250;
+    config.automation.shortcutSendIntervalMs = 65;
     changed = true;
   }
   if (!Number.isFinite(config.automation.shortcutRecentGameCount)) {
@@ -89,6 +96,14 @@ export function migrateAppConfig(config: AppConfig) {
     openGameShortcut.key = defaultOpenGameShortcutKey;
     changed = true;
   }
+  // F8 在多数机器上是「录制」、F10 是「举报」，会和游戏/系统抢按键，所以这两条
+  // 默认键挪到 F5 / F7。只改「还停在旧默认键」的那两条，用户自己录过的键保留。
+  for (const [id, legacy] of Object.entries(legacyShortcutKeys)) {
+    const shortcut = config.automation.shortcuts.find((item) => item.id === id);
+    if (!shortcut || shortcut.key !== legacy.from) continue;
+    shortcut.key = legacy.to;
+    changed = true;
+  }
   // Party context is sent as a separate ally-only line during champ-select;
   // keeping it in ally/enemy templates would leak it into in-game chat.
   for (const shortcut of config.automation.shortcuts) {
@@ -98,7 +113,7 @@ export function migrateAppConfig(config: AppConfig) {
     }
   }
   if (config.version < 16) {
-    config.automation.shortcutSendIntervalMs = 250;
+    config.automation.shortcutSendIntervalMs = 65;
     for (const shortcut of config.automation.shortcuts) {
       if (shortcut.id === "enemy" || shortcut.id === "ally") shortcut.template = defaultAssessmentTemplate;
     }
@@ -110,6 +125,14 @@ export function migrateAppConfig(config: AppConfig) {
       if (shortcut.id !== "enemy" && shortcut.id !== "ally") continue;
       if (shortcut.template.trim() !== previousAssessmentTemplate) continue;
       shortcut.template = defaultAssessmentTemplate;
+      changed = true;
+    }
+  }
+  if (config.version < 21) {
+    // 多条消息间隔的旧默认值是 250ms，发一条十行的消息要等两秒多。对齐 AK 的
+    // 65ms 后，只把「还停在旧默认值」的配置降下来——用户自己调过的值一律保留。
+    if (config.automation.shortcutSendIntervalMs === 250) {
+      config.automation.shortcutSendIntervalMs = 65;
       changed = true;
     }
   }

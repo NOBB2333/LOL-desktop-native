@@ -9,6 +9,7 @@ import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { ShortcutTarget } from "../types/domain";
 import { renderShortcutTemplateExample, shortcutTemplateFields } from "../shortcuts/template";
+import { shortcutTargetLabel, shortcutTargetOptions } from "../shortcuts/targets";
 
 const app = useAppStore();
 const message = useMessage();
@@ -135,10 +136,8 @@ function removeChampion(target: "pick" | "ban", id: number) {
   const key = target === "pick" ? "pickChampionIds" : "banChampionIds";
   app.config.automation[key] = app.config.automation[key].filter((value) => value !== id);
 }
-const targetOptions: { label: string; value: ShortcutTarget }[] = [
-  { label: "我方每位玩家", value: "ally" }, { label: "敌方每位玩家", value: "enemy" }, { label: "双方打野", value: "jungle" }, { label: "已知组队汇总", value: "premade" }, { label: "发送遇到记录", value: "encounter" }, { label: "本局所有玩家", value: "lobby" }, { label: "仅发送一次", value: "custom" },
-];
-const targetLabel = (target: ShortcutTarget) => targetOptions.find((option) => option.value === target)?.label ?? target;
+const targetOptions = shortcutTargetOptions;
+const targetLabel = (target: ShortcutTarget) => shortcutTargetLabel(target);
 
 </script>
 
@@ -306,7 +305,7 @@ const targetLabel = (target: ShortcutTarget) => targetOptions.find((option) => o
     <section class="panel shortcut-panel">
       <header class="panel-heading"><div><span class="eyebrow">SHORTCUTS</span><h2>快捷消息</h2><p class="panel-copy">快捷键由后台监听，不会抢占游戏按键，也不会把本应用切到前台。选人 / 准备阶段通过 LCU 聊天发送；游戏内直接向当前游戏窗口模拟键盘输入。模板修改后立即自动保存并生效。</p></div><NButton size="small" secondary @click="addShortcut"><template #icon><Keyboard :size="14" /></template>添加消息</NButton></header>
       <div v-if="app.shortcutRegistrationError" class="shortcut-diagnostic"><Keyboard :size="14" /><span>{{ app.shortcutRegistrationError }}</span></div>
-      <div class="shortcut-settings"><label><span>多条消息间隔<small>默认 250ms；发送异常时可适当调高</small></span><NInputNumber v-model:value="app.config.automation.shortcutSendIntervalMs" :min="250" :max="5000" :step="50" size="small"><template #suffix>ms</template></NInputNumber></label><label><span>逐场战绩数量<small>仅影响 {recent_games}</small></span><NInputNumber v-model:value="app.config.automation.shortcutRecentGameCount" :min="1" :max="10" size="small"><template #suffix>场</template></NInputNumber></label></div>
+      <div class="shortcut-settings"><label><span>多条消息间隔<small>默认 65ms（与 AK 一致）；发送异常时可适当调高</small></span><NInputNumber v-model:value="app.config.automation.shortcutSendIntervalMs" :min="65" :max="3500" :step="5" size="small"><template #suffix>ms</template></NInputNumber></label><label><span>逐场战绩数量<small>仅影响 {recent_games}</small></span><NInputNumber v-model:value="app.config.automation.shortcutRecentGameCount" :min="1" :max="10" size="small"><template #suffix>场</template></NInputNumber></label></div>
       <div class="shortcut-field-guide"><div class="shortcut-debug__subhead"><strong>模板参数</strong><span>示例值只展示格式；生成预览读取当前真实对局</span></div><div class="placeholder-fields"><div v-for="field in placeholderFields" :key="field.key" class="placeholder-field"><span>{{ field.label }}</span><code>{{ "{" + field.key + "}" }}</code><small>{{ field.description }}</small><em>示例：{{ field.example }}</em></div></div></div>
       <div class="shortcut-list">
         <template v-for="(shortcut, index) in app.config.automation.shortcuts" :key="shortcut.id">

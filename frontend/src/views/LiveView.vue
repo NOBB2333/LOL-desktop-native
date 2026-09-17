@@ -22,6 +22,7 @@ import { HIGH_WIN_RATE_LABEL, HIGH_WIN_RATE_MIN_SAMPLE, HIGH_WIN_RATE_THRESHOLD 
 import { deriveTagFacts } from "../tags/facts";
 import { createCoalescedAsyncRunner } from "../utils/coalescedAsync";
 import { roleName } from "../utils/format";
+import { shortcutTargetLabel } from "../shortcuts/targets";
 import { enrichedRosterCoversOverlay, mergeRosterSnapshot, playerCardKey } from "../live/roster";
 import { isActiveGamePhase, isCurrentLiveSnapshot, isVisibleGamePhase, shouldAutoHideLivePanel, shouldResetClearedLivePanel } from "../live/panel";
 import { assignPremadeTones, findLocalPlayer, isLocalPartyMember } from "../live/premadeGroups";
@@ -181,6 +182,20 @@ const classicLayout = computed(() => current.value?.layoutKind !== "arena" && te
 const allyTeam = computed(() => teams.value.find((team) => team.side === "ally") ?? teams.value[0] ?? { id: "ally", label: "我方阵容", side: "ally", players: [], summary: current.value?.allySummary ?? null });
 const enemyTeam = computed(() => teams.value.find((team) => team.side === "enemy") ?? teams.value[1] ?? { id: "enemy", label: "敌方阵容", side: "enemy", players: [], summary: current.value?.enemySummary ?? null });
 const enemyPlayers = computed(() => enemyTeam.value.players);
+/**
+ * 实时概览底部的快捷键图例。直接读自动化里的配置，所以在那边加了 / 删了 /
+ * 改了按键，这里会自动跟着变——只做展示，不在这里改配置。
+ */
+const shortcutLegend = computed(() =>
+  app.config.automation.shortcuts
+    .filter((shortcut) => shortcut.enabled)
+    .map((shortcut) => ({
+      id: shortcut.id,
+      label: shortcut.label,
+      key: shortcut.key,
+      detail: shortcut.id === "open-game" ? "随时调出对局速看" : shortcutTargetLabel(shortcut.target),
+    })),
+);
 const hasLobbyPlayers = computed(() => teams.value.some((team) => team.players.length > 0));
 const premadeTones = computed(() => assignPremadeTones(teams.value.map((team) => team.players)));
 const premadeTone = (player: PlayerProfile) => premadeTones.value.get(player);
@@ -509,7 +524,7 @@ onBeforeUnmount(() => {
             <div class="game-player-row" :class="{ 'game-player-row--sparse': team.players.length < 5 }" :style="{ '--player-columns': playerColumnCount(team.players.length) }"><PlayerCard v-for="(player, index) in team.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :suppress-encounters="team.side === 'ally' && isMyPartyMember(player)" :data-side="team.side" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" :player-notes="playerNotes.notesFor(player.puuid)" :can-edit-notes="playerNotes.canEdit(player.puuid)" @edit-notes="openTagEditor" /></div>
           </section>
         </div>
-        <aside class="game-summary-column"><div class="game-summary-column__head"><span class="eyebrow">实时概览</span><h2>本局总结</h2><p>{{ dangerPoints.length }} 条规则命中 · {{ teams.length }} 个队伍</p></div><template v-if="classicLayout"><div class="game-summary-team game-summary-team--ally"><strong>我方总结</strong><TeamSummaryCard :summary="current.allySummary" side="ally" /></div><div class="game-summary-team game-summary-team--enemy"><strong>敌方总结</strong><TeamSummaryCard :summary="current.enemySummary" side="enemy" /></div></template><template v-else><div v-for="team in teams.filter((item) => item.summary)" :key="`summary-${team.id}`" class="game-summary-team" :class="`game-summary-team--${team.side}`"><strong>{{ team.side === 'enemy' ? '敌方总结' : '我方总结' }}</strong><TeamSummaryCard :summary="team.summary!" :side="team.side === 'enemy' ? 'enemy' : 'ally'" /></div></template><div class="game-danger-list"><article v-for="(point, index) in dangerPoints" :key="point.title" :data-tone="point.tone"><b>0{{ index + 1 }}</b><div><strong>{{ point.title }}</strong><p>{{ point.detail }}</p></div></article></div><div class="game-summary-foot"><span>快捷键</span><strong>Ctrl + F1</strong><small>随时调出对局速看</small></div></aside>
+        <aside class="game-summary-column"><div class="game-summary-column__head"><span class="eyebrow">实时概览</span><h2>本局总结</h2><p>{{ dangerPoints.length }} 条规则命中 · {{ teams.length }} 个队伍</p></div><template v-if="classicLayout"><div class="game-summary-team game-summary-team--ally"><strong>我方总结</strong><TeamSummaryCard :summary="current.allySummary" side="ally" /></div><div class="game-summary-team game-summary-team--enemy"><strong>敌方总结</strong><TeamSummaryCard :summary="current.enemySummary" side="enemy" /></div></template><template v-else><div v-for="team in teams.filter((item) => item.summary)" :key="`summary-${team.id}`" class="game-summary-team" :class="`game-summary-team--${team.side}`"><strong>{{ team.side === 'enemy' ? '敌方总结' : '我方总结' }}</strong><TeamSummaryCard :summary="team.summary!" :side="team.side === 'enemy' ? 'enemy' : 'ally'" /></div></template><div class="game-danger-list"><article v-for="(point, index) in dangerPoints" :key="point.title" :data-tone="point.tone"><b>0{{ index + 1 }}</b><div><strong>{{ point.title }}</strong><p>{{ point.detail }}</p></div></article></div><div class="game-summary-foot game-shortcut-legend"><span>快捷键</span><ul v-if="shortcutLegend.length"><li v-for="shortcut in shortcutLegend" :key="shortcut.id"><strong>{{ shortcut.key }}</strong><small>{{ shortcut.label }} · {{ shortcut.detail }}</small></li></ul><small v-else>自动化里还没有启用快捷消息</small></div></aside>
       </section>
       <section v-else class="game-history-panel">
         <header><div><span class="eyebrow">最近对局 / 回顾</span><h2>当前没有可读取的十人阵容</h2><p>{{ phaseLabel }} 阶段保留对局页；下面显示最近一局完整数据，可展开查看十人阵容与 BP。</p></div><NButton quaternary size="small" :loading="lobby.isFetching.value" @click="refresh"><template #icon><RefreshCw :size="14" /></template>刷新状态</NButton></header>
@@ -954,6 +969,29 @@ onBeforeUnmount(() => {
   color: var(--accent);
   font-size: 10px;
   font-weight: 700;
+}
+/* 快捷键图例：每条一行「按键 + 这条消息是干嘛的」，内容随自动化配置动态增减。 */
+.game-shortcut-legend ul {
+  display: grid;
+  gap: 3px;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.game-shortcut-legend li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 6px;
+}
+.game-shortcut-legend li strong {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.game-shortcut-legend li small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .empty-live {
   display: grid;
