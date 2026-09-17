@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { ClipboardCheck, Eye, Info, Maximize2, Minus, Plus, RefreshCw, Trash2, UsersRound } from "@lucide/vue";
-import { NButton, NEmpty, useMessage } from "naive-ui";
+import { NButton, NEmpty, NSwitch, useMessage } from "naive-ui";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useQuery } from "@tanstack/vue-query";
+import AssetIcon from "../components/AssetIcon.vue";
 import LoadingState from "../components/LoadingState.vue";
 import MatchDetailCard from "../components/MatchDetailCard.vue";
 import PageHeader from "../components/PageHeader.vue";
@@ -196,6 +197,48 @@ const shortcutLegend = computed(() =>
       detail: shortcut.id === "open-game" ? "随时调出对局速看" : shortcutTargetLabel(shortcut.target),
     })),
 );
+// 英雄目录与自动化页共用同一份 vue-query 缓存（同一个 queryKey），不会多打一次 LCU。
+const champions = useQuery({ queryKey: computed(() => ["automation-champions", app.mode]), queryFn: backend.champions, enabled: computed(() => app.initialized), staleTime: 3600000 });
+const championById = computed(() => new Map((champions.data.value ?? []).map((champion) => [champion.id, champion])));
+
+type ChampionEntry = { id: number; name: string; alias: string; iconUrl: string };
+/// 目录还没回来（或这枚 id 不在目录里）时退化成「英雄 #id」，不要让这一行空掉。
+const championEntry = (id: number): ChampionEntry => {
+  const champion = championById.value.get(id);
+  return { id, name: champion?.name ?? `英雄 #${id}`, alias: champion?.alias ?? "", iconUrl: champion?.iconUrl ?? "" };
+};
+/// 候选列表只读展示：顺序就是自动化的优先级，所以把「第几只」明确写出来。
+const pickCandidates = computed(() => app.config.automation.pickChampionIds.map(championEntry));
+const banCandidates = computed(() => app.config.automation.banChampionIds.map(championEntry));
+const cnOrdinals = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"];
+/// 「第一选」「第二禁用」这种序号；超过十位就用「#11」兜底。
+function candidateOrdinal(index: number, kind: "选" | "禁用") {
+  const label = cnOrdinals[index];
+  return label ? `第${label}${kind}` : `#${index + 1} ${kind}`;
+}
+
+/**
+ * 这一块只做「临场开关」：自动接受 / 自动选人 / 自动禁用。英雄候选、延迟、
+ * 策略这些具体设置仍然回自动化页改，这里只把当前值显示出来 + 允许开关。
+ * 语义与自动化页一致：手动打开任意一个动作就退出「建议模式」，否则总开关即使
+ * 开着也不会真的执行。
+ */
+function setAutomationAction(key: "autoAccept" | "autoPick" | "autoBan", enabled: boolean) {
+  app.config.automation[key] = enabled;
+  if (enabled) app.config.automation.advisoryMode = false;
+}
+/// 三个开关各自的「现在会发生什么」。关掉就是交回手动，避免用户以为总开关开着
+/// 就一定会自动执行。
+const autoAcceptHint = computed(() => app.config.automation.autoAccept ? `${app.config.automation.autoAcceptDelaySeconds} 秒后接受` : "关闭时由你手动接受");
+/// 选人策略的可读说明。策略本身仍在自动化页改，这里只是显示会怎么选。
+const autoPickHint = computed(() => {
+  const automation = app.config.automation;
+  if (!automation.autoPick) return "关闭时由你手动选人";
+  if (automation.autoPickStrategy === "just-show") return "只亮人，不锁定";
+  if (automation.autoPickStrategy === "lock-in-immediately") return "立即锁定（秒选）";
+  return `亮人 ${automation.autoPickDelaySeconds} 秒后锁定`;
+});
+const autoBanHint = computed(() => app.config.automation.autoBan ? "按候选顺序禁用一位" : "关闭时由你手动禁用");
 const hasLobbyPlayers = computed(() => teams.value.some((team) => team.players.length > 0));
 const premadeTones = computed(() => assignPremadeTones(teams.value.map((team) => team.players)));
 const premadeTone = (player: PlayerProfile) => premadeTones.value.get(player);
@@ -524,7 +567,7 @@ onBeforeUnmount(() => {
             <div class="game-player-row" :class="{ 'game-player-row--sparse': team.players.length < 5 }" :style="{ '--player-columns': playerColumnCount(team.players.length) }"><PlayerCard v-for="(player, index) in team.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :suppress-encounters="team.side === 'ally' && isMyPartyMember(player)" :data-side="team.side" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" :player-notes="playerNotes.notesFor(player.puuid)" :can-edit-notes="playerNotes.canEdit(player.puuid)" @edit-notes="openTagEditor" /></div>
           </section>
         </div>
-        <aside class="game-summary-column"><div class="game-summary-column__head"><span class="eyebrow">实时概览</span><h2>本局总结</h2><p>{{ dangerPoints.length }} 条规则命中 · {{ teams.length }} 个队伍</p></div><template v-if="classicLayout"><div class="game-summary-team game-summary-team--ally"><strong>我方总结</strong><TeamSummaryCard :summary="current.allySummary" side="ally" /></div><div class="game-summary-team game-summary-team--enemy"><strong>敌方总结</strong><TeamSummaryCard :summary="current.enemySummary" side="enemy" /></div></template><template v-else><div v-for="team in teams.filter((item) => item.summary)" :key="`summary-${team.id}`" class="game-summary-team" :class="`game-summary-team--${team.side}`"><strong>{{ team.side === 'enemy' ? '敌方总结' : '我方总结' }}</strong><TeamSummaryCard :summary="team.summary!" :side="team.side === 'enemy' ? 'enemy' : 'ally'" /></div></template><div class="game-danger-list"><article v-for="(point, index) in dangerPoints" :key="point.title" :data-tone="point.tone"><b>0{{ index + 1 }}</b><div><strong>{{ point.title }}</strong><p>{{ point.detail }}</p></div></article></div><div class="game-summary-foot game-shortcut-legend"><span>快捷键</span><ul v-if="shortcutLegend.length"><li v-for="shortcut in shortcutLegend" :key="shortcut.id"><strong>{{ shortcut.key }}</strong><small>{{ shortcut.label }} · {{ shortcut.detail }}</small></li></ul><small v-else>自动化里还没有启用快捷消息</small></div></aside>
+        <aside class="game-summary-column"><div class="game-summary-column__head"><span class="eyebrow">实时概览</span><h2>本局总结</h2><p>{{ dangerPoints.length }} 条规则命中 · {{ teams.length }} 个队伍</p></div><template v-if="classicLayout"><div class="game-summary-team game-summary-team--ally"><strong>我方总结</strong><TeamSummaryCard :summary="current.allySummary" side="ally" /></div><div class="game-summary-team game-summary-team--enemy"><strong>敌方总结</strong><TeamSummaryCard :summary="current.enemySummary" side="enemy" /></div></template><template v-else><div v-for="team in teams.filter((item) => item.summary)" :key="`summary-${team.id}`" class="game-summary-team" :class="`game-summary-team--${team.side}`"><strong>{{ team.side === 'enemy' ? '敌方总结' : '我方总结' }}</strong><TeamSummaryCard :summary="team.summary!" :side="team.side === 'enemy' ? 'enemy' : 'ally'" /></div></template><div class="game-danger-list"><article v-for="(point, index) in dangerPoints" :key="point.title" :data-tone="point.tone"><b>0{{ index + 1 }}</b><div><strong>{{ point.title }}</strong><p>{{ point.detail }}</p></div></article></div><div class="game-automation-quick"><div class="game-automation-quick__head"><span>自动化</span><NSwitch v-model:value="app.config.automation.enabled" size="small" /></div><ul><li><div><strong>自动接受</strong><small>{{ autoAcceptHint }}</small></div><NSwitch :value="app.config.automation.autoAccept" size="small" :disabled="!app.config.automation.enabled" @update:value="setAutomationAction('autoAccept', $event)" /></li><li><div><strong>自动选人</strong><small>{{ autoPickHint }}</small></div><NSwitch :value="app.config.automation.autoPick" size="small" :disabled="!app.config.automation.enabled" @update:value="setAutomationAction('autoPick', $event)" /></li><li><div><strong>自动禁用</strong><small>{{ autoBanHint }}</small></div><NSwitch :value="app.config.automation.autoBan" size="small" :disabled="!app.config.automation.enabled" @update:value="setAutomationAction('autoBan', $event)" /></li></ul><div class="game-automation-pool"><div class="game-automation-pool__row"><span>选用</span><div class="game-automation-pool__icons"><AssetIcon v-for="id in app.config.automation.pickChampionIds" :key="`pick-${id}`" kind="champion" :id="id" :name="championEntry(id).name" :fallback-url="championEntry(id).iconUrl" size="xs" /><small v-if="!app.config.automation.pickChampionIds.length">未设置</small></div></div><div class="game-automation-pool__row"><span>禁用</span><div class="game-automation-pool__icons"><AssetIcon v-for="id in app.config.automation.banChampionIds" :key="`ban-${id}`" kind="champion" :id="id" :name="championEntry(id).name" :fallback-url="championEntry(id).iconUrl" size="xs" /><small v-if="!app.config.automation.banChampionIds.length">未设置</small></div></div></div><div class="game-automation-candidates"><div class="game-automation-candidates__group"><span class="game-automation-candidates__title">自动选人 · 选的是谁</span><ul v-if="pickCandidates.length"><li v-for="(champion, index) in pickCandidates" :key="`pick-name-${champion.id}`"><AssetIcon kind="champion" :id="champion.id" :name="champion.name" :fallback-url="champion.iconUrl" size="xs" /><span class="game-automation-candidates__name">{{ champion.name }}</span><em class="game-automation-candidates__rank">{{ candidateOrdinal(index, '选') }}</em></li></ul><small v-else class="game-automation-candidates__empty">未设置选人候选</small></div><div class="game-automation-candidates__group"><span class="game-automation-candidates__title">自动禁用 · 禁的是谁</span><ul v-if="banCandidates.length"><li v-for="(champion, index) in banCandidates" :key="`ban-name-${champion.id}`"><AssetIcon kind="champion" :id="champion.id" :name="champion.name" :fallback-url="champion.iconUrl" size="xs" /><span class="game-automation-candidates__name">{{ champion.name }}</span><em class="game-automation-candidates__rank">{{ candidateOrdinal(index, '禁用') }}</em></li></ul><small v-else class="game-automation-candidates__empty">未设置禁用候选</small></div></div></div><div class="game-summary-foot game-shortcut-legend"><span>快捷键</span><ul v-if="shortcutLegend.length"><li v-for="shortcut in shortcutLegend" :key="shortcut.id"><strong>{{ shortcut.key }}</strong><small>{{ shortcut.label }} · {{ shortcut.detail }}</small></li></ul><small v-else>自动化里还没有启用快捷消息</small></div></aside>
       </section>
       <section v-else class="game-history-panel">
         <header><div><span class="eyebrow">最近对局 / 回顾</span><h2>当前没有可读取的十人阵容</h2><p>{{ phaseLabel }} 阶段保留对局页；下面显示最近一局完整数据，可展开查看十人阵容与 BP。</p></div><NButton quaternary size="small" :loading="lobby.isFetching.value" @click="refresh"><template #icon><RefreshCw :size="14" /></template>刷新状态</NButton></header>
@@ -969,6 +1012,119 @@ onBeforeUnmount(() => {
   color: var(--accent);
   font-size: 10px;
   font-weight: 700;
+}
+/* 自动化临场开关：只管开 / 关，具体设置（候选英雄、延迟、策略）回自动化页改。 */
+.game-automation-quick {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+.game-automation-quick__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.game-automation-quick__head > span {
+  color: var(--text-muted);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.game-automation-quick ul {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.game-automation-quick li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+}
+.game-automation-quick li strong {
+  display: block;
+  font-size: 10px;
+  font-weight: 600;
+}
+.game-automation-quick li small {
+  display: block;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.game-automation-pool {
+  display: grid;
+  gap: 3px;
+  padding-top: 5px;
+  border-top: 1px dashed var(--line);
+}
+.game-automation-pool__row {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+}
+.game-automation-pool__row > span {
+  color: var(--text-muted);
+  font-size: 9px;
+}
+.game-automation-pool__icons {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  overflow: hidden;
+}
+.game-automation-pool__icons small {
+  color: var(--text-muted);
+  font-size: 9px;
+}
+/* 「选的是谁 / 禁的是谁」：头像 + 名字 + 优先级（第一选 / 第二禁用…），只读。 */
+.game-automation-candidates {
+  display: grid;
+  gap: 7px;
+}
+.game-automation-candidates__title {
+  display: block;
+  color: var(--text-muted);
+  font-size: 9px;
+}
+.game-automation-candidates ul {
+  display: grid;
+  gap: 3px;
+  margin: 3px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.game-automation-candidates li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+}
+.game-automation-candidates__name {
+  overflow: hidden;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.game-automation-candidates__rank {
+  color: var(--accent);
+  font-size: 9px;
+  font-style: normal;
+  white-space: nowrap;
+}
+.game-automation-candidates__empty {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 9px;
 }
 /* 快捷键图例：每条一行「按键 + 这条消息是干嘛的」，内容随自动化配置动态增减。 */
 .game-shortcut-legend ul {
