@@ -12,7 +12,7 @@ import { useAppStore } from "./stores/app";
 import type { AccountPresence } from "./types/domain";
 import { MATCH_HISTORY_QUERY_ROOT } from "./matches/query";
 
-const PROJECT_URL = "https://github.com/NOBB2333/lol-desktop";
+const PROJECT_URL = "https://github.com/NOBB2333/LOL-desktop-native";
 const app = useAppStore();
 const route = useRoute();
 const router = useRouter();

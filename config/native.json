@@ -16,7 +16,7 @@
     "requireAdministrator": true
   },
   "updates": {
-    "checkUrl": "https://github.com/NOBB2333/lol-desktop/releases/latest/download/latest.json"
+    "checkUrl": "https://github.com/NOBB2333/LOL-desktop-native/releases/latest/download/latest.json"
   },
   "package": {
     "target": "windows",

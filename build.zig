@@ -53,7 +53,7 @@ const NativeConfig = struct {
         requireAdministrator: bool = true,
     } = .{},
     updates: struct {
-        checkUrl: []const u8 = "https://github.com/NOBB2333/lol-desktop/releases/latest/download/latest.json",
+        checkUrl: []const u8 = "https://github.com/NOBB2333/LOL-desktop-native/releases/latest/download/latest.json",
     } = .{},
     package: struct {
         target: []const u8 = "windows",
