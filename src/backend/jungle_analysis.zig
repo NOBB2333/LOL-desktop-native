@@ -8,6 +8,83 @@ const Camp = enum { blue, red, wolves, raptors };
 const Side = enum { blue, red };
 const Zone = enum { top, mid, bot };
 
+pub const Point = struct { x: i64, y: i64, zone: Zone };
+
+/// 逐帧坐标收集器。
+///
+/// `Aggregate` 只累计比例，画路线图需要原始落点，所以由调用方决定要不要挂到
+/// `Aggregate.path` 上。挂上之后每场多几百个点常驻内存，因此默认关闭。
+pub const PathPoints = struct {
+    allocator: std.mem.Allocator,
+    minute_points: std.ArrayList(Point) = .empty,
+    gank_points: std.ArrayList(Point) = .empty,
+    level3_points: std.ArrayList(Point) = .empty,
+    level4_points: std.ArrayList(Point) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) PathPoints {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *PathPoints) void {
+        self.minute_points.deinit(self.allocator);
+        self.gank_points.deinit(self.allocator);
+        self.level3_points.deinit(self.allocator);
+        self.level4_points.deinit(self.allocator);
+    }
+
+    /// 路线图 JSON。分区与营地计数直接复用 `Aggregate`，保证图上的结论和
+    /// 快捷消息里的「打野偏好」是同一套口径。
+    pub fn writeJson(self: *const PathPoints, aggregate: *const Aggregate, writer: *std.Io.Writer, champion_id: i64) !void {
+        try writer.print("{{\"games\":{d},\"championId\":{d},\"zone\":{{\"top\":{d:.4},\"mid\":{d:.4},\"bot\":{d:.4}}},\"camps\":{{\"blueOwn\":", .{
+            aggregate.games,
+            champion_id,
+            share(aggregate.top_weight, aggregate.total_weight),
+            share(aggregate.mid_weight, aggregate.total_weight),
+            share(aggregate.bot_weight, aggregate.total_weight),
+        });
+        try writeCampCounts(writer, aggregate.blue_normal);
+        try writer.writeAll(",\"blueInvade\":");
+        try writeCampCounts(writer, aggregate.blue_invade);
+        try writer.writeAll(",\"redOwn\":");
+        try writeCampCounts(writer, aggregate.red_normal);
+        try writer.writeAll(",\"redInvade\":");
+        try writeCampCounts(writer, aggregate.red_invade);
+        try writer.print("}},\"level3\":{d},\"level4\":{d},\"blueGames\":{d},\"redGames\":{d}", .{
+            aggregate.level3_ganks,
+            aggregate.level4_ganks,
+            aggregate.blue_games,
+            aggregate.red_games,
+        });
+        try writer.writeAll(",\"minutePoints\":");
+        try writePoints(writer, self.minute_points.items);
+        try writer.writeAll(",\"gankPoints\":");
+        try writePoints(writer, self.gank_points.items);
+        try writer.writeAll(",\"level3Points\":");
+        try writePoints(writer, self.level3_points.items);
+        try writer.writeAll(",\"level4Points\":");
+        try writePoints(writer, self.level4_points.items);
+        try writer.writeByte('}');
+    }
+};
+
+fn writePoints(writer: *std.Io.Writer, points: []const Point) !void {
+    try writer.writeByte('[');
+    for (points, 0..) |point, index| {
+        if (index > 0) try writer.writeByte(',');
+        try writer.print("{{\"x\":{d},\"y\":{d},\"zone\":\"{s}\"}}", .{ point.x, point.y, @tagName(point.zone) });
+    }
+    try writer.writeByte(']');
+}
+
+fn writeCampCounts(writer: *std.Io.Writer, counts: CampCount) !void {
+    try writer.print("{{\"blue\":{d},\"red\":{d},\"wolves\":{d},\"raptors\":{d}}}", .{ counts.blue, counts.red, counts.wolves, counts.raptors });
+}
+
+fn share(value: f64, total: f64) f64 {
+    if (total <= 0) return 0;
+    return value / total;
+}
+
 const CampCount = struct {
     blue: usize = 0,
     red: usize = 0,
@@ -50,6 +127,8 @@ pub const Aggregate = struct {
     voidgrubs: usize = 0,
     heralds: usize = 0,
     barons: usize = 0,
+    /// 挂上之后才会收集逐帧落点，见 `PathPoints`。
+    path: ?*PathPoints = null,
 
     pub fn addDetails(self: *Aggregate, details_json: []const u8, puuid: []const u8) bool {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -89,12 +168,16 @@ pub const Aggregate = struct {
             const frame = frames.array.items[frame_index];
             const participant_frame = participantFrame(frame, participant_id) orelse continue;
             const position = nestedObject(participant_frame, "position") orelse continue;
+            const x = jsonInt(position, "x");
+            const y = jsonInt(position, "y");
+            const zone = classifyZone(x, y);
             total += 1;
-            switch (classifyZone(jsonInt(position, "x"), jsonInt(position, "y"))) {
+            switch (zone) {
                 .top => top += 1,
                 .mid => mid += 1,
                 .bot => bot += 1,
             }
+            if (self.path) |collector| collector.minute_points.append(collector.allocator, .{ .x = x, .y = y, .zone = zone }) catch {};
         }
 
         var level3_kill = false;
@@ -108,15 +191,30 @@ pub const Aggregate = struct {
                 const timestamp = jsonInt(event, "timestamp");
                 const event_type = jsonString(event, "type");
                 if (std.mem.eql(u8, event_type, "CHAMPION_KILL") and involvedInKill(event, participant_id)) {
-                    if (timestamp <= analysis_minutes * 60 * 1000) if (nestedObject(event, "position")) |position| {
+                    const spot = nestedObject(event, "position");
+                    if (timestamp <= analysis_minutes * 60 * 1000) if (spot) |position| {
+                        const x = jsonInt(position, "x");
+                        const y = jsonInt(position, "y");
                         total += kill_weight;
-                        switch (classifyZone(jsonInt(position, "x"), jsonInt(position, "y"))) {
+                        switch (classifyZone(x, y)) {
                             .top => top += kill_weight,
                             .mid => mid += kill_weight,
                             .bot => bot += kill_weight,
                         }
+                        // 图上只标「明显压线」的参战点：野区擦肩而过的击杀也按地形
+                        // 归了区，全画出来会把小地图糊住。
+                        if (self.path) |collector| if (classifyGankZone(x, y)) |lane| {
+                            collector.gank_points.append(collector.allocator, .{ .x = x, .y = y, .zone = lane }) catch {};
+                        };
                     };
                     if (timestamp <= 180000) level3_kill = true else if (timestamp <= 240000) level4_kill = true;
+                    if (self.path) |collector| if (timestamp <= 240000) if (spot) |position| {
+                        const x = jsonInt(position, "x");
+                        const y = jsonInt(position, "y");
+                        const zone = classifyGankZone(x, y) orelse classifyZone(x, y);
+                        const target = if (timestamp <= 180000) &collector.level3_points else &collector.level4_points;
+                        target.append(collector.allocator, .{ .x = x, .y = y, .zone = zone }) catch {};
+                    };
                 }
                 if (!std.mem.eql(u8, event_type, "ELITE_MONSTER_KILL")) continue;
                 const killer_id = jsonInt(event, "killerId");
@@ -439,6 +537,16 @@ fn classifyZone(x: i64, y: i64) Zone {
     return if (y > x) .top else .bot;
 }
 
+/// Gank 路线分类：比 `classifyZone` 更严格，非典型位置返回 null。
+/// 与 LeagueAkari `classifyGankLane` 的阈值一致。
+fn classifyGankZone(x: i64, y: i64) ?Zone {
+    if (x < 5000 and y > 9000) return .top;
+    if (x > 9000 and y < 5000) return .bot;
+    const mid_point = @divTrunc(x + y, 2);
+    if (@abs(y - x) < 4000 and mid_point > 3000 and mid_point < 12000) return .mid;
+    return null;
+}
+
 fn detectStartCamp(x: i64, y: i64) struct { camp: Camp, side: Side } {
     const camps = [_]struct { x: i64, y: i64, camp: Camp, side: Side }{
         .{ .x = 3830, .y = 7880, .camp = .blue, .side = .blue },
@@ -563,4 +671,46 @@ test "counts easy-gank evidence from separate LCU game and timeline payloads" {
 test "does not calculate easy-gank evidence for a jungler" {
     const details = "{\"mapId\":11,\"gameMode\":\"CLASSIC\",\"gameType\":\"MATCHED_GAME\",\"participants\":[{\"puuid\":\"target\",\"participantId\":1,\"teamId\":100,\"teamPosition\":\"JUNGLE\",\"spell1Id\":11},{\"participantId\":6,\"teamId\":200,\"teamPosition\":\"JUNGLE\"}],\"frames\":[]}";
     try std.testing.expect(earlyDeathsFromDetails(details, "target") == null);
+}
+
+test "collects waypoints only when a collector is attached" {
+    const details =
+        "{\"participants\":[{\"puuid\":\"jungler\",\"participantId\":1,\"teamId\":100,\"teamPosition\":\"JUNGLE\"}],\"frames\":[" ++
+        "{\"participantFrames\":{\"1\":{\"position\":{\"x\":1000,\"y\":12000}}},\"events\":[]}," ++
+        "{\"participantFrames\":{\"1\":{\"position\":{\"x\":1000,\"y\":12000}}},\"events\":[]}," ++
+        "{\"participantFrames\":{\"1\":{\"position\":{\"x\":9000,\"y\":3000}}},\"events\":[" ++
+        "{\"type\":\"CHAMPION_KILL\",\"timestamp\":150000,\"killerId\":1,\"position\":{\"x\":11000,\"y\":2000}}," ++
+        "{\"type\":\"CHAMPION_KILL\",\"timestamp\":200000,\"killerId\":1,\"position\":{\"x\":7000,\"y\":7000}}," ++
+        "{\"type\":\"CHAMPION_KILL\",\"timestamp\":900000,\"killerId\":1,\"position\":{\"x\":7000,\"y\":7000}}" ++
+        "]}," ++
+        "{\"participantFrames\":{\"1\":{\"position\":{\"x\":9000,\"y\":3000}}},\"events\":[]}]}";
+
+    // 不挂收集器时行为与以前完全一致：只累计比例，不留落点。
+    var plain = Aggregate{};
+    try std.testing.expect(plain.addDetails(details, "jungler"));
+    try std.testing.expectEqual(@as(usize, 1), plain.games);
+
+    var collector = PathPoints.init(std.testing.allocator);
+    defer collector.deinit();
+    var traced = Aggregate{ .path = &collector };
+    try std.testing.expect(traced.addDetails(details, "jungler"));
+
+    // 第 0 帧不参与，剩下 3 帧各有一个落点。
+    try std.testing.expectEqual(@as(usize, 3), collector.minute_points.items.len);
+    // 全图参战点只留压线的两个；14 分钟外的那次击杀不计。
+    try std.testing.expectEqual(@as(usize, 2), collector.gank_points.items.len);
+    try std.testing.expectEqual(@as(usize, 1), collector.level3_points.items.len);
+    try std.testing.expectEqual(@as(usize, 1), collector.level4_points.items.len);
+
+    var buffer: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try collector.writeJson(&traced, &writer, 64);
+    const json = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"games\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"championId\":64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"minutePoints\":[{\"x\":1000,\"y\":12000,\"zone\":\"top\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"level3Points\":[{\"x\":11000,\"y\":2000,\"zone\":\"bot\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"level4Points\":[{\"x\":7000,\"y\":7000,\"zone\":\"mid\"}]") != null);
+    // 首清营地落到了蓝方自己的蓝 Buff 上。
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"blueOwn\":{\"blue\":1,\"red\":0,\"wolves\":0,\"raptors\":0}") != null);
 }

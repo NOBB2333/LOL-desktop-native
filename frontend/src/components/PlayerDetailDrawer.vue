@@ -8,6 +8,7 @@ import type { EncounterRecord, MatchSummary, PlayerProfile, RecentMatch } from "
 import type { LiveLobby } from "../types/domain";
 import AssetIcon from "./AssetIcon.vue";
 import EncounterMatchModal from "./EncounterDetails.vue";
+import JungleRouteMap from "./JungleRouteMap.vue";
 import MatchDetailCard from "./MatchDetailCard.vue";
 import PlayerTagArea from "../tags/components/PlayerTagArea.vue";
 import PlayerTagMetPopover from "../tags/components/PlayerTagMetPopover.vue";
@@ -15,6 +16,7 @@ import { championImage, percent, rankName, roleName } from "../utils/format";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import { matchHistoryQueryKey } from "../matches/query";
+import { isJunglePosition } from "../live/gameMap";
 import { useEncounters } from "../composables/useEncounters";
 import { useMatchDetail } from "../composables/useMatchDetail";
 import { encounterGames as groupEncounters } from "../encounters/records";
@@ -138,6 +140,33 @@ const expandedMatchDetail = useMatchDetail({
   enabled: computed(() => props.show),
 });
 const { matchForRow, loading: expandedDetailLoading, error: expandedDetailError } = expandedMatchDetail;
+/**
+ * 打野路线图。
+ *
+ * 样本是「本人近期打野局」的 gameId，不按英雄筛：用户要的是「近期抓野路线」，
+ * 卡到当前英雄往往只剩一两局，画出来没有意义。
+ *
+ * 必须等抽屉打开才请求——一次要读最多 10 局的 SGP DETAILS，虽然后端有落盘缓存，
+ * 也没必要在浏览列表时替每个人都拉一遍。查询键带上 gameId 串，换人/换场次自动分开缓存。
+ */
+const jungleGameIds = computed(() => (props.player?.recentMatches ?? [])
+  .filter((match) => match.gameId > 0 && isJunglePosition(match.position))
+  .map((match) => match.gameId));
+const junglePathQuery = useQuery({
+  queryKey: computed(() => ["jungle-path", app.mode, props.player?.puuid ?? "", jungleGameIds.value.join(",")] as const),
+  // 账号归属用连接信息里的 puuid，和 `useMatchDetail` 同一套回退顺序。
+  queryFn: () => backend.junglePath(
+    props.player?.puuid ?? "",
+    app.connection.puuid ?? props.localPlayer?.puuid ?? props.player?.puuid ?? "",
+    jungleGameIds.value,
+  ),
+  enabled: computed(() => Boolean(props.show && props.player?.junglePreference && jungleGameIds.value.length)),
+  staleTime: 5 * 60_000,
+  retry: 0,
+});
+const junglePath = computed(() => junglePathQuery.data.value ?? null);
+const junglePathLoading = computed(() => junglePathQuery.isLoading.value);
+const junglePathError = computed(() => (junglePathQuery.isError.value ? "路线数据读取失败。" : ""));
 const drawerMatches = computed<Array<MatchSummary | RecentMatch>>(() => detailedMatches.value.length ? detailedMatches.value : props.player?.recentMatches ?? []);
 function openEncounterGame(records: EncounterRecord[]) {
   selectedEncounterRecords.value = records;
@@ -233,7 +262,7 @@ function sideFor(player: PlayerProfile) {
         <PlayerTagMetPopover :games="encounterGames" :total="Math.max(encounterGames.length, player.encounterCount)" :target-name="player.gameName" :last-met-at="player.lastEncounteredAt ?? ''" hide-summary @inspect="openEncounterGame" />
       </section>
       <section v-if="player.isPremade" class="player-drawer__section"><header><div><span class="eyebrow">组队信息</span><h3>本局开黑</h3></div><span>LCU 当前局信息</span></header><div class="player-drawer__party"><Link2 :size="16" /><span>{{ player.premadeWith.length ? `与 ${player.premadeWith.join("、")} 一起组队` : "检测到组队，但客户端未返回队友名称" }}</span></div></section>
-      <section v-if="player.junglePreference" class="player-drawer__section player-drawer__jungle" data-testid="jungle-preference"><header><div><span class="eyebrow">打野分析</span><h3><MapPinned :size="15" />打野偏好</h3></div><span>基于最近 {{ player.junglePreference.sampleSize }} 场打野</span></header><div class="player-drawer__jungle-head" :data-style="player.junglePreference.style"><div><small>风格判断</small><strong>{{ player.junglePreference.label }}</strong></div><p>{{ player.junglePreference.evidence }}</p></div><div class="player-drawer__jungle-metrics"><div><span>胜率</span><strong>{{ percent(player.junglePreference.winRate) }}</strong><small>{{ player.junglePreference.wins }} 胜 / {{ player.junglePreference.sampleSize }} 场</small></div><div><span>平均 KDA</span><strong>{{ player.junglePreference.averageKda.toFixed(1) }}</strong><small>打野样本</small></div><div><span>平均参团</span><strong>{{ percent(player.junglePreference.averageKillParticipation) }}</strong><small>击杀与助攻参与</small></div><div><span>分均补刀</span><strong>{{ player.junglePreference.averageCsPerMinute.toFixed(1) }}</strong><small>兵线与野怪合计</small></div><div><span>前期参与击杀</span><strong>{{ player.junglePreference.averageEarlyTakedowns?.toFixed(1) ?? "--" }}</strong><small>{{ player.junglePreference.averageEarlyTakedowns === null ? "SGP 暂无数据" : "场均精确挑战数据" }}</small></div><div><span>资源参与</span><strong>{{ player.junglePreference.averageObjectiveTakedowns?.toFixed(1) ?? "--" }}</strong><small>小龙 / 峡谷 / 大龙</small></div><div><span>反野数量</span><strong>{{ player.junglePreference.averageEnemyJungleMonsters?.toFixed(1) ?? "--" }}</strong><small>场均敌方野区击杀</small></div><div><span>本局英雄样本</span><strong>{{ player.junglePreference.currentChampionGames }}</strong><small>近期打野局</small></div></div><div v-if="player.junglePreference.mainChampions.length" class="player-drawer__jungle-champions"><span>常用打野</span><div><span v-for="champion in player.junglePreference.mainChampions" :key="champion.championId"><AssetIcon kind="champion" :id="champion.championId" :name="champion.championName" size="sm" /><strong>{{ champion.championName }}</strong><small>{{ champion.games }} 场 · {{ percent(champion.winRate) }}</small></span></div></div></section>
+      <section v-if="player.junglePreference" class="player-drawer__section player-drawer__jungle" data-testid="jungle-preference"><header><div><span class="eyebrow">打野分析</span><h3><MapPinned :size="15" />打野偏好</h3></div><span>基于最近 {{ player.junglePreference.sampleSize }} 场打野</span></header><div class="player-drawer__jungle-head" :data-style="player.junglePreference.style"><div><small>风格判断</small><strong>{{ player.junglePreference.label }}</strong></div><p>{{ player.junglePreference.evidence }}</p></div><div class="player-drawer__jungle-metrics"><div><span>胜率</span><strong>{{ percent(player.junglePreference.winRate) }}</strong><small>{{ player.junglePreference.wins }} 胜 / {{ player.junglePreference.sampleSize }} 场</small></div><div><span>平均 KDA</span><strong>{{ player.junglePreference.averageKda.toFixed(1) }}</strong><small>打野样本</small></div><div><span>平均参团</span><strong>{{ percent(player.junglePreference.averageKillParticipation) }}</strong><small>击杀与助攻参与</small></div><div><span>分均补刀</span><strong>{{ player.junglePreference.averageCsPerMinute.toFixed(1) }}</strong><small>兵线与野怪合计</small></div><div><span>前期参与击杀</span><strong>{{ player.junglePreference.averageEarlyTakedowns?.toFixed(1) ?? "--" }}</strong><small>{{ player.junglePreference.averageEarlyTakedowns === null ? "SGP 暂无数据" : "场均精确挑战数据" }}</small></div><div><span>资源参与</span><strong>{{ player.junglePreference.averageObjectiveTakedowns?.toFixed(1) ?? "--" }}</strong><small>小龙 / 峡谷 / 大龙</small></div><div><span>反野数量</span><strong>{{ player.junglePreference.averageEnemyJungleMonsters?.toFixed(1) ?? "--" }}</strong><small>场均敌方野区击杀</small></div><div><span>本局英雄样本</span><strong>{{ player.junglePreference.currentChampionGames }}</strong><small>近期打野局</small></div></div><div v-if="player.junglePreference.mainChampions.length" class="player-drawer__jungle-champions"><span>常用打野</span><div><span v-for="champion in player.junglePreference.mainChampions" :key="champion.championId"><AssetIcon kind="champion" :id="champion.championId" :name="champion.championName" size="sm" /><strong>{{ champion.championName }}</strong><small>{{ champion.games }} 场 · {{ percent(champion.winRate) }}</small></span></div></div><div class="player-drawer__jungle-map" data-testid="jungle-route"><div class="player-drawer__jungle-map-head"><strong>打野路线图</strong><span>近期打野局前 15 分钟逐帧落点 · {{ jungleGameIds.length }} 局样本</span></div><JungleRouteMap v-if="junglePath" :path="junglePath" /><div v-else-if="junglePathLoading" class="player-drawer__match-status">正在解析逐帧路线数据…</div><div v-else class="player-drawer__match-status" :data-tone="junglePathError ? 'warning' : null">{{ junglePathError || "这批对局没有可用的逐帧数据（SGP DETAILS 缺失）" }} <button v-if="junglePathError" type="button" class="player-drawer__retry" @click="junglePathQuery.refetch()">重试</button></div></div></section>
       <section class="player-drawer__section"><header><div><span class="eyebrow">评分依据</span><h3>评分构成</h3></div></header><div class="player-drawer__breakdown"><div v-for="item in player.score.components" :key="item.key"><div><span>{{ item.label }}</span><b>{{ item.score.toFixed(1) }} / {{ item.maxScore }}</b></div><i :class="meterClass(item.maxScore ? item.score / item.maxScore : 0)" /><small>{{ item.evidence }}</small></div></div></section>
       <section class="player-drawer__section"><header><div><span class="eyebrow">英雄池</span><h3>主要英雄</h3></div><span>{{ Math.round(player.championPoolConcentration * 100) }}% 集中度</span></header><div class="player-drawer__champion-list"><div v-for="champion in player.topChampions" :key="champion.championId"><AssetIcon kind="champion" :id="champion.championId" :name="champion.championName" size="md" /><strong>{{ champion.championName }}</strong><span>{{ champion.wins }} 胜</span><b>{{ champion.games }} 把</b></div></div></section>
       <section v-if="lobbyPlayers.length" class="player-drawer__section"><header><div><span class="eyebrow">当前阵容</span><h3>本局玩家</h3></div><span>{{ lobbyPlayers.length }} 人 · 当前玩家高亮</span></header><div class="player-drawer__lobby"><section v-for="team in lobbyTeams" :key="team.id" class="player-drawer__lobby-team" :data-side="team.side"><header><strong>{{ team.label }}</strong><span>{{ team.players.length }} 人</span></header><div class="player-drawer__lobby-list"><button v-for="item in team.players" :key="item.puuid" type="button" class="player-drawer__lobby-player" :class="{ 'player-drawer__lobby-player--self': item.puuid === player.puuid }" :data-side="sideFor(item)" @click="openHistory(item)"><AssetIcon kind="champion" :id="item.championId" :name="item.championName" :fallback-url="championImage(item.championId)" size="sm" /><span><strong>{{ item.gameName }}<em v-if="item.puuid === player.puuid">本人</em></strong><small>{{ item.championName }} · {{ roleName(item.assignedPosition) }}</small></span><b>{{ item.recentMatches.length ? percent(item.recentMatches.filter((match) => match.win).length / item.recentMatches.length) : "--" }}</b></button></div></section></div></section>
@@ -284,6 +313,9 @@ function sideFor(player: PlayerProfile) {
 .player-drawer__jungle-champions .asset-icon { grid-row: span 2; }
 .player-drawer__jungle-champions strong { font-size: 9px; }
 .player-drawer__jungle-champions small { color: var(--text-muted); font-size: 8px; }
+.player-drawer__jungle-map { margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--line); }
+.player-drawer__jungle-map-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 8px; color: var(--text-secondary); font-size: 9px; }
+.player-drawer__jungle-map-head strong { color: var(--text-primary); font-size: 10px; }
 .player-drawer__breakdown { display: grid; gap: 10px; }
 .player-drawer__breakdown > div > div { display: flex; justify-content: space-between; color: var(--text-secondary); font-size: 10px; }
 .player-drawer__breakdown b { color: var(--text-primary); font-variant-numeric: tabular-nums; }

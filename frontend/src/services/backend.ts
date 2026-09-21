@@ -16,6 +16,7 @@ import type {
   EncounterRecord,
   FinalBpRecord,
   FriendToolsSnapshot,
+  JunglePathMap,
   LiveLobby,
   MatchSummary,
   ShortcutValidation,
@@ -142,6 +143,25 @@ export const backend = {
   async matchDetail(gameId: number, platformId: string, selfPuuid: string, targetPuuid: string, subjectPuuid = ""): Promise<MatchSummary> {
     if (usesFixtureData()) return browserBackend.matchDetail(gameId);
     return command("get_match_detail", { gameId, platformId, selfPuuid, targetPuuid, subjectPuuid });
+  },
+  /**
+   * 打野路线图：把该玩家这些局的前 15 分钟逐帧落点取回来。
+   *
+   * 只传 gameId，不传 MatchSummary——后端自己按 gameId 走 SGP DETAILS（带本地
+   * 缓存），拿到的帧数据和快捷消息里的「打野偏好」是同一份，两处口径不会漂。
+   * `selfPuuid` 与 `matchDetail` 同义，只做账号归属校验。没有逐帧数据时返回 null。
+   */
+  async junglePath(puuid: string, selfPuuid: string, gameIds: number[], championId = 0): Promise<JunglePathMap | null> {
+    const target = puuid?.trim() ?? "";
+    const ids = [...new Set(gameIds.filter((id) => Number.isFinite(id) && id > 0))].slice(0, 10);
+    if (!target || !ids.length) return null;
+    if (usesFixtureData()) return null;
+    return command<JunglePathMap | null>("get_jungle_path", {
+      puuid: target,
+      selfPuuid: selfPuuid?.trim() ?? "",
+      championId,
+      gameIds: ids,
+    });
   },
   async asset(kind: "champion" | "item" | "spell" | "perk" | "profile", id: number): Promise<AssetPayload> {
     if (usesFixtureData()) throw new Error("Fixture 使用静态资源");

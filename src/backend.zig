@@ -256,6 +256,7 @@ pub const command_names = [_][]const u8{
     "lol.get_live_roster",
     "lol.get_match_history",
     "lol.get_match_detail",
+    "lol.get_jungle_path",
     "lol.search_summoner",
     "lol.get_champions",
     "lol.get_asset",
@@ -591,6 +592,7 @@ pub const Runtime = struct {
             .{ .name = "lol.get_live_roster", .context = self, .invoke_fn = getLiveRoster },
             .{ .name = "lol.get_match_history", .context = self, .invoke_fn = getMatches },
             .{ .name = "lol.get_match_detail", .context = self, .invoke_fn = getMatchDetail },
+            .{ .name = "lol.get_jungle_path", .context = self, .invoke_fn = getJunglePath },
             .{ .name = "lol.search_summoner", .context = self, .invoke_fn = searchSummoner },
             .{ .name = "lol.get_champions", .context = self, .invoke_fn = assets_ipc.getChampions },
             .{ .name = "lol.get_asset", .context = self, .invoke_fn = assets_ipc.getAsset },
@@ -2897,6 +2899,52 @@ fn getMatchDetail(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
         return singleMatchDto(game, payload.gameId, subject, payload.targetPuuid, catalog orelse "[]", "sgp", output);
     }
     return error.MatchDetailUnavailable;
+}
+
+/// 打野路线图：按 gameId 逐帧还原该玩家近期的野区动线。
+///
+/// 只收 gameId 而不是整份 MatchSummary——帧数据后端本来就有，快捷消息里的
+/// 「打野偏好」走的就是同一条 SGP DETAILS 通道和同一份落盘缓存。让前端再传一遍
+/// 摘要既浪费，又可能和缓存口径漂开（摘要里的 position 只是「那一局打了什么位置」，
+/// 和逐帧数据不是一回事）。
+///
+/// 逐场解析，最多 10 场；一场都没解析出帧数据时返回 `PathUnavailable`，
+/// 调用方按「暂无路线数据」处理，不当作错误弹窗。
+fn getJunglePath(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = runtime(context);
+    const payload_json = parsePayload(struct {
+        puuid: []const u8 = "",
+        selfPuuid: []const u8 = "",
+        championId: i64 = 0,
+        gameIds: []const i64 = &.{},
+    }, invocation.request.payload) catch return error.InvalidRequest;
+    defer payload_json.deinit();
+    const payload = payload_json.value;
+    if (payload.puuid.len == 0) return error.InvalidRequest;
+    if (self.live_owner_puuid_len > 0 and !samePuuid(payload.selfPuuid, self.live_owner_puuid[0..self.live_owner_puuid_len])) return error.AccountChanged;
+    if (self.mode != .live) return error.PathUnavailable;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var client = try discoverClient(self, self.io orelse return error.LcuNotRunning);
+    defer client.deinit();
+    client.timeout_ms = @min(client.timeout_ms, player_enrichment_timeout_ms);
+    const sgp_context = prepareJungleSgpContext(self, client, allocator);
+
+    var collector = jungle_analysis.PathPoints.init(allocator);
+    var aggregate = jungle_analysis.Aggregate{ .path = &collector };
+    var analyzed: usize = 0;
+    for (payload.gameIds) |game_id| {
+        if (analyzed == 10) break;
+        if (game_id <= 0) continue;
+        if (addJungleGameDetails(self, client, sgp_context, &aggregate, game_id, payload.puuid)) analyzed += 1;
+    }
+    if (analyzed == 0) return error.PathUnavailable;
+
+    var writer = std.Io.Writer.fixed(output);
+    try collector.writeJson(&aggregate, &writer, payload.championId);
+    return writer.buffered();
 }
 
 fn cachedSingleMatch(json: []const u8, game_id: i64, subject: []const u8, target: []const u8, catalog: []const u8, output: []u8) ![]const u8 {

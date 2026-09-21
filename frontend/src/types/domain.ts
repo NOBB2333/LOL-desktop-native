@@ -184,6 +184,51 @@ export interface JunglePreference {
   currentChampionGames: number;
 }
 
+export type JungleZone = "top" | "mid" | "bot";
+
+export interface JunglePathPoint {
+  x: number;
+  y: number;
+  zone: JungleZone;
+}
+
+export interface JungleCampCounts {
+  blue: number;
+  red: number;
+  wolves: number;
+  raptors: number;
+}
+
+/**
+ * 打野路线图数据（`lol.get_jungle_path`）。
+ *
+ * 一个点位属于「常规开」还是「入侵开」由它自己的半区决定，所以后端按
+ * 「阵营 + 常规/入侵」四组分开计数，落点坐标在前端。
+ */
+export interface JunglePathMap {
+  /** 成功解析出逐帧数据的场次。 */
+  games: number;
+  /** 这些场次里使用的英雄；0 表示不限英雄。 */
+  championId: number;
+  zone: Record<JungleZone, number>;
+  camps: {
+    blueOwn: JungleCampCounts;
+    blueInvade: JungleCampCounts;
+    redOwn: JungleCampCounts;
+    redInvade: JungleCampCounts;
+  };
+  /** 判定为「3 级抓」/「4 级抓」的场次数量。 */
+  level3: number;
+  level4: number;
+  /** 蓝方 / 红方样本场次；营地占比的分母，和快捷消息的口径一致。 */
+  blueGames: number;
+  redGames: number;
+  minutePoints: JunglePathPoint[];
+  gankPoints: JunglePathPoint[];
+  level3Points: JunglePathPoint[];
+  level4Points: JunglePathPoint[];
+}
+
 export interface ScoreComponent {
   key: string;
   label: string;
