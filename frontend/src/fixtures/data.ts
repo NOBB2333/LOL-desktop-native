@@ -6,6 +6,10 @@ import type {
   EncounterRecord,
   FriendToolsSnapshot,
   FinalBpRecord,
+  JungleCampCounts,
+  JunglePathMap,
+  JunglePathPoint,
+  JungleZone,
   LiveLobby,
   ItemSummary,
   MatchParticipant,
@@ -17,6 +21,7 @@ import type {
   TeamSummary,
 } from "../types/domain";
 import { defaultPlayerTagSettings } from "../tags/settings";
+import type { JungleCamp } from "../live/gameMap";
 import { playerSignals, teamSignals } from "../tags/signals";
 
 const now = Date.now();
@@ -449,3 +454,81 @@ export const fixtureBootstrap: AppBootstrap = {
   appDataPath: "~/.lol_desktop",
   appVersion: "2.0.0",
 };
+
+/**
+ * 打野路线图 fixture（只服务浏览器预览）。
+ *
+ * 原生侧这份数据来自逐帧解析 SGP DETAILS，没有原生桥就取不到；这里造一份
+ * 「形状对、随玩家变化、同一个人每次刷新都一样」的样本，让浏览器预览也能看到
+ * 路线图。**不参与任何统计口径**，结论都不应该引用这里的数字。
+ *
+ * 构造规则：
+ * - 场次一半算蓝方（`blueGames`）、一半算红方；
+ * - 起始营地按 puuid 哈希在蓝 Buff / 红 Buff 之间二选一，占多数场次，其余算入侵开
+ *   ——入侵那一组要落到**对面半区**的营地，理由见 `live/gameMap.ts` 的 `clearCountsAt`；
+ * - 每分钟一个落点，沿「自家野区 → 河道 → 边路」推进，再叠一点确定性抖动；
+ * - 3 级抓 / 4 级抓各取一部分场次，落点在自家野区到河道之间。
+ */
+export function createFixtureJunglePath(puuid: string, gameIds: number[]): JunglePathMap {
+  const games = Math.max(1, gameIds.length);
+  const seed = [...puuid].reduce((sum, char) => sum + char.charCodeAt(0), 0) + games;
+  const blueGames = Math.ceil(games / 2);
+  const redGames = games - blueGames;
+  const startBlue = seed % 3 !== 0;
+  const ownCamp: JungleCamp = startBlue ? "blue" : "red";
+  // 入侵只留一场、且只给一侧：跑对面半区的四鬼（蓝开时）/ 三狼（红开时）。
+  // 只给一侧是为了让「入侵描边」在图上只出现一处，肉眼一看就知道落在哪个半区。
+  const invadeCamp: JungleCamp = startBlue ? "raptors" : "wolves";
+  const zero = (): JungleCampCounts => ({ blue: 0, red: 0, wolves: 0, raptors: 0 });
+  const split = (total: number, invade: boolean) => {
+    const invadeGames = invade && total > 3 ? 1 : 0;
+    return { own: total - invadeGames, invade: invadeGames };
+  };
+  const blue = split(blueGames, seed % 2 === 0);
+  const red = split(redGames, seed % 4 === 0);
+  const camps = { blueOwn: zero(), blueInvade: zero(), redOwn: zero(), redInvade: zero() };
+  camps.blueOwn[ownCamp] = blue.own;
+  camps.blueInvade[invadeCamp] = blue.invade;
+  camps.redOwn[ownCamp] = red.own;
+  camps.redInvade[invadeCamp] = red.invade;
+
+  // 起始半区决定走向：蓝方半区靠下路，红方半区靠上路。游戏坐标，y 轴与地图相反。
+  const route: [number, number, JungleZone][] = startBlue
+    ? [[3830, 7880, "bot"], [3800, 6440, "bot"], [6970, 5460, "mid"], [7760, 4010, "mid"], [11200, 2600, "bot"]]
+    : [[10990, 7000, "top"], [11020, 8440, "top"], [7850, 9420, "mid"], [7060, 10870, "mid"], [3200, 12000, "top"]];
+  const minutePoints: JunglePathPoint[] = [];
+  const gankPoints: JunglePathPoint[] = [];
+  const level3Points: JunglePathPoint[] = [];
+  const level4Points: JunglePathPoint[] = [];
+  for (let game = 0; game < games; game += 1) {
+    for (let minute = 0; minute < 14; minute += 1) {
+      const [x, y, zone] = route[Math.min(route.length - 1, Math.floor(minute / 3))];
+      const jitter = ((seed + game * 7 + minute * 13) % 25) - 12;
+      minutePoints.push({ x: x + jitter * 45, y: y + jitter * 45, zone });
+    }
+    const lane = route[4];
+    gankPoints.push({ x: lane[0] - game * 90, y: lane[1] + game * 110, zone: lane[2] });
+    if (game % 2 === 0) level3Points.push({ x: route[1][0], y: route[1][1], zone: route[1][2] });
+    level4Points.push({ x: route[2][0], y: route[2][1], zone: route[2][2] });
+  }
+
+  const tally: Record<JungleZone, number> = { top: 0, mid: 0, bot: 0 };
+  for (const point of minutePoints) tally[point.zone] += 1;
+  const zone = { top: 0, mid: 0, bot: 0 } as Record<JungleZone, number>;
+  for (const key of Object.keys(tally) as JungleZone[]) zone[key] = tally[key] / minutePoints.length;
+
+  return {
+    games,
+    championId: 0,
+    zone,
+    camps,
+    level3: level3Points.length,
+    level4: level4Points.length,
+    blueGames,
+    redGames,
+    minutePoints,
+    gankPoints,
+    level3Points,
+    level4Points,
+  };
+}

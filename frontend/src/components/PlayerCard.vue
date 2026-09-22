@@ -1,9 +1,12 @@
 <script setup lang="ts">
 import { Link2, MapPinned } from "@lucide/vue";
-import type { EncounterRecord, PlayerProfile, RankQueueSummary } from "../types/domain";
+import { computed } from "vue";
+import type { EncounterRecord, JunglePathMap, PlayerProfile, RankQueueSummary } from "../types/domain";
 import AssetIcon from "./AssetIcon.vue";
+import JungleRouteMap from "./JungleRouteMap.vue";
 import PlayerTagArea from "../tags/components/PlayerTagArea.vue";
 import { premadeGroupLabel } from "../tags/tones";
+import { isCurrentJungler } from "../live/gameMap";
 import { championImage, rankName, roleName, shortDate, shortDay } from "../utils/format";
 
 type RecentColumns = 1 | 2;
@@ -21,6 +24,9 @@ const props = withDefaults(
     encounterError?: boolean;
     currentGameId?: number;
     localPlayer?: PlayerProfile | null;
+    /** 本局打野路线图。只对「本局打野」下发，其他人是 undefined，卡片据此决定要不要这块。 */
+    jungleMap?: JunglePathMap | null;
+    jungleMapLoading?: boolean;
     /** 本地玩家为该玩家写的备注。 */
     playerNotes?: string[];
     canEditNotes?: boolean;
@@ -34,6 +40,17 @@ const emit = defineEmits<{
   "retry-encounters": [];
   "edit-notes": [player: PlayerProfile];
 }>();
+
+/**
+ * 路线图只画在「本局打野」的卡上。
+ *
+ * 这是 AK 的默认口径（`showJunglePathing` 只对当前打野生效），也是必要的：
+ * 一次要读最多 10 局的 SGP DETAILS，而 `recentMatches` 里有打野样本的玩家
+ * 一局可能有三四个，全员都拉会让载入阶段刷几十个请求。
+ *
+ * 判定复用 `live/gameMap.ts` 的那一份，对局页用同一个条件决定去拉谁。
+ */
+const showJungleMap = computed(() => isCurrentJungler(props.player) && Boolean(props.player.junglePreference));
 
 const visibleMatches = (player: PlayerProfile) => player.recentMatches.slice(0, props.recentLimit);
 const completed = (player: PlayerProfile) => visibleMatches(player).filter((match) => match.durationMinutes > 0);
@@ -331,6 +348,16 @@ function selectFromKeyboard(event: KeyboardEvent) {
       <span>打野偏好</span>
       <strong>{{ player.junglePreference.label }}</strong>
       <small>{{ player.junglePreference.sampleSize }} 场 · {{ Math.round(player.junglePreference.winRate * 100) }}%</small>
+    </div>
+
+    <div v-if="showJungleMap" class="bp-player-card__jungle-map" data-testid="player-card-jungle-map">
+      <div class="bp-player-card__jungle-map-head">
+        <span>打野路线图</span>
+        <small v-if="jungleMap">{{ jungleMap.games }} 局样本</small>
+        <small v-else-if="jungleMapLoading">解析逐帧数据…</small>
+        <small v-else>暂无逐帧数据</small>
+      </div>
+      <JungleRouteMap v-if="jungleMap" :path="jungleMap" variant="inline" />
     </div>
 
     <!-- 特色标签区：统一由标签系统渲染，顺序与开关见 frontend/src/tags -->
@@ -979,6 +1006,10 @@ function selectFromKeyboard(event: KeyboardEvent) {
 .bp-player-card__jungle[data-style="tempo"] svg { color: var(--red); }
 .bp-player-card__jungle[data-style="farm"] { border-left-color: var(--green); background: var(--green-soft); }
 .bp-player-card__jungle[data-style="farm"] svg { color: var(--green); }
+.bp-player-card__jungle-map { margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--line); }
+.bp-player-card__jungle-map-head { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; margin-bottom: 6px; }
+.bp-player-card__jungle-map-head span { color: var(--text-secondary); font-size: 9px; font-weight: 500; }
+.bp-player-card__jungle-map-head small { color: var(--text-muted); font-size: 8px; }
 
 /* 7. 标签区：chip 的尺寸/配色统一由 styles/main.css 的 .tag-chip 负责，
    这里只保留分区本身的分隔线。 */

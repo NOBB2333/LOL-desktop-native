@@ -27,6 +27,7 @@ import { shortcutTargetLabel } from "../shortcuts/targets";
 import { enrichedRosterCoversOverlay, mergeRosterSnapshot, playerCardKey } from "../live/roster";
 import { isActiveGamePhase, isCurrentLiveSnapshot, isVisibleGamePhase, shouldAutoHideLivePanel, shouldResetClearedLivePanel } from "../live/panel";
 import { assignPremadeTones, findLocalPlayer, isLocalPartyMember } from "../live/premadeGroups";
+import { isCurrentJungler, isJunglePosition } from "../live/gameMap";
 import { premadeGroupLabel } from "../tags/tones";
 import { queueLabel } from "../utils/queue";
 
@@ -291,6 +292,52 @@ const isMyPartyMember = (player: PlayerProfile) => isLocalPartyMember(localPlaye
 // 玩家标记（备注）：按本局十人的 puuid 批量读取，只有「别人」才允许编辑。
 const lobbyPuuids = computed(() => teams.value.flatMap((team) => team.players).map((player) => player.puuid));
 const playerNotes = usePlayerNotes(lobbyPuuids, () => localPlayer.value?.puuid ?? null);
+
+/**
+ * 本局打野的近期路线图（玩家卡上那块内嵌地图的数据源）。
+ *
+ * 只给「本局打野」拉数据，这既是 AK 的口径（`showJunglePathing` 只对当前打野
+ * 生效），也是必须的：一次要读最多 10 局的 SGP DETAILS，而战绩里有打野样本的
+ * 玩家一局可能有三四个，十个人都拉会在载入阶段刷几十个请求。一局最多两个打野
+ * （每边一个），后端还有落盘缓存，成本可控——和玩家详情抽屉里那份是同一套数据。
+ *
+ * 一个 query 覆盖场上所有打野：`queryFn` 并行取完再按 puuid 汇总，卡片侧用
+ * `jungleMapFor(player)` 取自己的那一份。键带上每人的样本串，换局 / 换人 / 战绩
+ * 刷新都会自动分开缓存。
+ */
+const jungleMapTargets = computed(() => teams.value
+  .flatMap((team) => team.players)
+  .filter((player) => isCurrentJungler(player) && Boolean(player.junglePreference))
+  .map((player) => ({
+    puuid: player.puuid,
+    gameIds: player.recentMatches
+      .filter((match) => match.gameId > 0 && isJunglePosition(match.position))
+      .map((match) => match.gameId),
+  }))
+  .filter((target) => Boolean(target.puuid) && target.gameIds.length > 0));
+const jungleMaps = useQuery({
+  queryKey: computed(() => [
+    "live-jungle-map",
+    app.mode,
+    app.connection.puuid ?? "",
+    jungleMapTargets.value.map((target) => `${target.puuid}:${target.gameIds.join(",")}`).join("|"),
+  ] as const),
+  // 账号归属用连接信息里的 puuid，与 `useMatchDetail` / 抽屉同一套回退顺序。
+  queryFn: async () => {
+    const entries = await Promise.all(jungleMapTargets.value.map(async (target) => [
+      target.puuid,
+      await backend.junglePath(target.puuid, app.connection.puuid ?? "", target.gameIds),
+    ] as const));
+    return new Map(entries);
+  },
+  enabled: computed(() => app.initialized && jungleMapTargets.value.length > 0),
+  staleTime: 5 * 60_000,
+  retry: 0,
+});
+/// 卡片按 puuid 取自己的路线图；没数据（还没回来 / 这批局没有逐帧数据）时给 null。
+const jungleMapFor = (player: PlayerProfile) => jungleMaps.data.value?.get(player.puuid) ?? null;
+const jungleMapLoading = computed(() => jungleMaps.isLoading.value);
+
 const tagEditorPlayer = ref<PlayerProfile | null>(null);
 const tagEditorSaving = ref(false);
 const tagEditorError = ref("");
@@ -560,14 +607,14 @@ onBeforeUnmount(() => {
       <section v-if="hasLobbyPlayers" class="game-board" :data-layout="current.layoutKind || 'classic'">
         <div v-if="classicLayout" class="game-teams">
           <header class="game-team-heading game-team-heading--ally"><div><span class="side-kicker ally">我方 · {{ allyTeam.players.length }} 人</span><h2>{{ allyTeam.label }}</h2></div><TeamTagsArea :players="allyTeam.players" :groups="teamPremadeGroups(allyTeam)" /><strong>{{ (allyTeam.summary?.score ?? current.allySummary.score).toFixed(1) }}<small> 队伍评分</small></strong></header>
-          <div class="game-player-row" :style="{ '--player-columns': playerColumnCount(allyTeam.players.length) }"><PlayerCard v-for="(player, index) in allyTeam.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :suppress-encounters="isMyPartyMember(player)" data-side="ally" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" :player-notes="playerNotes.notesFor(player.puuid)" :can-edit-notes="playerNotes.canEdit(player.puuid)" @edit-notes="openTagEditor" /></div>
+          <div class="game-player-row" :style="{ '--player-columns': playerColumnCount(allyTeam.players.length) }"><PlayerCard v-for="(player, index) in allyTeam.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :suppress-encounters="isMyPartyMember(player)" data-side="ally" show-recent :jungle-map="jungleMapFor(player)" :jungle-map-loading="jungleMapLoading" @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" :player-notes="playerNotes.notesFor(player.puuid)" :can-edit-notes="playerNotes.canEdit(player.puuid)" @edit-notes="openTagEditor" /></div>
           <header class="game-team-heading game-team-heading--enemy"><div><span class="side-kicker enemy">敌方 · {{ enemyTeam.players.length }} 人</span><h2>{{ enemyTeam.label }}</h2></div><TeamTagsArea :players="enemyTeam.players" :groups="teamPremadeGroups(enemyTeam)" /><strong>{{ (enemyTeam.summary?.score ?? current.enemySummary.score).toFixed(1) }}<small> 队伍评分</small></strong></header>
-          <div class="game-player-row" :style="{ '--player-columns': playerColumnCount(enemyTeam.players.length) }"><PlayerCard v-for="(player, index) in enemyTeam.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" data-side="enemy" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" :player-notes="playerNotes.notesFor(player.puuid)" :can-edit-notes="playerNotes.canEdit(player.puuid)" @edit-notes="openTagEditor" /></div>
+          <div class="game-player-row" :style="{ '--player-columns': playerColumnCount(enemyTeam.players.length) }"><PlayerCard v-for="(player, index) in enemyTeam.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" data-side="enemy" show-recent :jungle-map="jungleMapFor(player)" :jungle-map-loading="jungleMapLoading" @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" :player-notes="playerNotes.notesFor(player.puuid)" :can-edit-notes="playerNotes.canEdit(player.puuid)" @edit-notes="openTagEditor" /></div>
         </div>
         <div v-else class="game-teams game-teams--generic">
           <section v-for="team in teams" :key="team.id" class="game-team-group" :data-side="team.side">
             <header class="game-team-heading"><div><span class="side-kicker" :class="team.side">{{ team.side === 'enemy' ? '敌方' : '我方' }} · {{ team.players.length }} 人</span><h2>{{ team.label }}</h2></div><TeamTagsArea :players="team.players" :groups="teamPremadeGroups(team)" /><strong v-if="team.summary">{{ team.summary.score.toFixed(1) }}<small> 队伍评分</small></strong></header>
-            <div class="game-player-row" :class="{ 'game-player-row--sparse': team.players.length < 5 }" :style="{ '--player-columns': playerColumnCount(team.players.length) }"><PlayerCard v-for="(player, index) in team.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :suppress-encounters="team.side === 'ally' && isMyPartyMember(player)" :data-side="team.side" show-recent @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" :player-notes="playerNotes.notesFor(player.puuid)" :can-edit-notes="playerNotes.canEdit(player.puuid)" @edit-notes="openTagEditor" /></div>
+            <div class="game-player-row" :class="{ 'game-player-row--sparse': team.players.length < 5 }" :style="{ '--player-columns': playerColumnCount(team.players.length) }"><PlayerCard v-for="(player, index) in team.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :suppress-encounters="team.side === 'ally' && isMyPartyMember(player)" :data-side="team.side" show-recent :jungle-map="jungleMapFor(player)" :jungle-map-loading="jungleMapLoading" @select="selectPlayer" @select-match="selectPlayerMatch" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" :player-notes="playerNotes.notesFor(player.puuid)" :can-edit-notes="playerNotes.canEdit(player.puuid)" @edit-notes="openTagEditor" /></div>
           </section>
         </div>
         <aside class="game-summary-column"><div class="game-summary-column__head"><span class="eyebrow">实时概览</span><h2>本局总结</h2><p>{{ dangerPoints.length }} 条规则命中 · {{ teams.length }} 个队伍</p></div><template v-if="classicLayout"><div class="game-summary-team game-summary-team--ally"><strong>我方总结</strong><TeamSummaryCard :summary="current.allySummary" side="ally" /></div><div class="game-summary-team game-summary-team--enemy"><strong>敌方总结</strong><TeamSummaryCard :summary="current.enemySummary" side="enemy" /></div></template><template v-else><div v-for="team in teams.filter((item) => item.summary)" :key="`summary-${team.id}`" class="game-summary-team" :class="`game-summary-team--${team.side}`"><strong>{{ team.side === 'enemy' ? '敌方总结' : '我方总结' }}</strong><TeamSummaryCard :summary="team.summary!" :side="team.side === 'enemy' ? 'enemy' : 'ally'" /></div></template><div class="game-danger-list"><article v-for="(point, index) in dangerPoints" :key="point.title" :data-tone="point.tone"><b>0{{ index + 1 }}</b><div><strong>{{ point.title }}</strong><p>{{ point.detail }}</p></div></article></div><div class="game-automation-quick"><div class="game-automation-quick__head"><span>自动化</span><NSwitch v-model:value="app.config.automation.enabled" size="small" /></div><ul><li><div><strong>自动接受</strong><small>{{ autoAcceptHint }}</small></div><NSwitch :value="app.config.automation.autoAccept" size="small" :disabled="!app.config.automation.enabled" @update:value="setAutomationAction('autoAccept', $event)" /></li><li><div><strong>自动选人</strong><small>{{ autoPickHint }}</small></div><NSwitch :value="app.config.automation.autoPick" size="small" :disabled="!app.config.automation.enabled" @update:value="setAutomationAction('autoPick', $event)" /></li><li><div><strong>自动禁用</strong><small>{{ autoBanHint }}</small></div><NSwitch :value="app.config.automation.autoBan" size="small" :disabled="!app.config.automation.enabled" @update:value="setAutomationAction('autoBan', $event)" /></li></ul><div class="game-automation-pool"><div class="game-automation-pool__row"><span>选用</span><div class="game-automation-pool__icons"><AssetIcon v-for="id in app.config.automation.pickChampionIds" :key="`pick-${id}`" kind="champion" :id="id" :name="championEntry(id).name" :fallback-url="championEntry(id).iconUrl" size="xs" /><small v-if="!app.config.automation.pickChampionIds.length">未设置</small></div></div><div class="game-automation-pool__row"><span>禁用</span><div class="game-automation-pool__icons"><AssetIcon v-for="id in app.config.automation.banChampionIds" :key="`ban-${id}`" kind="champion" :id="id" :name="championEntry(id).name" :fallback-url="championEntry(id).iconUrl" size="xs" /><small v-if="!app.config.automation.banChampionIds.length">未设置</small></div></div></div><div class="game-automation-candidates"><div class="game-automation-candidates__group"><span class="game-automation-candidates__title">自动选人 · 选的是谁</span><ul v-if="pickCandidates.length"><li v-for="(champion, index) in pickCandidates" :key="`pick-name-${champion.id}`"><AssetIcon kind="champion" :id="champion.id" :name="champion.name" :fallback-url="champion.iconUrl" size="xs" /><span class="game-automation-candidates__name">{{ champion.name }}</span><em class="game-automation-candidates__rank">{{ candidateOrdinal(index, '选') }}</em></li></ul><small v-else class="game-automation-candidates__empty">未设置选人候选</small></div><div class="game-automation-candidates__group"><span class="game-automation-candidates__title">自动禁用 · 禁的是谁</span><ul v-if="banCandidates.length"><li v-for="(champion, index) in banCandidates" :key="`ban-name-${champion.id}`"><AssetIcon kind="champion" :id="champion.id" :name="champion.name" :fallback-url="champion.iconUrl" size="xs" /><span class="game-automation-candidates__name">{{ champion.name }}</span><em class="game-automation-candidates__rank">{{ candidateOrdinal(index, '禁用') }}</em></li></ul><small v-else class="game-automation-candidates__empty">未设置禁用候选</small></div></div></div><div class="game-quick-filter"><span class="game-quick-filter__title">数据</span><div class="game-quick-filter__row"><div><strong>仅显示排位数据</strong><small>{{ rankedOnlyHint }}</small></div><NSwitch v-model:value="app.config.providers.rankedOnly" size="small" aria-label="仅显示排位数据" /></div></div><div class="game-summary-foot game-shortcut-legend"><span>快捷键</span><ul v-if="shortcutLegend.length"><li v-for="shortcut in shortcutLegend" :key="shortcut.id"><strong>{{ shortcut.key }}</strong><small>{{ shortcut.label }} · {{ shortcut.detail }}</small></li></ul><small v-else>自动化里还没有启用快捷消息</small></div></aside>

@@ -6,6 +6,12 @@
  * 这里只做投影和绘制，不做任何统计判断——分区、营地归属都是后端算好的，
  * 所以地图上的结论和快捷消息里的「打野偏好」是同一套口径。
  *
+ * 两种排布：
+ * - `full`：固定尺寸地图 + 右侧图例/分区权重/首清营地/抓人面板（玩家详情抽屉用）。
+ * - `inline`：宽度自适应、正方形，地图下面只留两行速览（对局界面的玩家卡用）——
+ *   卡片宽度只有 180~260px，塞不下右侧那些面板。
+ *
+ * 覆盖物一律用百分比定位，所以地图尺寸完全交给 CSS，JS 不需要知道像素。
  * 底图恒为深色，因此标记配色不跟随应用主题，见 `live/gameMap.ts`。
  */
 import { computed } from "vue";
@@ -19,6 +25,7 @@ import {
   JUNGLE_ZONE_LABELS,
   campCountsTotal,
   campMarkerSize,
+  clearCountsAt,
   describeCamps,
   mapToImagePosition,
   type JungleZone,
@@ -26,16 +33,19 @@ import {
 
 const props = withDefaults(defineProps<{
   path: JunglePathMap | null;
-  size?: number;
-}>(), { size: 232 });
+  variant?: "full" | "inline";
+  /** 仅 `full` 用：地图边长（px）。 */
+  stageSize?: number;
+}>(), { variant: "full", stageSize: 232 });
 
 const zones: JungleZone[] = ["top", "mid", "bot"];
+const isInline = computed(() => props.variant === "inline");
 
+/** 归一化到 0~1，交给模板写成百分比。 */
 function project(points: JunglePathPoint[] | undefined) {
-  const size = props.size;
   return (points ?? []).map((point) => {
-    const { left, top } = mapToImagePosition(point.x, point.y, size, size);
-    return { left, top, zone: point.zone };
+    const { left, top } = mapToImagePosition(point.x, point.y, 1, 1);
+    return { left, top, zone: point.zone } as const;
   });
 }
 
@@ -47,22 +57,23 @@ const level4Points = computed(() => project(props.path?.level4Points));
 /**
  * 首清营地落点。
  *
- * 后端只给「蓝方常规开 / 蓝方入侵开 / 红方常规开 / 红方入侵开」四组计数；
- * 某个具体点位属于哪一类，由它自己的半区决定——自己半区算常规，对面半区算入侵。
+ * 后端只给「蓝方常规开 / 蓝方入侵开 / 红方常规开 / 红方入侵开」四组计数，
+ * 某个具体点位属于哪一组由它自己的半区决定——读哪一组见 `clearCountsAt`
+ * （入侵那一组在**对面**半区，不能顺着 index 直接取）。
  */
 const campSpots = computed(() => {
   const path = props.path;
   if (!path) return [];
   const spots = JUNGLE_CAMP_SPOTS.map((spot) => {
-    const own = spot.side === "blue" ? path.camps.blueOwn[spot.camp] : path.camps.redOwn[spot.camp];
-    const invade = spot.side === "blue" ? path.camps.blueInvade[spot.camp] : path.camps.redInvade[spot.camp];
-    const { left, top } = mapToImagePosition(spot.x, spot.y, props.size, props.size);
+    const { own, invade } = clearCountsAt(path.camps, spot.side, spot.camp);
+    const { left, top } = mapToImagePosition(spot.x, spot.y, 1, 1);
     return { ...spot, left, top, own, invade, total: own + invade };
   });
   const max = spots.reduce((best, spot) => Math.max(best, spot.total), 0);
+  const min = isInline.value ? 5 : 8;
   return spots
     .filter((spot) => spot.total > 0)
-    .map((spot) => ({ ...spot, diameter: campMarkerSize(spot.total, max) }));
+    .map((spot) => ({ ...spot, diameter: campMarkerSize(spot.total, max, min, min + 1) }));
 });
 
 const zoneShares = computed(() => {
@@ -96,12 +107,29 @@ const gankRows = computed(() => {
   ];
 });
 
+/** 卡片上不做四行明细，只留「最常开哪个野」的一行。 */
+const clearBrief = computed(() => {
+  const path = props.path;
+  if (!path) return "无样本";
+  const own = campCountsTotal(path.camps.blueOwn) + campCountsTotal(path.camps.redOwn);
+  if (own > 0) {
+    const blue = describeCamps(path.camps.blueOwn);
+    return blue === "无样本" ? describeCamps(path.camps.redOwn) : blue;
+  }
+  const invade = campCountsTotal(path.camps.blueInvade) + campCountsTotal(path.camps.redInvade);
+  return invade > 0 ? describeCamps(path.camps.blueInvade) : "无样本";
+});
+
 const percentText = (ratio: number) => `${Math.round(ratio * 100)}%`;
+const pct = (value: number) => `${(value * 100).toFixed(3)}%`;
 </script>
 
 <template>
-  <div class="jungle-map" data-testid="jungle-route-map">
-    <div class="jungle-map__stage" :style="{ width: `${size}px`, height: `${size}px` }">
+  <div class="jungle-map" :class="{ 'jungle-map--inline': isInline }" data-testid="jungle-route-map">
+    <div
+      class="jungle-map__stage"
+      :style="isInline ? undefined : { width: `${stageSize}px`, height: `${stageSize}px` }"
+    >
       <img class="jungle-map__plate" :src="map11" alt="召唤师峡谷地图" />
       <svg class="jungle-map__guide" viewBox="0 0 100 100" aria-hidden="true">
         <polygon points="0,0 100,100 0,100" fill="rgba(59,130,246,0.10)" />
@@ -113,7 +141,7 @@ const percentText = (ratio: number) => `${Math.round(ratio * 100)}%`;
         v-for="(point, index) in minutePoints"
         :key="`minute-${index}`"
         class="jungle-map__dot"
-        :style="{ left: `${point.left}px`, top: `${point.top}px`, background: JUNGLE_ZONE_COLORS[point.zone] }"
+        :style="{ left: pct(point.left), top: pct(point.top), background: JUNGLE_ZONE_COLORS[point.zone] }"
       />
 
       <span
@@ -121,10 +149,10 @@ const percentText = (ratio: number) => `${Math.round(ratio * 100)}%`;
         :key="`camp-${index}`"
         class="jungle-map__camp"
         data-testid="jungle-camp-marker"
-        :title="`${JUNGLE_CAMP_LABELS[spot.camp]}（${spot.side === 'blue' ? '蓝方半区' : '红方半区'}）：己方开 ${spot.own} 次 / 入侵开 ${spot.invade} 次`"
+        :title="`${JUNGLE_CAMP_LABELS[spot.camp]}（${spot.side === 'blue' ? '蓝方' : '红方'}半区）：常规开 ${spot.own} 次 / 入侵开 ${spot.invade} 次`"
         :style="{
-          left: `${spot.left}px`,
-          top: `${spot.top}px`,
+          left: pct(spot.left),
+          top: pct(spot.top),
           width: `${spot.diameter}px`,
           height: `${spot.diameter}px`,
           background: JUNGLE_CAMP_SPOT_COLORS[spot.camp],
@@ -132,12 +160,24 @@ const percentText = (ratio: number) => `${Math.round(ratio * 100)}%`;
         }"
       />
 
-      <span v-for="(point, index) in level3Points" :key="`l3-${index}`" class="jungle-map__cross jungle-map__cross--level3" :style="{ left: `${point.left}px`, top: `${point.top}px` }" />
-      <span v-for="(point, index) in level4Points" :key="`l4-${index}`" class="jungle-map__cross jungle-map__cross--level4" :style="{ left: `${point.left}px`, top: `${point.top}px` }" />
-      <span v-for="(point, index) in gankPoints" :key="`gank-${index}`" class="jungle-map__cross" :style="{ left: `${point.left}px`, top: `${point.top}px`, '--cross-color': JUNGLE_ZONE_COLORS[point.zone] }" />
+      <span v-for="(point, index) in level3Points" :key="`l3-${index}`" class="jungle-map__cross jungle-map__cross--level3" :style="{ left: pct(point.left), top: pct(point.top) }" />
+      <span v-for="(point, index) in level4Points" :key="`l4-${index}`" class="jungle-map__cross jungle-map__cross--level4" :style="{ left: pct(point.left), top: pct(point.top) }" />
+      <span v-for="(point, index) in gankPoints" :key="`gank-${index}`" class="jungle-map__cross" :style="{ left: pct(point.left), top: pct(point.top), '--cross-color': JUNGLE_ZONE_COLORS[point.zone] }" />
     </div>
 
-    <div class="jungle-map__side">
+    <div v-if="isInline" class="jungle-map__brief">
+      <p>
+        <span v-for="share in zoneShares" :key="`brief-zone-${share.key}`" class="jungle-map__brief-zone">
+          <i :style="{ background: JUNGLE_ZONE_COLORS[share.key] }" />{{ JUNGLE_ZONE_LABELS[share.key] }} {{ percentText(share.ratio) }}
+        </span>
+      </p>
+      <p>
+        <span v-for="row in gankRows" :key="`brief-gank-${row.key}`"><b>{{ row.label }}</b> {{ percentText(row.ratio) }}</span>
+        <span><b>首清</b> {{ clearBrief }}</span>
+      </p>
+    </div>
+
+    <div v-else class="jungle-map__side">
       <ul class="jungle-map__legend">
         <li>
           <span class="jungle-map__legend-dots">
@@ -198,6 +238,8 @@ const percentText = (ratio: number) => `${Math.round(ratio * 100)}%`;
 <style scoped>
 .jungle-map { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 12px; }
 .jungle-map__stage { position: relative; flex: 0 0 auto; border: 1px solid var(--line); background: #0b1020; }
+.jungle-map--inline { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+.jungle-map--inline .jungle-map__stage { width: 100%; max-width: 190px; aspect-ratio: 1 / 1; }
 .jungle-map__plate, .jungle-map__guide { position: absolute; inset: 0; width: 100%; height: 100%; }
 .jungle-map__dot { position: absolute; width: 5px; height: 5px; border-radius: 50%; opacity: .62; transform: translate(-50%, -50%); }
 .jungle-map__camp { position: absolute; border: 2px solid rgba(255,255,255,.55); border-radius: 50%; opacity: .82; transform: translate(-50%, -50%); }
@@ -208,6 +250,11 @@ const percentText = (ratio: number) => `${Math.round(ratio * 100)}%`;
 .jungle-map__cross--level3 { --cross-color: #f97316; }
 .jungle-map__cross--level4 { --cross-color: #a855f7; }
 .jungle-map__side { display: grid; gap: 9px; min-width: 0; }
+.jungle-map__brief { display: grid; gap: 2px; min-width: 0; }
+.jungle-map__brief p { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; margin: 0; color: var(--text-secondary); font-size: 8px; line-height: 1.5; }
+.jungle-map__brief-zone { display: inline-flex; align-items: center; gap: 3px; }
+.jungle-map__brief-zone i { width: 5px; height: 5px; border-radius: 50%; }
+.jungle-map__brief b { color: var(--text-muted); font-weight: 500; }
 .jungle-map__legend { display: grid; gap: 4px; margin: 0; padding: 0; color: var(--text-secondary); font-size: 9px; line-height: 1.5; list-style: none; }
 .jungle-map__legend li { display: grid; grid-template-columns: 40px minmax(0, 1fr); align-items: center; gap: 6px; }
 .jungle-map__legend-dots { display: inline-grid; grid-auto-flow: column; place-items: center; gap: 2px; }
@@ -233,5 +280,5 @@ const percentText = (ratio: number) => `${Math.round(ratio * 100)}%`;
 .jungle-map__gank > span { display: grid; gap: 2px; padding: 5px 7px; border: 1px solid var(--line); background: var(--surface-raised); }
 .jungle-map__gank b { color: var(--text-primary); font-size: 9px; }
 .jungle-map__gank em { color: var(--text-secondary); font-size: 8px; font-style: normal; font-variant-numeric: tabular-nums; }
-@media (max-width: 720px) { .jungle-map { grid-template-columns: 1fr; } }
+@media (max-width: 720px) { .jungle-map:not(.jungle-map--inline) { grid-template-columns: 1fr; } }
 </style>

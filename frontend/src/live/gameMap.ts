@@ -114,10 +114,54 @@ export function describeCamps(counts: Record<JungleCamp, number>, limit = 2): st
 }
 
 /**
+ * 首清营地计数 → 某个半区营地落点上的「常规开 / 入侵开」次数。
+ *
+ * 后端按「场次所属阵营 × 起始半区」分成四组计数
+ * （`blueOwn` = 蓝方场次在自家半区开、`blueInvade` = 蓝方场次在敌方半区开……），
+ * 所以**落点在哪一边**决定读哪一组：
+ *
+ * - 蓝方半区的营地：常规开 = `blueOwn`；被入侵开 = `redInvade`（红方场次跑到蓝方半区来开）。
+ * - 红方半区的营地：常规开 = `redOwn`；被入侵开 = `blueInvade`（蓝方场次跑到红方半区来开）。
+ *
+ * 直接把 `blueInvade` 画在蓝方半区是错的——那组数字记的是**红方半区**的落点。
+ * 见 `src/backend/jungle_analysis.zig` 的 `addFrames`（`detectStartCamp` 同时给出
+ * 营地的半区，`start.side` 与场次阵营不同才算入侵）。
+ */
+export function clearCountsAt(
+  camps: Record<"blueOwn" | "blueInvade" | "redOwn" | "redInvade", Record<JungleCamp, number>>,
+  side: JungleSide,
+  camp: JungleCamp,
+): { own: number; invade: number } {
+  return side === "blue"
+    ? { own: camps.blueOwn[camp], invade: camps.redInvade[camp] }
+    : { own: camps.redOwn[camp], invade: camps.blueInvade[camp] };
+}
+
+/**
  * LCU 的战绩里打野位置有多种写法（`JUNGLE` / `JUG`），与后端
  * `isJunglePosition` 保持同一组可接受值。
  */
 export function isJunglePosition(position: string | undefined): boolean {
   const value = (position ?? "").trim().toUpperCase();
   return value === "JUNGLE" || value === "JUG";
+}
+
+/** Smite（惩戒）的法术 id。与 `tags/facts.ts` 里那个是同一个值。 */
+export const SMITE_SPELL_ID = 11;
+
+/**
+ * 本局是不是打野：分路写着打野，或者带着惩戒。
+ *
+ * 惩戒是更稳的判据——进入对局前后 `assignedPosition` 有一段时间是过期/空的。
+ * 与 `tags/facts.isJungler` 同义，区别只在这里额外认 `JUG` 这个写法。
+ *
+ * 路线图的「只画本局打野」判定必须走这一份：玩家卡（决定要不要画）和
+ * 对局页（决定去拉谁的数据）用的是同一个条件，分成两处迟早会走偏。
+ */
+export function isCurrentJungler(
+  player: { assignedPosition?: string; summonerSpells?: { id: number }[] } | null | undefined,
+): boolean {
+  if (!player) return false;
+  if (isJunglePosition(player.assignedPosition)) return true;
+  return (player.summonerSpells ?? []).some((spell) => spell.id === SMITE_SPELL_ID);
 }

@@ -11,6 +11,7 @@
  */
 import { isNative } from "./native";
 import {
+  createFixtureJunglePath,
   createFixtureLobby,
   fixtureBootstrap,
   fixtureBpHistory,
@@ -33,6 +34,7 @@ import type {
   EncounterRecord,
   FinalBpRecord,
   FriendToolsSnapshot,
+  JunglePathMap,
   LiveLobby,
   MatchSummary,
   PlayerProfile,
@@ -184,6 +186,10 @@ export const browserBackend = {
     return structuredClone(fixtureBootstrap.dashboard.connection);
   },
   lobby: lobbyFixture,
+  junglePath(puuid: string, gameIds: number[]): JunglePathMap {
+    // 参数已由门面清洗（去重、截断到 10 场），这里只负责造数据。
+    return createFixtureJunglePath(puuid, gameIds);
+  },
   matches(page: number, pageSize: number): MatchSummary[] {
     const source = visibleMatches(fixtureMatches, browserState.config.providers.hideUnfinishedMatches, browserState.config.providers.rankedOnly);
     const start = page * pageSize;

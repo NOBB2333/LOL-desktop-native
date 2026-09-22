@@ -4,7 +4,9 @@ import {
   JUNGLE_CAMP_SPOTS,
   campCountsTotal,
   campMarkerSize,
+  clearCountsAt,
   describeCamps,
+  isCurrentJungler,
   isJunglePosition,
   mapToImagePosition,
 } from "./gameMap";
@@ -73,4 +75,45 @@ describe("isJunglePosition", () => {
 it("营地坐标表覆盖双半区各四个营地，且互不重叠", () => {
   expect(JUNGLE_CAMP_SPOTS).toHaveLength(8);
   expect(new Set(JUNGLE_CAMP_SPOTS.map((spot) => `${spot.side}-${spot.camp}`)).size).toBe(8);
+});
+
+describe("clearCountsAt", () => {
+  // 后端四组计数是按「场次所属阵营 × 起始半区」分的，所以入侵那一组记的是
+  // **对面**半区的落点：blueInvade 落在红方半区，redInvade 落在蓝方半区。
+  const groups = {
+    blueOwn: camps({ blue: 2 }),
+    blueInvade: camps({ red: 1 }),
+    redOwn: camps({ blue: 3 }),
+    redInvade: camps({ wolves: 4 }),
+  };
+
+  it("蓝方半区的落点：常规开读 blueOwn，入侵开读 redInvade", () => {
+    expect(clearCountsAt(groups, "blue", "blue")).toEqual({ own: 2, invade: 0 });
+    expect(clearCountsAt(groups, "blue", "wolves")).toEqual({ own: 0, invade: 4 });
+  });
+
+  it("红方半区的落点：常规开读 redOwn，入侵开读 blueInvade", () => {
+    expect(clearCountsAt(groups, "red", "blue")).toEqual({ own: 3, invade: 0 });
+    expect(clearCountsAt(groups, "red", "red")).toEqual({ own: 0, invade: 1 });
+  });
+});
+
+describe("isCurrentJungler", () => {
+  it("分路写着打野就算，两种写法都认", () => {
+    expect(isCurrentJungler({ assignedPosition: "JUNGLE" })).toBe(true);
+    expect(isCurrentJungler({ assignedPosition: "jug", summonerSpells: [] })).toBe(true);
+  });
+
+  it("分路缺失或过期时退回惩戒判定", () => {
+    // 选人阶段与刚进游戏时 assignedPosition 经常还是空的，只有惩戒可靠。
+    expect(isCurrentJungler({ assignedPosition: "", summonerSpells: [{ id: 11 }] })).toBe(true);
+    expect(isCurrentJungler({ assignedPosition: "MIDDLE", summonerSpells: [{ id: 4 }] })).toBe(false);
+  });
+
+  it("其它位置、空对象与 null 都不算打野", () => {
+    expect(isCurrentJungler({ assignedPosition: "TOP", summonerSpells: [{ id: 4 }, { id: 12 }] })).toBe(false);
+    expect(isCurrentJungler({})).toBe(false);
+    expect(isCurrentJungler(null)).toBe(false);
+    expect(isCurrentJungler(undefined)).toBe(false);
+  });
 });

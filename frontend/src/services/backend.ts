@@ -155,7 +155,8 @@ export const backend = {
     const target = puuid?.trim() ?? "";
     const ids = [...new Set(gameIds.filter((id) => Number.isFinite(id) && id > 0))].slice(0, 10);
     if (!target || !ids.length) return null;
-    if (usesFixtureData()) return null;
+    // 浏览器预览下没有逐帧数据可解，用 fixture 顶上，保证路线图这块看得见。
+    if (usesFixtureData()) return browserBackend.junglePath(target, ids);
     return command<JunglePathMap | null>("get_jungle_path", {
       puuid: target,
       selfPuuid: selfPuuid?.trim() ?? "",
