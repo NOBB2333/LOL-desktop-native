@@ -335,6 +335,9 @@ pub fn build(b: *std.Build) void {
         break :pkg built;
     };
 
+    // 打包目录名里的版本跟随 app.json，与 src 和前端使用同一个来源。
+    const app_version = appVersion(b);
+
     const package = b.addSystemCommand(&.{
         "native",
         "package",
@@ -347,7 +350,7 @@ pub fn build(b: *std.Build) void {
         "--optimize",
         package_optimize_name,
         "--output",
-        b.fmt("zig-out/package/{s}-2.0.0-{s}-{s}{s}", .{ app_exe_name, @tagName(package_target), package_optimize_name, packageSuffix(package_target) }),
+        b.fmt("zig-out/package/{s}-{s}-{s}-{s}{s}", .{ app_exe_name, app_version, @tagName(package_target), package_optimize_name, packageSuffix(package_target) }),
         "--binary",
     });
     // The CLI writes to the explicit --output path instead of a Zig-managed
@@ -944,6 +947,18 @@ fn appManifestBuildConfig(b: *std.Build) AppManifestBuildConfig {
         break :blk null;
     };
     return config;
+}
+
+/// app.json 是应用版本的唯一手工维护来源。打包输出目录、Zig 侧 app_manifest_zon
+/// 和前端都从它派生，因此这里不再接受版本字面量。
+fn appVersion(b: *std.Build) []const u8 {
+    const parsed = std.json.parseFromSliceLeaky(
+        struct { version: []const u8 },
+        b.allocator,
+        @embedFile("app.json"),
+        .{ .ignore_unknown_fields = true },
+    ) catch @panic("无法从 app.json 读取 version；先运行 `native check` 看具体诊断");
+    return parsed.version;
 }
 
 fn appManifestModule(b: *std.Build) *std.Build.Module {

@@ -109,6 +109,20 @@
         ]
       },
       {
+        "name": "lol.get_jungle_path",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.search_summoner",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
         "name": "lol.get_champions",
         "origins": [
           "zero://app",
@@ -215,6 +229,55 @@
       },
       {
         "name": "lol.get_shortcut_events",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_player_tags",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.update_player_tag",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_claims",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.claim",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.gameflow_action",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.delete_friends",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.spectate",
         "origins": [
           "zero://app",
           "http://127.0.0.1:49173"

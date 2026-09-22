@@ -4,6 +4,7 @@ import { nextTick } from "vue";
 import type { Plugin } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fixtureEncounters, fixtureLobby, fixtureMatches } from "../fixtures/data";
+import type { PlayerProfile } from "../types/domain";
 import PlayerDetailDrawer from "./PlayerDetailDrawer.vue";
 
 const { encounters, matches, matchDetail, junglePath, push } = vi.hoisted(() => ({ encounters: vi.fn(), matches: vi.fn(), matchDetail: vi.fn(), junglePath: vi.fn(), push: vi.fn() }));
@@ -74,7 +75,10 @@ describe("PlayerDetailDrawer", () => {
     Element.prototype.scrollIntoView = originalScrollIntoView;
   });
 
-  async function mountScrolledDrawer(props: Record<string, unknown>) {
+  // `player` 是组件的必填 prop，不能用 Record<string, unknown> 兜住——
+  // 展开这种索引签名后 `player` 会退化成 unknown，vue-tsc 直接报 TS2322。
+  // 只声明这个 helper 真正用到的两个 prop，类型由组件契约本身约束。
+  async function mountScrolledDrawer(props: { player: PlayerProfile | null; focusSection?: "jungle" | null }) {
     const scrolled: Element[] = [];
     Element.prototype.scrollIntoView = function scrollIntoViewSpy(this: Element) { scrolled.push(this); };
     const wrapper = mount(PlayerDetailDrawer, {

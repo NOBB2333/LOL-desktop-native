@@ -3,6 +3,7 @@ import type {
   AppConfig,
   BanSummary,
   ChampionOverview,
+  ClaimSnapshot,
   EncounterRecord,
   FriendToolsSnapshot,
   FinalBpRecord,
@@ -400,10 +401,31 @@ export const fixtureFriends: FriendToolsSnapshot = {
     { id: 2, name: "双排", priority: 20 },
   ],
   friends: [
-    { id: "friend-1", puuid: "friend-puuid-1", summonerId: 101, gameName: "河道观察者", gameTag: "233", icon: 3494, groupId: 2, availability: "chat", friendsSince: new Date(now - 420 * 86400000).toISOString(), lastGameAt: new Date(now - 5 * 3600000).toISOString() },
-    { id: "friend-2", puuid: "friend-puuid-2", summonerId: 102, gameName: "狐狸收藏家", gameTag: "MID", icon: 29, groupId: 1, availability: "dnd", friendsSince: new Date(now - 730 * 86400000).toISOString(), lastGameAt: new Date(now - 2 * 86400000).toISOString() },
-    { id: "friend-3", puuid: "friend-puuid-3", summonerId: 103, gameName: "灯笼点一下", gameTag: "SUP", icon: 7, groupId: 1, availability: "offline", friendsSince: null, lastGameAt: null },
+    { id: "friend-1", puuid: "friend-puuid-1", summonerId: 101, gameName: "河道观察者", gameTag: "233", icon: 3494, groupId: 2, availability: "chat", gameStatus: "", canSpectate: false, friendsSince: new Date(now - 420 * 86400000).toISOString(), lastGameAt: new Date(now - 5 * 3600000).toISOString() },
+    { id: "friend-2", puuid: "friend-puuid-2", summonerId: 102, gameName: "狐狸收藏家", gameTag: "MID", icon: 29, groupId: 1, availability: "dnd", gameStatus: "ingame", canSpectate: true, friendsSince: new Date(now - 730 * 86400000).toISOString(), lastGameAt: new Date(now - 2 * 86400000).toISOString() },
+    { id: "friend-3", puuid: "friend-puuid-3", summonerId: 103, gameName: "灯笼点一下", gameTag: "SUP", icon: 7, groupId: 1, availability: "offline", gameStatus: "", canSpectate: false, friendsSince: null, lastGameAt: null },
   ],
+};
+
+/**
+ * 工具箱「一键领取」的浏览器预览样本。
+ *
+ * 形状与后端 `lol.get_claims` 一致（三个来源各来一两条），**不参与任何真实统计**；
+ * 预览里领一条就少一条，方便看「领空之后」的样子。
+ */
+export const fixtureClaims: ClaimSnapshot = {
+  items: [
+    { key: "mission:fixture-1", source: "mission", sourceLabel: "任务", id: "fixture-1", title: "峡谷日常", detail: "蓝色精粹 500", iconUrl: null, count: 1 },
+    { key: "mission:fixture-2", source: "mission", sourceLabel: "任务", id: "fixture-2", title: "今日首胜", detail: "钥匙 1", iconUrl: null, count: 1 },
+    { key: "reward:fixture-3", source: "reward", sourceLabel: "奖励", id: "fixture-3", title: "自选皮肤碎片", detail: "皮肤碎片 A · 皮肤碎片 B", iconUrl: null, count: 1 },
+    { key: "event:fixture-4", source: "event", sourceLabel: "事件中心", id: "fixture-4", title: "灵魂莲华", detail: "奖励轨道待领 3 项", iconUrl: null, count: 3 },
+  ],
+  sources: [
+    { source: "mission", label: "任务", count: 2 },
+    { source: "reward", label: "奖励", count: 1 },
+    { source: "event", label: "事件中心", count: 1 },
+  ],
+  total: 4,
 };
 
 export const fixtureConfig: AppConfig = {

@@ -428,6 +428,15 @@ export interface FriendRecord {
   icon: number;
   groupId: number;
   availability: string;
+  /** 客户端的游戏状态（好友对象的 `lol.gameStatus`），`ingame` 表示正在对局。 */
+  gameStatus: string;
+  /**
+   * 是否拿得到观战密钥。
+   *
+   * 客户端只在好友「在线且正在对局中」时才下发 `lol.spectatorKey`，所以这个字段是
+   * 「现在能不能观战」的**权威**依据——不要只看 `availability` 自己推断。
+   */
+  canSpectate: boolean;
   friendsSince: string | null;
   lastGameAt: string | null;
 }
@@ -544,4 +553,102 @@ export interface AssetPayload {
   mimeType: string;
   dataUrl: string;
   source: string;
+}
+
+/* ------------------------------------------------------------------ 工具箱 */
+
+/** 一键领取的三个来源：任务 / 奖励（grants）/ 事件中心奖励轨道。 */
+export type ClaimSource = "mission" | "reward" | "event";
+
+export interface ClaimItem {
+  /** `来源:id`，领取时用它指认具体条目。 */
+  key: string;
+  source: ClaimSource;
+  sourceLabel: string;
+  id: string;
+  title: string;
+  detail: string;
+  iconUrl: string | null;
+  /** 这一项里包含几份奖励（多选一的只算实际会提交的那几份）。 */
+  count: number;
+}
+
+export interface ClaimSourceSummary {
+  source: ClaimSource;
+  label: string;
+  count: number;
+}
+
+export interface ClaimSnapshot {
+  items: ClaimItem[];
+  sources: ClaimSourceSummary[];
+  total: number;
+}
+
+/**
+ * 领取结果里的**一条**。
+ *
+ * 后端把成功与失败放在同一个 `claimed` 数组里、用 `reason` 的有无区分，
+ * 所以这里两个字段都是可选的：有 `reason` 就是没领成。
+ */
+export interface ClaimResultEntry {
+  source: ClaimSource;
+  id: string;
+  title: string;
+  detail?: string;
+  reason?: string;
+}
+
+export interface ClaimOutcome {
+  claimed: ClaimResultEntry[];
+  claimedCount: number;
+  failedCount: number;
+}
+
+/** 客户端急救动作。键名与后端 `gameflow_ipc.action_table` 逐项对应。 */
+export type GameflowActionKey = "dodge" | "leave-lobby" | "play-again" | "reconnect" | "ack-failed-launch";
+
+export interface GameflowActionResult {
+  action: GameflowActionKey | string;
+  ok: boolean;
+  /** 执行时客户端所处的 gameflow 阶段；读不到时为空串。 */
+  phase: string;
+  /** 失败原因（成功时为空串）。后端永远返回结构化结果而不是抛错。 */
+  reason: string;
+}
+
+export interface FriendDeleteResultEntry {
+  id: string;
+  ok: boolean;
+  reason: string;
+}
+
+export interface FriendDeleteOutcome {
+  results: FriendDeleteResultEntry[];
+  deleted: number;
+  failed: number;
+}
+
+export interface SpectateResult {
+  ok: boolean;
+  reason: string;
+}
+
+/**
+ * 本地「见过的玩家」搜索结果的一项。
+ *
+ * 数据只来自本地已沉淀的东西（历史遇到记录 + 好友列表），**不做任何网络查询**：
+ * 本地没有任何 name→全服玩家 的反向索引，所以这里只可能搜到「你确实见过的人」。
+ */
+export interface LocalPlayerHit {
+  puuid: string;
+  gameName: string;
+  tagLine: string;
+  /** 本地遇到记录里出现过几局。 */
+  encounterGames: number;
+  /** 是否同时是好友（好友列表取不到时一律 false）。 */
+  isFriend: boolean;
+  lastSeenAt: string | null;
+  /** 最近一次遇到时用的英雄，空串表示没记录。 */
+  lastChampion: string;
 }

@@ -1,0 +1,331 @@
+# 改造方案与执行记录（2026-09-22）
+
+对象：`LOL-desktop-native`（Zig 0.16 后端 + Vue 3 前端，Native SDK 0.10.1）
+参照标准：`D:\4_Code\0_Github_Project\vercel-labs_native_Demo`（Native SDK 官方模板）
+本次性质：**已在工作区落地，未提交 git。** 上一轮评估见 [架构评估 2026-09-13](ARCHITECTURE_REVIEW_2026-09-13.md)。
+
+---
+
+## 0. 一句话
+
+`demo` 与 `LOL-desktop-native` 是**同一代框架**（同为 Native SDK 0.10.1 / Zig 0.16 / 同一
+`app.json` schema / 同一 `runner.zig` / 同一 `window.zero.invoke` 边界），**不存在架构代差**。
+所以本次没有"迁移到 demo 架构"，而是把 demo 的**约束与工具链**搬了过来，并修掉了它揭示出的三个
+真实缺陷。**复制 demo 目录重写是被明确否决的方案**（会丢掉 157 + 193 条测试且零架构收益）。
+
+---
+
+## 1. 本次实际改动
+
+### 1.1 版本单一源（原问题："所有流程版本是写死的 2.0.0"）
+
+**实测原有 9 处版本字面量，且完全没有任何同步机制：**
+
+| 位置 | 原值用途 | 处置 |
+|---|---|---|
+| `src/backend.zig` `getBootstrap` | 下发给前端的 `appVersion` | 改为 `self.app_version` |
+| `src/backend.zig` `updateDto` | **更新检查的比较基线** | 改为形参 `current_version` |
+| `src/main.zig` `ping` | `native.ping` 响应 | 改为 `app_manifest.version` |
+| `src/main.zig` `extractEmbeddedAssets` | 运行缓存目录名 | 改为 `app_manifest.version` |
+| `build.zig` `package --output` | 打包输出目录名 | 改为 `appVersion(b)` |
+| `scripts/build.sh` ×2 | `PACKAGE_DIR` / `ARCHIVE` 路径 | 改为从 `app.json` 读 |
+| `scripts/build.ps1` ×1 | `$PackageDir` 路径 | 改为从 `app.json` 读 |
+| `frontend/src/fixtures/data.ts` | 浏览器预览 fixture | 纳入 `version.mjs` 同步 |
+
+其中 `updateDto` 那一处是**功能性缺陷**而不是显示问题：它拿 `"2.0.0"` 当比较基线，
+发布 2.0.1 时若漏改这里，用户**永远收不到更新提示**。
+
+**新机制（对齐 demo）：**
+- 唯一手工来源是 `app.json` 的 `version`。
+- Zig 侧通过 `build.zig` 生成的 `app_manifest_zon` 读取——`src/` 不再保存副本。
+- 新增 `scripts/version.mjs`：`set` / `sync` / `check`。
+- 与 demo 版本的差异：**不做 JSON 重新格式化，只替换版本字段本身**（因此不引入 oxfmt 依赖，
+  也不产生与版本无关的 diff）；`check` 额外断言 **`src/` 下不存在当前版本的字符串字面量**。
+- `package-lock.json` 只改根包那两处（`occurrences: 2`），不会误伤依赖条目里的 `version`。
+
+**已在 `package.json` 暴露：** `version:set` / `version:sync` / `version:check`。
+
+### 1.2 命令面漂移（本次评估新发现的真实缺陷）
+
+实测 `app.json` 与 `src/backend.zig` 的 `command_names` 对比：
+
+```
+app.json 声明     : 27 条（native.ping + 26 × lol.*）
+Zig 注册          : 31 条（native.ping + 30 × lol.*）
+
+在 Zig 里但 app.json 没声明（4 条）：
+  lol.get_jungle_path     ← commit da8f5a0「玩家详情增加打野路线图」
+  lol.search_summoner     ← commit e3c2dac「优化重构部分对局显示信息」
+  lol.get_player_tags     ← commit b951662「重做标签系统」
+  lol.update_player_tag   ← commit b951662「重做标签系统」
+```
+
+`app.json` 最后一次改动停在 `c19bac6`；这三个功能落地时只改了 Zig，清单一直没跟上。
+（运行时危害有限——`app.json` 用于 CLI 校验与打包，Zig 的 bridge policy 才是真实运行时授权
+——但 `native check . --strict` 的基线已经不反映真实命令面。）
+
+**处置：** 补齐 4 条声明，并新增防线 `scripts/check-bridge-parity.mjs`，一次校验三件事：
+
+1. `app.json` 的 `bridge.commands` ↔ Zig `command_table` 集合一致；
+2. `handlers()` 的注册**顺序与成员**与 `command_table` 完全一致
+   （`main.zig` 依赖 `handlers()` 的下标填充 `async_contexts`，顺序错位是静默 bug）；
+3. 每个非 `query` 通道的成员集合，在 Zig 与 `frontend/src/services/native.ts`
+   的 `createCommandScheduler()` 之间一致。
+
+**已做过反向验证**：人为注入两处漂移（从 `app.json` 删一条命令 + 从前端 `action` 通道移走
+`lol.run_automation`），脚本同时报出两类问题并各自给出**可执行**的修复提示，然后修复并复原。
+
+### 1.3 命令表单一源（原问题："有些流程写得比较死"）
+
+原状：同一条 lane 规则表存在于**两个地方**，必须人工同步：
+
+| 位置 | 形式 | 显式命令数 |
+|---|---|---|
+| `src/backend.zig` `commandLane()` | Zig 字面量数组 | 14 |
+| `frontend/src/services/native.ts` `createCommandScheduler()` | TS 字面量数组 | 14 |
+
+实测两份表**当时恰好一致**，但没有任何机制保证；新增一个命令要手工改 5 处，
+其中 `app.json` 已有 4 次漏改记录。
+
+**处置（Zig 侧收敛）：** 引入 `command_table`——每个命令的名字与通道写在同一行：
+
+```zig
+pub const CommandSpec = struct { name: []const u8, lane: CommandLane };
+
+pub const command_table = [_]CommandSpec{
+    .{ .name = "lol.get_bootstrap", .lane = .query },
+    .{ .name = "lol.get_live_roster", .lane = .roster },
+    ...
+};
+
+pub const command_names = blk: { /* 从 command_table 派生 */ };
+pub fn commandLane(name: []const u8) CommandLane { /* 查表，未登记回落 .query */ }
+```
+
+`command_names`、`commandLane()`、`bridge.zig` 的 policy 现在**全部由这一张表派生**。
+新增 2 条 Zig 测试：命令表与 `handlers()` 逐项对应、未登记命令回落 `query`。
+通道语义（哪条 lane 为什么单独拆出）以行内注释保留在表上，没有丢失原有设计理由。
+
+前沿到前端的重复尚未消除（跨语言），目前由 1.2 的 `bridge:check` 守住双端一致；
+若要彻底单一源，见 §3.2。
+
+### 1.4 顺带修掉的既有缺陷
+
+| 项 | 证据 | 处置 |
+|---|---|---|
+| `vue-tsc --noEmit` **在 HEAD 上是红的** | `frontend/src/components/PlayerDetailDrawer.test.ts(81,7)` TS2322：`props: Record<string, unknown>` 展开后 `player` 退化成 `unknown`，不满足组件必填 prop | 把 helper 形参收窄为 `{ player: PlayerProfile \| null; focusSection?: "jungle" \| null }`，并补 `PlayerProfile` 类型导入 |
+| `build.zig.zon` 声明了**不存在**的路径 | `.paths` 里有 `MIGRATION.md`，该文件已在上轮清理时移到 `docs/archive/migration-boundary.md` | 改为 `docs` |
+| README 指向**已归档**的文档 | `[改造结果与验收方案](docs/IMPROVEMENT_PLAN.md)` → 实际在 `docs/archive/` | 改指向本文件 |
+| README 的 bridge 约定写错位置 | 称"命令必须同时在 `src/main.zig` 注册 handler"，实际注册表是 `src/backend.zig` 的 `command_table` | 已更正 |
+
+### 1.5 脚本面（对齐 demo 的 pnpm 命令）
+
+根 `package.json` 新增脚本，入口统一为 `pnpm run <name>`；前端细节由脚本转发到 `frontend/`：
+
+```
+version:set / version:sync / version:check     bridge:check
+check / check:static                            test / test:sandbox / native:check
+frontend:install / dev / build / typecheck / test / test:sandbox / lint
+lint / format / format:check / format:frontend / format:zig
+verify:network
+```
+
+`frontend/package.json` 补三个被根脚本依赖的入口：`test:sandbox`、`format`、`format:check`。
+（`pnpm --dir <pkg> exec <bin>` 在本机解析不到局部 bin，必须走 `run <script>`。）
+
+根 `package.json` 另加 `pnpm.onlyBuiltDependencies: ["scriptc"]`——pnpm 12 默认拦截
+`@native-sdk/cli` 的构建脚本，不加这条会反复弹出 `approve-builds` 并自动生成
+`pnpm-workspace.yaml` 占位文件（实测已触发）。
+
+### 1.6 文件清单
+
+```
+修改  src/backend.zig          版本注入 + command_table + 2 条测试
+修改  src/main.zig             版本注入（ping / 运行缓存目录）
+修改  build.zig                appVersion() + 打包输出目录
+修改  build.zig.zon            修正 .paths 的悬空项
+修改  app.json                 补 4 条命令声明
+修改  package.json             脚本面 + pnpm 构建脚本白名单
+修改  frontend/package.json    补 test:sandbox / format / format:check
+修改  frontend/src/components/PlayerDetailDrawer.test.ts   修 TS2322
+修改  scripts/build.sh         版本改为从 app.json 读
+修改  scripts/build.ps1        版本改为从 app.json 读
+修改  README.md                脚本表 / 版本与命令面 / 修正过期链接与错误描述
+新增  scripts/version.mjs              版本单一源 set|sync|check
+新增  scripts/check-bridge-parity.mjs  命令面一致性防线
+新增  docs/REFACTOR_PLAN_2026-09-22.md 本文件
+```
+
+未提交 git（按要求）。
+
+---
+
+## 2. 验收结果（2026-09-22 实测）
+
+| 项 | 结果 |
+|---|---|
+| 后端 | `bash scripts/run-backend-tests.sh` → **157/157 passed**（改造前基线 155，+2 为新防线测试） |
+| 前端 | `pnpm run frontend:test:sandbox` → **193 passed / 28 files**（与改造前一致，无回归） |
+| 类型检查 | `vue-tsc --noEmit` → **exit 0**（改造前为 TS2322 失败） |
+| lint | `oxlint src` → **0 warnings / 0 errors**（102 文件） |
+| 静态门 | `pnpm run check:static` → **exit 0** |
+| 版本一致性 | `pnpm run version:check` → 5 个派生文件 / 6 处字段一致，`src/` 无硬编码 |
+| 命令面 | `pnpm run bridge:check` → manifest 30 条 + `native.ping`；handlers 30 个顺序吻合；通道 roster:1 events:1 connection:1 action:3 state:8 |
+| 反向验证 | 注入 2 处漂移 → 脚本报出 2 类问题；复原后恢复通过 |
+| `build.zig` | `zig build --help` 正常列出全部步骤（`appVersion()` 生效） |
+
+> 沙箱注意：`zig test` 与 `vitest` **必须串行**；后端用 `scripts/run-backend-tests.sh`
+> （直接调编译器、`-j1`、缓存放仓库内），前端必须带 `--no-file-parallelism`。
+
+---
+
+## 3. 本次**没有**做、但建议后续做的事
+
+### 3.1 统一包管理器：根目录切 pnpm workspace（中风险，建议单独提交）
+
+**现状**：根用 npm（提交 `package-lock.json`）装 `@native-sdk/cli`；`frontend/` 用 pnpm
+（提交 `frontend/pnpm-lock.yaml`）。README 已用一整段警告这个混用坑——说明踩过。
+`build.zig` 甚至为此写了兼容逻辑（优先 pnpm，找不到才退 npm）。
+
+**为什么这次没做**：转换会**删除两个被 git 跟踪的锁文件**，并且 `build.zig` 里
+`pnpm --dir frontend install` 这一步在 workspace 下语义会变。这两点都该是一次
+可独立审阅的提交，不适合和版本修复混在一起。
+
+**配方（对齐 demo）：**
+
+```sh
+# 1) 声明 workspace（scriptc 白名单同时从 package.json 的 pnpm 字段搬到这里）
+cat > pnpm-workspace.yaml <<'YAML'
+packages:
+  - frontend
+
+allowBuilds:
+  scriptc: true
+YAML
+
+# 2) 根 package.json 增加 "packageManager": "pnpm@12.3.4"，
+#    并把 "pnpm": { "onlyBuiltDependencies": ["scriptc"] } 移除
+
+# 3) 删掉被 git 跟踪的旧锁文件
+git rm package-lock.json frontend/pnpm-lock.yaml
+
+# 4) 生成唯一的根锁文件
+pnpm install
+
+# 5) build.zig 里 frontend_install 改为 workspace 感知
+#    现：pnpm --dir frontend install
+#    新：pnpm install（根）+ pnpm --dir frontend run build
+
+# 6) 验收
+pnpm run check        # 全绿
+pnpm run frontend:build
+zig build --help
+```
+
+**验收要点**：`node_modules/@native-sdk/cli` 仍能被 `build.zig` 解析（它是根 devDependency），
+且 `frontend/dist` 能正常产出。
+
+### 3.2 命令面跨语言单一源（低优先级）
+
+当前 Zig `command_table` 已是唯一 Zig 侧来源，前端调度器仍是一份手写 TS 数组。
+两条路线：
+
+- **保守（已落地）**：`bridge:check` 双向比对，任一端漏改即失败。**本次采用。**
+- **激进**：由 `build.zig` 从 `command_table` 生成一个 `.ts`（通道表 + 命令名字面量联合类型），
+  前端直接 import。收益是前端能拿到命令名的字面量类型；代价是引入代码生成步骤。
+
+### 3.3 启用 format 门（低风险，但会产生大 diff）
+
+**现状**：`format:check` 已写好但**故意不在 `check` 里**，因为现在跑会大面积失败：
+
+- `zig fmt --check` 会把一批**本来就符合 Zig 风格、只是行尾为 CRLF** 的文件判为需格式化
+  （实测 `src/main.zig` CRLF 843 处、`build.zig` 1046 处，而 `src/backend.zig` 是纯 LF）。
+  根因是仓库 `core.autocrlf=true` 且**没有 `.gitattributes`**，行尾已经混杂。
+- `oxfmt --check` 报 92 个文件（`frontend/` 没有 oxfmt 配置，走默认风格）。
+
+**推荐顺序：**
+
+```sh
+# 1) 先把行尾钉死（对齐 demo 的 .gitattributes）
+cat > .gitattributes <<'ATTR'
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.png binary
+*.ico binary
+*.dll binary
+*.sqlite3 binary
+ATTR
+
+# 2) 只做行尾规范化，单独一次提交（便于 review 与回滚）
+#    然后跑一次纯格式化，再单独一次提交
+pnpm run format
+
+# 3) 两次提交都合入后，把 format:check 接进 check
+```
+
+### 3.4 后端竖切：`src/backend.zig` 仍有 8,186 行（既有计划，未动）
+
+上一轮评估已给出完整方案与 6 步交接循环，但**停摆了**：
+
+| 时间 | `backend.zig` 行数 | 变化 |
+|---|---|---|
+| 2026-09-13 评估开始时 | 8,134 | — |
+| 评估进行中 | 7,655 | −479（切出 4 模块 / 9 handler） |
+| 2026-09-22（本次） | **8,186** | **+531，涨回去了** |
+
+计划的 19 个 handler 一个都没继续切。**根因不是不知道怎么做，而是缺少自动化约束**——
+这次补上的 `bridge:check` 与 `version:check` 正是那层约束，建议**先让它们跑一段时间并接进
+提交习惯，再重启竖切**。顺序沿用上轮方案（风险从低到高）：
+
+```
+encounters_ipc / automation_ipc → shortcuts_ipc → connection → matches → live
+→ 最后把 Runtime + 共享 helper 收进 runtime.zig
+```
+
+**等 handler 全部搬完、`Runtime` 落到 `runtime.zig` 之后**，再考虑对齐 demo 的
+`Backend` 形态（每个 feature 持有自己的 `Service`，注册中心只做注册 + 策略）。
+**顺序不能颠倒**：demo 那种形态之所以干净，是因为它只有 1 个 handler；在 8,000 行
+状态体量下先做形态改造会变成事故。
+
+### 3.5 未纳入的小项
+
+| 项 | 结论 |
+|---|---|
+| `checkUpdate` 的 User-Agent `"lol-desktop-native/2.0"` | **保持独立，不跟随应用版本**。它是更新源的 API 契约版本，应用升到 3.x 不应改变服务端分桶语义。已加行内注释说明。 |
+| `frontend/` → `src_web/` 改名 | **不做**。纯改名成本（`build.zig` / `app.json` / 脚本全要动），零功能收益；仓库内部已自洽。 |
+| `docs/ARCHITECTURE_REVIEW_2026-09-13.md` 的行数已过期 | 已在其进度表加指引到本文件；正文历史数据保留，作为决策记录。 |
+
+---
+
+## 4. 命令速查
+
+```sh
+# 提交前（秒级）
+pnpm run check:static
+
+# 全量（含两套测试）
+pnpm run check
+
+# 沙箱内（zig test 与 vitest 必须串行，绝不能并发）
+pnpm run test:sandbox
+pnpm run frontend:test:sandbox
+
+# 发版
+pnpm run version:set 2.1.0
+pnpm run version:check
+pnpm run native:check
+```
+
+## 5. 验收基线（后续改动守住这些数字）
+
+```
+后端  157 passed        （scripts/run-backend-tests.sh；改后端才跑）
+前端  193 passed / 28 files
+vue-tsc --noEmit       exit 0
+oxlint src             0 warnings / 0 errors
+pnpm run check:static  exit 0
+```
+
+数字会随功能增长，**以最近一次全绿为准**，不要硬套旧值。

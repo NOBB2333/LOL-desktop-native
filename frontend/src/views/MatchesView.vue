@@ -13,8 +13,10 @@ import { useAppStore } from "../stores/app";
 import type { MatchSummary, SummonerSearchCandidate, SummonerSearchResult } from "../types/domain";
 import { championImage, roleName, shortDate } from "../utils/format";
 import { visibleMatches } from "../matches/filters";
+import { localPlayerRiotId, searchLocalPlayers } from "../matches/localPlayers";
 import { matchHistoryQueryKey } from "../matches/query";
 import { useMatchDetail } from "../composables/useMatchDetail";
+import { useLocalPlayers } from "../composables/useLocalPlayers";
 import { useRoute, useRouter } from "vue-router";
 
 const app = useAppStore();
@@ -37,6 +39,20 @@ const search = ref("");
 const searchResult = ref<SummonerSearchResult | null>(null);
 const searchError = ref("");
 const searchPending = ref(false);
+/** 本地「见过的玩家」索引：只在本地档案里搜，不发请求。 */
+const localPlayers = useLocalPlayers();
+/**
+ * 本地档案兜底候选。
+ *
+ * 只在「只给了名字」时出现：带上 `#标签` 之后 Riot Client 的精确解析才是权威，
+ * 这时候再混一份本地结果只会干扰判断。也正因为数据源只是我们自己的历史记录，
+ * 列出来的人**确实见过**，不存在「全服同名」那种噪声。
+ */
+const localHits = computed(() => {
+  const query = summonerQuery.value.trim();
+  if (!query || query.includes("#")) return [];
+  return searchLocalPlayers(query, localPlayers.data.value ?? [], 6);
+});
 const result = ref("all");
 const queue = ref("all");
 const viewMode = ref<"detail" | "index">(typeof localStorage === "undefined" ? "detail" : localStorage.getItem("lol-desktop-match-view") === "index" ? "index" : "detail");
@@ -114,7 +130,10 @@ async function searchSummoner() {
     if (result.candidates.length === 0 && result.hasTag) return void applySummoner(query);
     // 只给名字又解析不到：不发起注定落空的查询，改为提示补全标签。
     if (result.candidates.length === 0) {
-      message.warning("客户端只能精确匹配，请补全为「名字#标签」后再试");
+      // 本地档案里有像的人就直接指出来——比一句「请补全标签」有用得多，
+      // 而且这些人是我们**确实见过**的，点一下就带着完整的 `名字#标签` 去查。
+      if (localHits.value.length) message.info(`本地档案里有 ${localHits.value.length} 位相近的玩家，点选一位即可查询`);
+      else message.warning("客户端只能精确匹配，请补全为「名字#标签」后再试");
       return;
     }
     message.info(`匹配到 ${result.candidates.length} 个账号，请选择要查询的玩家`);
@@ -196,6 +215,20 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
           <em v-else-if="isDuplicatedCandidate(candidate)" class="matches-candidate__ordinal">候选 {{ index + 1 }}</em>
         </button>
       </div>
+
+      <!--
+        本地档案兜底：数据只来自我们自己的历史记录与好友列表，**不是**全服搜索。
+        所以列出来的人一定见过；反过来，这里没有也不代表这个人不存在。
+      -->
+      <div v-if="localHits.length" class="matches-candidates matches-candidates--local">
+        <span class="matches-candidates__label">本地见过的玩家 {{ localHits.length }}</span>
+        <button v-for="hit in localHits" :key="hit.puuid" type="button" class="matches-candidate" @click="applySummoner(localPlayerRiotId(hit))">
+          <strong>{{ hit.gameName }}</strong>
+          <small v-if="hit.tagLine">#{{ hit.tagLine }}</small>
+          <em v-if="hit.isFriend">好友</em>
+          <em v-else-if="hit.encounterGames">{{ hit.encounterGames }} 局</em>
+        </button>
+      </div>
       <p v-if="duplicatedCandidateNames.size" class="matches-query-note">
         有 {{ duplicatedCandidateNames.size }} 组同名同标签的结果：名称无法区分它们，请逐个点选确认哪一个是你要找的人。
       </p>
@@ -253,7 +286,10 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
 .matches-page--workspace { width: 100%; max-width: none; }
 .matches-page-actions { display: flex; align-items: center; gap: 5px; }
 .matches-query-panel { display: grid; gap: 11px; margin-bottom: 14px; padding: 14px 16px; border: 1px solid var(--line); background: var(--surface); }.matches-query-form { display: grid; grid-template-columns: minmax(280px, 1fr) auto; align-items: end; gap: 10px 14px; }.matches-query-field { display: grid; gap: 5px; min-width: 0; }.matches-query-field > span { color: var(--text-primary); font-size: 11px; font-weight: 700; }.matches-query-field .n-input { width: min(100%, 620px); }.matches-query-submit { justify-self: end; min-width: 116px; }.matches-query-form > p { grid-column: 1 / -1; margin: 0; color: var(--text-secondary); font-size: 9px; }.matches-filter-row { display: grid; grid-template-columns: auto minmax(190px, 1fr) 120px 150px auto; align-items: center; gap: 7px; padding-top: 10px; border-top: 1px solid var(--line); }.matches-filter-title { display: inline-flex; align-items: center; gap: 5px; color: var(--text-muted); font-size: 9px; }.matches-filter-count { justify-self: end; color: var(--text-secondary); font-size: 9px; font-variant-numeric: tabular-nums; }
-.matches-candidates { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding-top: 10px; border-top: 1px solid var(--line); }.matches-candidates__label { color: var(--text-muted); font-size: 9px; }.matches-candidate { display: inline-flex; align-items: center; gap: 3px; padding: 4px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--text-primary); background: var(--surface-raised); cursor: pointer; font-size: 11px; transition: border-color 140ms ease, background 140ms ease; }.matches-candidate:hover { border-color: var(--accent); background: var(--accent-soft); }.matches-candidate strong { font-weight: 700; }.matches-candidate small { color: var(--text-secondary); font-size: 10px; }.matches-candidate em { padding: 1px 5px; border-radius: 3px; color: var(--accent); background: var(--accent-soft); font-size: 8px; font-style: normal; font-weight: 700; }.matches-candidate em.matches-candidate__ordinal { color: var(--text-secondary); background: var(--surface-muted); }
+.matches-candidates { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding-top: 10px; border-top: 1px solid var(--line); }.matches-candidates__label { color: var(--text-muted); font-size: 9px; }
+/* 本地档案是「猜测」而不是「精确命中」，用虚线把它和上面的精确匹配区分开。 */
+.matches-candidates--local { border-top-style: dashed; }
+.matches-candidates--local .matches-candidate { border-style: dashed; }.matches-candidate { display: inline-flex; align-items: center; gap: 3px; padding: 4px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--text-primary); background: var(--surface-raised); cursor: pointer; font-size: 11px; transition: border-color 140ms ease, background 140ms ease; }.matches-candidate:hover { border-color: var(--accent); background: var(--accent-soft); }.matches-candidate strong { font-weight: 700; }.matches-candidate small { color: var(--text-secondary); font-size: 10px; }.matches-candidate em { padding: 1px 5px; border-radius: 3px; color: var(--accent); background: var(--accent-soft); font-size: 8px; font-style: normal; font-weight: 700; }.matches-candidate em.matches-candidate__ordinal { color: var(--text-secondary); background: var(--surface-muted); }
 .matches-query-note { margin: 0; padding: 8px 10px; border: 1px dashed var(--line-strong); border-left: 3px solid var(--amber); color: var(--text-secondary); background: var(--surface-raised); font-size: 10px; line-height: 1.5; }.matches-query-note b { color: var(--text-primary); }
 .matches-summary { display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)) minmax(230px, 1.4fr); gap: 1px; margin-bottom: 14px; border: 1px solid var(--line); background: var(--line); }.matches-summary > div { min-height: 70px; padding: 12px 15px; background: var(--surface); }.matches-summary span, .matches-summary strong { display: block; }.matches-summary span { color: var(--text-secondary); font-size: 10px; }.matches-summary strong { margin-top: 9px; font-size: 20px; font-variant-numeric: tabular-nums; }.matches-summary small { color: var(--text-secondary); font-size: 11px; font-weight: 500; }.matches-summary__result { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 11px; }.matches-summary__result span { display: inline; }
 .match-table-shell { border: 1px solid var(--line); background: var(--surface); }.match-table-heading { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; padding: 13px 15px 10px; border-bottom: 1px solid var(--line); }.match-table-heading h2 { margin: 4px 0 0; font-size: 16px; }.match-table-heading__hint { color: var(--text-muted); font-size: 9px; }.match-list--full { padding: 8px; overflow-x: auto; }

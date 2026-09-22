@@ -21,14 +21,27 @@
 
 需要 Node.js 24.15.0（见 `.node-version`）、**pnpm 12**（前端依赖只能用 pnpm，见下）、Zig 0.16 和 Native SDK CLI。若 SDK 安装在全局目录，Zig 命令需要显式传入 `-Dnative-sdk-path=<SDK路径>`；默认路径是项目内的 `node_modules/@native-sdk/cli`。
 
-```sh
-pnpm --dir frontend install
-pnpm --dir frontend run build
-pnpm --dir frontend run typecheck
-pnpm --dir frontend test
-native check . --strict
-zig build test -Dplatform=null
-```
+常用入口统一收在仓库根的 `package.json`（对齐 `vercel-labs/native` 模板的脚本面），前端细节由脚本转发到 `frontend/`：
+
+| 命令 | 用途 |
+|---|---|
+| `pnpm run check:static` | 版本 + 命令面 + lint + `vue-tsc`，秒级，适合提交前 |
+| `pnpm run check` | `check:static` + 后端测试 + 前端测试 |
+| `pnpm run test` | 后端测试（`zig build test`） |
+| `pnpm run test:sandbox` | 后端测试的沙箱替代路径（`scripts/run-backend-tests.sh`） |
+| `pnpm run frontend:build` | 构建前端 |
+| `pnpm run frontend:dev` | 只起 Vite；浏览器预览自动走 fixture |
+| `pnpm run frontend:test` | 前端测试（沙箱内改用 `frontend:test:sandbox`） |
+| `pnpm run lint` | 前端 oxlint |
+| `pnpm run format` / `format:check` | 前端 oxfmt + `zig fmt`（见下） |
+| `pnpm run version:set 2.1.0` | 改版本并同步全部派生字段 |
+| `pnpm run version:check` | 校验 `app.json.version` 与派生字段一致 |
+| `pnpm run bridge:check` | 校验 `app.json` ↔ Zig 命令表 ↔ 前端调度器一致 |
+| `pnpm run native:check` | `native check . --strict` |
+
+> `format:check` **故意不在** `check` 里：仓库目前 CRLF/LF 混用，`zig fmt --check` 会把
+> 一批本来就符合 Zig 风格、只是行尾为 CRLF 的文件判为「需格式化」，`oxfmt --check` 也会
+> 报 90+ 个既有文件。要启用这道门之前，先单独跑一次 `pnpm run format` 并作为一次纯格式提交。
 
 > 前端依赖**必须**用 pnpm：仓库提交的是 `frontend/pnpm-lock.yaml`。
 > 用 `npm install --prefix frontend` 会把仓库根的 `package.json`（它只为
@@ -53,13 +66,29 @@ Native SDK 路径、开发端口、LCU 常规/2999 探测超时、证书策略�
 
 受控网络验证使用 `node scripts/verify-network.mjs -Dnative-sdk-path=<SDK路径>`；只读客户端验证使用 `zig build verify-runtime -Dplatform=null -Dnative-sdk-path=<SDK路径>`。后者仅在内存中缓存读取结果，不发送聊天或执行自动化。
 
-改造状态、实测边界和本轮分发产物见 [改造结果与验收方案](docs/IMPROVEMENT_PLAN.md)。
+本轮改造（版本单一源、命令面一致性防线、脚本面统一）与后续计划见 [改造方案](docs/REFACTOR_PLAN_2026-09-22.md)；上一轮后端竖切的进度见 [架构评估 2026-09-13](docs/ARCHITECTURE_REVIEW_2026-09-13.md)。
+
+## 版本与命令面
+
+- **应用版本只有一个手工维护来源：`app.json` 的 `version`。**
+  Zig 侧（`main.zig` / `backend.zig`）通过 `build.zig` 生成的 `app_manifest_zon` 读取，
+  前端 fixture 之外不再有源码副本。改版本用 `pnpm run version:set <SemVer>`，
+  它会同步根/前端 `package.json`、`package-lock.json`、`build.zig.zon` 和浏览器预览 fixture；
+  `pnpm run version:check` 会一并断言 `src/` 下没有硬编码的当前版本字面量。
+- **命令面只有一个 Zig 真相来源：`src/backend.zig` 的 `command_table`。**
+  每个命令的名字和并发通道写在同一行，`command_names`、`commandLane()`、bridge policy 和
+  后端测试都从它派生。新增命令的顺序是：加 `command_table` 一行 → 在 `app.json` 的
+  `bridge.commands` 声明 → 补前端 `services/native.ts` 适配函数与调度通道。
+  `pnpm run bridge:check` 会校验 `app.json` ↔ Zig 命令表 ↔ 前端调度器三者一致。
+  （2026-09-22 之前这里没有防线，`lol.get_jungle_path`、`lol.search_summoner`、
+  `lol.get_player_tags`、`lol.update_player_tag` 四条命令在 Zig 注册了但清单一直没声明。）
 
 ## Bridge 约定
 
 前端统一通过 `frontend/src/services/native.ts` 调用 `window.zero`。业务命令使用
 `lol.<operation>` 命名空间，事件使用 `window.zero.on(name, callback)`。命令必须同时在
-`src/main.zig` 注册 handler、在 `app.json` 的 `bridge.commands` 中声明，并绑定精确 origin。
+`src/backend.zig` 的 `command_table` 注册 handler、在 `app.json` 的 `bridge.commands` 中声明，
+并绑定精确 origin；三者的一致性由 `pnpm run bridge:check` 守住。
 
 LCU token、lockfile、SQLite 连接和 Windows 输入模拟永远不进入 Vue 页面。WebView2 页面没有
 `fs`、进程枚举、全局键盘钩子或可绕过 LCU 自签名证书校验的网络权限，因此不能把这些逻辑
@@ -88,7 +117,7 @@ zig-out/package/lol-desktop-native.exe
 
 这是可直接分发的单个 exe：前端 `dist`、Fixture 图标和 Windows `WebView2Loader.dll` 都已
 嵌入二进制。首次启动会自动解包到当前用户的运行缓存目录（Windows 为
-`%LOCALAPPDATA%/lol-desktop-native/runtime/2.0.0`），因此 exe 不依赖旁边的
+`%LOCALAPPDATA%/lol-desktop-native/runtime/<应用版本>-<内容哈希>`，两者都由构建期注入），因此 exe 不依赖旁边的
 `resources/frontend/dist` 或 DLL。若需要查看 Native SDK 的原始 staging 目录，使用
 `scripts/build.ps1 -NoArchive`（或 `scripts/build.sh --no-archive`）；此模式不会删除
 `bin/`、`resources/` 等调试文件。

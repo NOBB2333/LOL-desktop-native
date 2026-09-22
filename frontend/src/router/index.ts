@@ -11,6 +11,7 @@ const router = createRouter({
     { path: "/automation", name: "automation", component: () => import("../views/AutomationView.vue"), meta: { title: "自动化" } },
     { path: "/history", name: "history", component: () => import("../views/HistoryView.vue"), meta: { title: "历史" } },
     { path: "/friends", name: "friends", component: () => import("../views/FriendsView.vue"), meta: { title: "好友工具" } },
+    { path: "/toolkit", name: "toolkit", component: () => import("../views/ToolboxView.vue"), meta: { title: "工具箱" } },
     { path: "/settings", name: "settings", component: () => import("../views/SettingsView.vue"), meta: { title: "设置" } },
   ],
 });

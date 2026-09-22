@@ -38,7 +38,7 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
     <nav class="settings-nav" aria-label="设置分区">
       <a href="#settings-data" class="settings-nav__item" @click.prevent="scrollToSection('settings-data')">
         <Database :size="15" />
-        <span>数据与缓存</span>
+        <span>数据源与缓存</span>
         <i class="settings-nav__arrow">›</i>
       </a>
       <a href="#settings-appearance" class="settings-nav__item" @click.prevent="scrollToSection('settings-appearance')">
@@ -53,10 +53,10 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
       </a>
       <a href="#settings-connection" class="settings-nav__item" @click.prevent="scrollToSection('settings-connection')">
         <Server :size="15" />
-        <span>连接方式</span>
+        <span>账号与连接</span>
         <i class="settings-nav__arrow">›</i>
       </a>
-      <a href="#settings-ai" class="settings-nav__item" @click.prevent="scrollToSection('settings-ai')">
+      <a href="#settings-about" class="settings-nav__item" @click.prevent="scrollToSection('settings-about')">
         <MonitorCog :size="15" />
         <span>应用信息</span>
         <i class="settings-nav__arrow">›</i>
@@ -328,7 +328,7 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
       </section>
 
       <!-- 应用信息 -->
-      <section id="settings-ai" class="settings-section">
+      <section id="settings-about" class="settings-section">
         <header class="settings-section__header">
           <div class="settings-section__icon-wrap">
             <MonitorCog :size="17" />

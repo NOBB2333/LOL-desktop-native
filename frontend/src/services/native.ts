@@ -60,7 +60,16 @@ export function createCommandScheduler() {
     if (name === "lol.get_live_roster") return roster(task);
     if (name === "lol.get_lcu_events") return events(task);
     if (name === "lol.refresh_connection") return connection(task);
-    if (["lol.send_shortcut", "lol.delete_friend", "lol.run_automation"].includes(name)) return action(task);
+    // 与后端 `command_table` 的 action 通道逐项对应（`pnpm run bridge:check` 会校验）。
+    if ([
+      "lol.send_shortcut",
+      "lol.delete_friend",
+      "lol.delete_friends",
+      "lol.run_automation",
+      "lol.claim",
+      "lol.gameflow_action",
+      "lol.spectate",
+    ].includes(name)) return action(task);
     if (["lol.get_config", "lol.save_config", "lol.set_shortcut_capture", "lol.set_data_mode", "lol.get_live_lobby", "lol.get_shortcut_events", "lol.open_game_view", "lol.validate_shortcut_template"].includes(name)) return state(task);
     return query(task);
   };

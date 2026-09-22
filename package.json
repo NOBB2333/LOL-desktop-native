@@ -2,11 +2,44 @@
   "name": "lol-desktop-native-root",
   "private": true,
   "version": "2.0.0",
-  "description": "Host dependency for the Zig build. build.zig resolves @native-sdk/cli from node_modules/ and runs `pnpm --dir frontend install`, which requires a package.json in the repository root.",
+  "description": "Host dependency for the Zig build. build.zig resolves @native-sdk/cli from node_modules/ and drives the frontend through pnpm; this root package.json exists so both resolve from the repository root.",
   "engines": {
     "node": ">=24"
   },
+  "scripts": {
+    "version:set": "node scripts/version.mjs set",
+    "version:sync": "node scripts/version.mjs sync",
+    "version:check": "node scripts/version.mjs check",
+    "bridge:check": "node scripts/check-bridge-parity.mjs",
+
+    "test": "zig build test -Dplatform=null",
+    "test:sandbox": "bash scripts/run-backend-tests.sh",
+    "native:check": "native check . --strict",
+    "verify:network": "node scripts/verify-network.mjs",
+
+    "frontend:install": "pnpm --dir frontend install",
+    "frontend:dev": "pnpm --dir frontend run dev",
+    "frontend:build": "pnpm --dir frontend run build",
+    "frontend:typecheck": "pnpm --dir frontend run typecheck",
+    "frontend:test": "pnpm --dir frontend test",
+    "frontend:test:sandbox": "pnpm --dir frontend run test:sandbox",
+    "frontend:lint": "pnpm --dir frontend run lint",
+
+    "lint": "pnpm run frontend:lint",
+    "format:frontend": "pnpm --dir frontend run format",
+    "format:zig": "zig fmt build.zig build.zig.zon src",
+    "format": "pnpm run format:frontend && pnpm run format:zig",
+    "format:check": "pnpm --dir frontend run format:check && zig fmt --check build.zig build.zig.zon src",
+
+    "check": "pnpm run version:check && pnpm run bridge:check && pnpm run lint && pnpm run frontend:typecheck && pnpm run test && pnpm run frontend:test",
+    "check:static": "pnpm run version:check && pnpm run bridge:check && pnpm run lint && pnpm run frontend:typecheck"
+  },
   "dependencies": {
     "@native-sdk/cli": "0.10.1"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "scriptc"
+    ]
   }
 }

@@ -127,7 +127,7 @@ const App = struct {
     fn ping(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
         _ = invocation;
         _ = context;
-        return std.fmt.bufPrint(output, "{{\"name\":\"lol-desktop-native\",\"version\":\"2.0.0\",\"ready\":true}}", .{});
+        return std.fmt.bufPrint(output, "{{\"name\":\"lol-desktop-native\",\"version\":\"{s}\",\"ready\":true}}", .{app_manifest.version});
     }
 
     fn bridge(self: *@This()) native_sdk.BridgeDispatcher {
@@ -458,7 +458,9 @@ fn extractEmbeddedAssets(allocator: std.mem.Allocator, io: std.Io, env_map: *con
         env_map.get("XDG_CACHE_HOME") orelse env_map.get("HOME") orelse ".";
     var root_buf: [1024]u8 = undefined;
     const bundle_hash = std.hash.Wyhash.hash(0, embedded_assets.bytes);
-    const runtime_root = std.fmt.bufPrint(&root_buf, "{s}/lol-desktop-native/runtime/2.0.0-{x}", .{ root, bundle_hash }) catch return null;
+    // 缓存目录本身已按内容哈希寻址，版本前缀只用于排查；
+    // 从 manifest 读取，避免发版时漏改。
+    const runtime_root = std.fmt.bufPrint(&root_buf, "{s}/lol-desktop-native/runtime/{s}-{x}", .{ root, app_manifest.version, bundle_hash }) catch return null;
     std.Io.Dir.cwd().createDirPath(io, runtime_root) catch return null;
     var dir = std.Io.Dir.cwd().openDir(io, runtime_root, .{}) catch return null;
     defer dir.close(io);
@@ -709,7 +711,7 @@ pub fn main(init: std.process.Init) !void {
         .env_map = init.environ_map,
         .dist_path = dist_path,
         .icon_path = productionIconPath(std.heap.page_allocator, init.io, dist_path),
-        .runtime = backend.Runtime.initWithIo(init.io, init.environ_map),
+        .runtime = backend.Runtime.initWithIo(init.io, init.environ_map, app_manifest.version),
     };
     defer app.runtime.deinit();
     try runner.runWithOptions(app.app(), .{

@@ -12,7 +12,10 @@
     "prebuild": "node scripts/clean-dist.mjs",
     "typecheck": "vue-tsc --noEmit",
     "test": "vitest run",
+    "test:sandbox": "vitest run --no-file-parallelism",
     "lint": "oxlint src",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
     "preview": "vite preview"
   },
   "dependencies": {

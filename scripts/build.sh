@@ -3,6 +3,8 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 CONFIG="$ROOT/config/native.json"
 TARGET="$(node -e 'console.log(require(process.argv[1]).package.target)' "$CONFIG")"
+# 打包目录名必须与 build.zig 的 --output 一致，因此同样从 app.json 取版本。
+VERSION="$(node -e 'console.log(require(process.argv[1]).version)' "$ROOT/app.json")"
 ARCHIVE_DISABLED=0
 SINGLE_FILE="$(node -e 'console.log(require(process.argv[1]).package.singleFile !== false)' "$CONFIG")"
 for ARG in "$@"; do
@@ -25,7 +27,7 @@ command -v zig >/dev/null
 node "$ROOT/scripts/sync-native-config.mjs"
 cd "$ROOT"
 zig build package "-Dpackage-target=$TARGET" "-Dplatform=$TARGET" "-Dnative-sdk-path=$SDK" -Dpackage-archive=false
-PACKAGE_DIR="$ROOT/zig-out/package/lol-desktop-native-2.0.0-$TARGET-ReleaseFast"
+PACKAGE_DIR="$ROOT/zig-out/package/lol-desktop-native-$VERSION-$TARGET-ReleaseFast"
 if [ "$ARCHIVE_DISABLED" != 1 ] && [ "$SINGLE_FILE" = true ] && [ -d "$PACKAGE_DIR" ]; then
   BINARY="$PACKAGE_DIR/bin/lol-desktop-native"
   SINGLE_EXE="$ROOT/zig-out/package/lol-desktop-native"
@@ -35,7 +37,7 @@ if [ "$ARCHIVE_DISABLED" != 1 ] && [ "$SINGLE_FILE" = true ] && [ -d "$PACKAGE_D
   rm -rf "$PACKAGE_DIR"
   printf 'Single-file executable: %s/zig-out/package/lol-desktop-native\n' "$ROOT"
 elif [ "$ARCHIVE_DISABLED" != 1 ] && [ -d "$PACKAGE_DIR" ] && command -v zip >/dev/null 2>&1; then
-  ARCHIVE="$ROOT/zig-out/package/lol-desktop-native-2.0.0-$TARGET-ReleaseFast.zip"
+  ARCHIVE="$ROOT/zig-out/package/lol-desktop-native-$VERSION-$TARGET-ReleaseFast.zip"
   rm -f "$ARCHIVE"
   (cd "$PACKAGE_DIR" && zip -qr "$ARCHIVE" .)
   printf 'Package archive: %s\n' "$ARCHIVE"

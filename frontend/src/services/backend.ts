@@ -12,14 +12,21 @@ import type {
   AppConfig,
   AssetPayload,
   ChampionOverview,
+  ClaimOutcome,
+  ClaimSnapshot,
+  ClaimSource,
   DataMode,
   EncounterRecord,
   FinalBpRecord,
+  FriendDeleteOutcome,
   FriendToolsSnapshot,
+  GameflowActionKey,
+  GameflowActionResult,
   JunglePathMap,
   LiveLobby,
   MatchSummary,
   ShortcutValidation,
+  SpectateResult,
   SummonerSearchResult,
 } from "../types/domain";
 import { createShortcutSendQueue } from "../shortcuts/sendQueue";
@@ -220,6 +227,51 @@ export const backend = {
       return;
     }
     await command("delete_friend", { id });
+  },
+  /**
+   * 批量删除好友。
+   *
+   * 后端逐条删、逐条回报，所以**不会因为其中一个失败就整批抛错**：返回值里
+   * `failed > 0` 时去 `results` 里挑 `ok === false` 的那些看原因。
+   */
+  async deleteFriends(ids: string[]): Promise<FriendDeleteOutcome> {
+    const targets = [...new Set(ids.map((id) => id?.trim()).filter(Boolean))];
+    if (!targets.length) return { results: [], deleted: 0, failed: 0 };
+    if (usesFixtureData()) return browserBackend.deleteFriends(targets);
+    return command("delete_friends", { ids: targets });
+  },
+  /**
+   * 观战。
+   *
+   * 只有「在线且正在对局中」的好友拿得到观战密钥，其余情况后端会返回
+   * `ok: false` 与一句能直接展示的原因——所以调用方**不要**把它当成异常来处理。
+   */
+  async spectate(puuid: string): Promise<SpectateResult> {
+    const target = puuid?.trim() ?? "";
+    if (!target) throw new Error("缺少玩家标识，无法观战");
+    if (usesFixtureData()) return browserBackend.spectate(target);
+    return command("spectate", { puuid: target });
+  },
+  /** 当前能领的东西（只读）。`total === 0` 表示没有可领的。 */
+  async claims(): Promise<ClaimSnapshot> {
+    if (usesFixtureData()) return browserBackend.claims();
+    return command("get_claims");
+  },
+  /**
+   * 领取。
+   *
+   * `source` 传 `"all"` 表示三个来源全领；`keys` 为空表示该来源下所有可领的都领，
+   * 也可以只传想领的那几个 `ClaimItem.key`。逐项提交，成功失败混在
+   * `claimed` 里（有 `reason` 就是没领成）。
+   */
+  async claim(source: ClaimSource | "all", keys: string[] = []): Promise<ClaimOutcome> {
+    if (usesFixtureData()) return browserBackend.claim(source, keys);
+    return command("claim", { source, keys });
+  },
+  /** 客户端急救动作。永远返回结构化结果，失败时 `reason` 是给人看的一句话。 */
+  async gameflowAction(action: GameflowActionKey): Promise<GameflowActionResult> {
+    if (usesFixtureData()) return browserBackend.gameflowAction(action);
+    return command("gameflow_action", { action });
   },
   async bpHistory(): Promise<FinalBpRecord[]> {
     if (usesFixtureData()) return browserBackend.bpHistory();

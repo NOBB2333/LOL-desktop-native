@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { CalendarDays, ClipboardList, Eye, Shield, UsersRound } from "@lucide/vue";
-import { NButton, NTag } from "naive-ui";
+import { CalendarDays, ClipboardList, Eye, Search, Shield, UsersRound } from "@lucide/vue";
+import { NButton, NInput, NTag } from "naive-ui";
 import { computed, ref } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 import AssetIcon from "../components/AssetIcon.vue";
@@ -9,6 +9,7 @@ import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import { championImage, relativeTime } from "../utils/format";
 import { queueLabel } from "../utils/queue";
+import { scorePlayerName } from "../matches/localPlayers";
 
 const app = useAppStore();
 const tab = ref<"bp" | "encounters">("bp");
@@ -18,6 +19,20 @@ const champions = useQuery({ queryKey: computed(() => ["champions", app.mode]), 
 const championIds = computed(() => new Map((champions.data.value ?? []).map((champion) => [champion.name.trim(), champion.id])));
 const championIdFor = (name: string, recordedId = 0) => recordedId > 0 ? recordedId : championIds.value.get(name.trim()) ?? 0;
 const scoreTone = (ally: number, enemy: number) => ally >= enemy ? "ally" : "enemy";
+/**
+ * 玩家档案的本地模糊筛选。
+ *
+ * 只用**已经取回来的**本地记录过一遍，不发请求；判分规则与战绩页的
+ * 「本地见过的玩家」兜底完全共用（`matches/localPlayers.ts`），
+ * 所以两边「像不像」的标准不会漂。
+ */
+const playerQuery = ref("");
+const visibleEncounters = computed(() => {
+  const list = encounters.data.value ?? [];
+  const query = playerQuery.value.trim();
+  if (!query) return list;
+  return list.filter((record) => scorePlayerName(query, record.gameName, record.tagLine ?? "") !== null);
+});
 </script>
 
 <template>
@@ -141,13 +156,22 @@ const scoreTone = (ally: number, enemy: number) => ally >= enemy ? "ally" : "ene
           <h2>遇到的玩家</h2>
           <p>按 PUUID 记录最近遇到的队友和对手，点击战绩页可以继续查看完整数据。</p>
         </div>
-        <span class="history-count">{{ encounters.data.value?.length ?? 0 }} <small>人</small></span>
+        <div class="history-archive-tools">
+          <NInput v-model:value="playerQuery" size="small" clearable placeholder="按名字模糊筛选"><template #prefix><Search :size="14" /></template></NInput>
+          <span class="history-count">{{ visibleEncounters.length }} <small>/ {{ encounters.data.value?.length ?? 0 }} 条</small></span>
+        </div>
       </header>
 
       <div v-if="!encounters.data.value?.length" class="history-empty">
         <UsersRound :size="24" />
         <strong>还没有遇到玩家记录</strong>
         <span>对局页获取到十人阵容后，会自动保存玩家摘要。</span>
+      </div>
+
+      <div v-else-if="!visibleEncounters.length" class="history-empty">
+        <Search :size="24" />
+        <strong>本地档案里没有匹配的玩家</strong>
+        <span>这里只搜你已经遇到过的人，不会去查其他大区的同名账号。</span>
       </div>
 
       <div v-else class="encounter-table">
@@ -159,7 +183,7 @@ const scoreTone = (ally: number, enemy: number) => ally >= enemy ? "ally" : "ene
           <span>时间</span>
         </div>
         <div
-          v-for="record in encounters.data.value ?? []"
+          v-for="record in visibleEncounters"
           :key="`${record.gameId}-${record.puuid}`"
           class="encounter-table__row"
         >
@@ -247,6 +271,8 @@ const scoreTone = (ally: number, enemy: number) => ally >= enemy ? "ally" : "ene
 .history-section__header p { margin: 0; color: var(--text-secondary); font-size: 11px; }
 .history-count { flex: 0 0 auto; text-align: right; font-size: 24px; font-weight: 700; color: var(--accent); line-height: 1; font-variant-numeric: tabular-nums; }
 .history-count small { font-size: 12px; font-weight: 400; color: var(--text-secondary); margin-left: 3px; }
+.history-archive-tools { display: flex; align-items: center; gap: 12px; flex: 0 0 auto; }
+.history-archive-tools .n-input { width: min(200px, 34vw); }
 
 /* 空状态 */
 .history-empty {

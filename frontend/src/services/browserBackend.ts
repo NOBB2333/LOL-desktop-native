@@ -16,6 +16,7 @@ import {
   fixtureBootstrap,
   fixtureBpHistory,
   fixtureChampions,
+  fixtureClaims,
   fixtureConfig,
   fixtureEncounters,
   fixtureFriends,
@@ -30,15 +31,23 @@ import type {
   AppBootstrap,
   AppConfig,
   ChampionOverview,
+  ClaimItem,
+  ClaimOutcome,
+  ClaimSnapshot,
+  ClaimSource,
   DataMode,
   EncounterRecord,
   FinalBpRecord,
+  FriendDeleteOutcome,
+  FriendDeleteResultEntry,
   FriendToolsSnapshot,
+  GameflowActionResult,
   JunglePathMap,
   LiveLobby,
   MatchSummary,
   PlayerProfile,
   ShortcutValidation,
+  SpectateResult,
 } from "../types/domain";
 
 /**
@@ -52,6 +61,8 @@ export const browserState = {
   /** 配置缓存：两条路径共用；native 下每次读写后端后同步到这里。 */
   config: structuredClone(fixtureConfig),
   friends: structuredClone(fixtureFriends),
+  /** 浏览器预览下的可领清单，领取后就地从这里减掉，方便演示「领完变空」。 */
+  claims: structuredClone(fixtureClaims),
   /** 浏览器预览下的玩家标记，写在内存里方便演示。 */
   playerTags: {} as Record<string, string[]>,
 };
@@ -232,6 +243,48 @@ export const browserBackend = {
   },
   deleteFriend(id: string): void {
     browserState.friends.friends = browserState.friends.friends.filter((friend) => friend.id !== id);
+  },
+  /**
+   * 批量删除。原生侧逐条回报，这里也保持同一形状（含失败原因字段），
+   * 免得界面在预览和真机下走两条分支。
+   */
+  deleteFriends(ids: string[]): FriendDeleteOutcome {
+    const removing = new Set(ids);
+    const results: FriendDeleteResultEntry[] = ids.map((id) => ({ id, ok: true, reason: "" }));
+    browserState.friends.friends = browserState.friends.friends.filter((friend) => !removing.has(friend.id));
+    return { results, deleted: results.length, failed: 0 };
+  },
+  claims(): ClaimSnapshot {
+    return structuredClone(browserState.claims);
+  },
+  claim(source: ClaimSource | "all", keys: string[]): ClaimOutcome {
+    const matches = (item: ClaimItem) =>
+      (source === "all" || item.source === source) && (!keys.length || keys.includes(item.key));
+    const claimed = browserState.claims.items.filter(matches);
+    // 与原生一致：领过的条目就不该再出现在「可领」清单里。
+    browserState.claims.items = browserState.claims.items.filter((item) => !matches(item));
+    for (const summary of browserState.claims.sources) summary.count = browserState.claims.items.filter((item) => item.source === summary.source).length;
+    browserState.claims.total = browserState.claims.items.length;
+    return {
+      claimed: claimed.map((item) => ({ source: item.source, id: item.id, title: item.title, detail: item.detail })),
+      claimedCount: claimed.length,
+      failedCount: 0,
+    };
+  },
+  /**
+   * 浏览器预览里没有 LCU，急救动作没有对象可施。
+   *
+   * 这里**不抛错**而是回报 `ok: false`：页面本来就是靠 `reason` 这一行告诉用户
+   * 「为什么没生效」，预览下正好把这套展示跑通。
+   */
+  gameflowAction(action: string): GameflowActionResult {
+    return { action, ok: false, phase: "", reason: "浏览器预览不支持客户端操作" };
+  },
+  spectate(puuid: string): SpectateResult {
+    const friend = browserState.friends.friends.find((item) => item.puuid === puuid);
+    if (!friend) return { ok: false, reason: "只能观战好友，这位不在好友列表里" };
+    if (!friend.canSpectate) return { ok: false, reason: "这位好友现在不在选人也不在对局中，拿不到观战密钥" };
+    return { ok: true, reason: "" };
   },
   bpHistory(): FinalBpRecord[] {
     return structuredClone(fixtureBpHistory);

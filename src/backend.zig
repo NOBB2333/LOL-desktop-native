@@ -19,6 +19,8 @@ const events_ipc = @import("backend/events_ipc.zig");
 const player_tags_ipc = @import("backend/player_tags_ipc.zig");
 const friends_ipc = @import("backend/friends_ipc.zig");
 const assets_ipc = @import("backend/assets_ipc.zig");
+const claim_ipc = @import("backend/claim_ipc.zig");
+const gameflow_ipc = @import("backend/gameflow_ipc.zig");
 
 const fallback_data_dir = std.fmt.comptimePrint(".{s}", .{build_options.data_dir_name});
 
@@ -245,38 +247,79 @@ fn flushLiveLobbyPersist(self: *Runtime) void {
     self.live_lobby_persist_pending = false;
 }
 
-pub const command_names = [_][]const u8{
-    "lol.get_bootstrap",
-    "lol.get_config",
-    "lol.save_config",
-    "lol.set_shortcut_capture",
-    "lol.set_data_mode",
-    "lol.refresh_connection",
-    "lol.get_live_lobby",
-    "lol.get_live_roster",
-    "lol.get_match_history",
-    "lol.get_match_detail",
-    "lol.get_jungle_path",
-    "lol.search_summoner",
-    "lol.get_champions",
-    "lol.get_asset",
-    "lol.get_encounters",
-    "lol.get_friends",
-    "lol.get_friend_last_game",
-    "lol.delete_friend",
-    "lol.get_bp_history",
-    "lol.save_match_export",
-    "lol.send_shortcut",
-    "lol.preview_shortcut",
-    "lol.run_automation",
-    "lol.validate_shortcut_template",
-    "lol.check_update",
-    "lol.open_game_view",
-    "lol.get_lcu_events",
-    "lol.get_shortcut_events",
-    "lol.get_player_tags",
-    "lol.update_player_tag",
+/// 命令表是命令面唯一的真相来源：命令名和它所属的并发通道写在同一行。
+/// `command_names`（供 bridge 策略与 handler 注册表对齐）和 `commandLane()`
+/// 都由这张表派生，新增命令只需要在这里加一行。
+///
+/// 通道选择的理由见 `.lane` 上的内联注释；默认通道是 `.query`。
+pub const CommandSpec = struct {
+    name: []const u8,
+    lane: CommandLane,
 };
+
+pub const command_table = [_]CommandSpec{
+    .{ .name = "lol.get_bootstrap", .lane = .query },
+    .{ .name = "lol.get_config", .lane = .state },
+    .{ .name = "lol.save_config", .lane = .state },
+    .{ .name = "lol.set_shortcut_capture", .lane = .state },
+    .{ .name = "lol.set_data_mode", .lane = .state },
+    .{ .name = "lol.refresh_connection", .lane = .connection },
+    // get_live_lobby 与 get_live_roster 共享 lobby 合并状态机，前者写状态、
+    // 后者只读，因此分开走 state / roster 通道。
+    .{ .name = "lol.get_live_lobby", .lane = .state },
+    .{ .name = "lol.get_live_roster", .lane = .roster },
+    .{ .name = "lol.get_match_history", .lane = .query },
+    .{ .name = "lol.get_match_detail", .lane = .query },
+    .{ .name = "lol.get_jungle_path", .lane = .query },
+    .{ .name = "lol.search_summoner", .lane = .query },
+    .{ .name = "lol.get_champions", .lane = .query },
+    .{ .name = "lol.get_asset", .lane = .query },
+    .{ .name = "lol.get_encounters", .lane = .query },
+    .{ .name = "lol.get_friends", .lane = .query },
+    .{ .name = "lol.get_friend_last_game", .lane = .query },
+    .{ .name = "lol.delete_friend", .lane = .action },
+    .{ .name = "lol.get_bp_history", .lane = .query },
+    .{ .name = "lol.save_match_export", .lane = .query },
+    .{ .name = "lol.send_shortcut", .lane = .action },
+    .{ .name = "lol.preview_shortcut", .lane = .query },
+    .{ .name = "lol.run_automation", .lane = .action },
+    .{ .name = "lol.validate_shortcut_template", .lane = .state },
+    .{ .name = "lol.check_update", .lane = .query },
+    .{ .name = "lol.open_game_view", .lane = .state },
+    // 事件轮询每 750ms 发 6~9 个 LCU 请求，和阵容查询挤在一条 lane 上时，
+    // 阵容结果要排在它后面才能执行，因此单独一条通道。
+    .{ .name = "lol.get_lcu_events", .lane = .events },
+    .{ .name = "lol.get_shortcut_events", .lane = .state },
+    .{ .name = "lol.get_player_tags", .lane = .query },
+    .{ .name = "lol.update_player_tag", .lane = .query },
+    // 工具箱：领取与进行时操作都会改客户端状态，走 action 通道，别和查询抢。
+    .{ .name = "lol.get_claims", .lane = .query },
+    .{ .name = "lol.claim", .lane = .action },
+    .{ .name = "lol.gameflow_action", .lane = .action },
+    .{ .name = "lol.delete_friends", .lane = .action },
+    .{ .name = "lol.spectate", .lane = .action },
+};
+
+pub const command_names = blk: {
+    var names: [command_table.len][]const u8 = undefined;
+    for (command_table, 0..) |spec, index| names[index] = spec.name;
+    break :blk names;
+};
+
+test "命令表与 handler 注册表逐项对应" {
+    var state = Runtime.init();
+    const handlers = state.handlers();
+    try std.testing.expectEqual(command_table.len, handlers.len);
+    for (handlers, 0..) |handler, index| {
+        // 顺序也要一致：main.zig 依赖 handlers() 的下标去填充 async_contexts。
+        try std.testing.expectEqualStrings(command_table[index].name, handler.name);
+        try std.testing.expectEqual(command_table[index].lane, commandLane(handler.name));
+    }
+}
+
+test "未登记命令回落到默认 query 通道" {
+    try std.testing.expectEqual(CommandLane.query, commandLane("lol.not_registered"));
+}
 
 const default_config =
     "{\"version\":21,\"appearance\":{\"theme\":\"system\",\"colorMode\":\"dark\",\"compact\":false}," ++
@@ -313,6 +356,9 @@ pub const Runtime = struct {
     // 手动自动化与后台检查共用互斥锁，避免重复接受同一次匹配。
     automation_mutex: std.atomic.Mutex = .unlocked,
     mode: Mode = .live,
+    // 应用版本由 composition root 注入：main.zig 读取 build.zig 从 app.json
+    // 生成的 app_manifest_zon，后端不再保存版本字面量。
+    app_version: []const u8 = "unknown",
     config: [65536]u8 = undefined,
     config_len: usize = 0,
     io: ?std.Io = null,
@@ -380,8 +426,9 @@ pub const Runtime = struct {
         return state;
     }
 
-    pub fn initWithIo(io: std.Io, env_map: *std.process.Environ.Map) Runtime {
+    pub fn initWithIo(io: std.Io, env_map: *std.process.Environ.Map, app_version: []const u8) Runtime {
         var state = init();
+        state.app_version = app_version;
         state.io = io;
         state.env_map = env_map;
         var resolved_buffer: [path_capacity]u8 = undefined;
@@ -612,6 +659,11 @@ pub const Runtime = struct {
             .{ .name = "lol.get_shortcut_events", .context = self, .invoke_fn = events_ipc.getShortcutEvents },
             .{ .name = "lol.get_player_tags", .context = self, .invoke_fn = player_tags_ipc.getPlayerTags },
             .{ .name = "lol.update_player_tag", .context = self, .invoke_fn = player_tags_ipc.updatePlayerTag },
+            .{ .name = "lol.get_claims", .context = self, .invoke_fn = claim_ipc.getClaims },
+            .{ .name = "lol.claim", .context = self, .invoke_fn = claim_ipc.claim },
+            .{ .name = "lol.gameflow_action", .context = self, .invoke_fn = gameflow_ipc.action },
+            .{ .name = "lol.delete_friends", .context = self, .invoke_fn = friends_ipc.deleteFriends },
+            .{ .name = "lol.spectate", .context = self, .invoke_fn = friends_ipc.spectate },
         };
     }
 };
@@ -636,17 +688,11 @@ pub fn validateActionTicket(self: *Runtime, ticket: ActionTicket) !void {
     if (ticket.request != current.request or ticket.session != current.session) return error.RequestCancelled;
 }
 
+/// 通道查表。未登记的命令走默认的 `.query`；表是唯一真相来源，
+/// 不再有第二份命令名列表需要同步。
 pub fn commandLane(name: []const u8) CommandLane {
-    if (std.mem.eql(u8, name, "lol.get_live_roster")) return .roster;
-    // 事件轮询每 750ms 发 6~9 个 LCU 请求，和阵容查询挤在一条 lane 上时，
-    // 阵容结果要排在它后面才能执行。
-    if (std.mem.eql(u8, name, "lol.get_lcu_events")) return .events;
-    if (std.mem.eql(u8, name, "lol.refresh_connection")) return .connection;
-    for ([_][]const u8{ "lol.send_shortcut", "lol.delete_friend", "lol.run_automation" }) |item| {
-        if (std.mem.eql(u8, name, item)) return .action;
-    }
-    for ([_][]const u8{ "lol.get_config", "lol.save_config", "lol.set_shortcut_capture", "lol.set_data_mode", "lol.get_live_lobby", "lol.get_shortcut_events", "lol.open_game_view", "lol.validate_shortcut_template" }) |item| {
-        if (std.mem.eql(u8, name, item)) return .state;
+    for (command_table) |spec| {
+        if (std.mem.eql(u8, name, spec.name)) return spec.lane;
     }
     return .query;
 }
@@ -655,7 +701,7 @@ fn querySnapshot(self: *Runtime) !*Runtime {
     const snapshot = try std.heap.page_allocator.create(Runtime);
     snapshot.* = Runtime.init();
     // 数据缓冲区独占，数据库连接由父运行时保管，所有工作线程退出后才能关闭。
-    inline for (.{ "mode", "config", "config_len", "io", "env_map", "storage", "connection", "connection_len", "live_lobby", "live_lobby_len", "champ_select_lobby", "champ_select_lobby_len", "champ_select_game_id", "last_live_phase", "last_live_phase_len", "champ_select_handoff_active", "live_roster_hash", "live_lobby_enriched", "live_owner_puuid", "live_owner_puuid_len", "event_state", "request_generation", "data_dir_path", "data_dir_path_len", "config_path_buffer", "config_path_len", "database_path_buffer", "database_path_len", "bp_history_path_buffer", "bp_history_path_len", "force_profile_refresh", "bp_snapshot_fingerprint" }) |field| {
+    inline for (.{ "mode", "app_version", "config", "config_len", "io", "env_map", "storage", "connection", "connection_len", "live_lobby", "live_lobby_len", "champ_select_lobby", "champ_select_lobby_len", "champ_select_game_id", "last_live_phase", "last_live_phase_len", "champ_select_handoff_active", "live_roster_hash", "live_lobby_enriched", "live_owner_puuid", "live_owner_puuid_len", "event_state", "request_generation", "data_dir_path", "data_dir_path_len", "config_path_buffer", "config_path_len", "database_path_buffer", "database_path_len", "bp_history_path_buffer", "bp_history_path_len", "force_profile_refresh", "bp_snapshot_fingerprint" }) |field| {
         @field(snapshot, field) = @field(self, field);
     }
     snapshot.is_snapshot = true;
@@ -945,7 +991,9 @@ fn getBootstrap(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
     try jsonString(&writer, self.databasePath());
     try writer.writeAll(",\"appDataPath\":");
     try jsonString(&writer, self.dataDir());
-    try writer.writeAll(",\"appVersion\":\"2.0.0\"}");
+    try writer.writeAll(",\"appVersion\":");
+    try jsonString(&writer, self.app_version);
+    try writer.writeByte('}');
     return writer.buffered();
 }
 
@@ -3807,9 +3855,11 @@ fn checkUpdate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, ou
         .timeout_ms = build_options.lcu_request_timeout_ms,
         .verify_tls = true,
     };
+    // 这里的 "lol-desktop-native/2.0" 是更新源 API 契约版本，与应用版本无关，
+    // 故意保持独立：应用升到 3.x 不应改变服务端的分桶语义。
     const response = try public_client.getPublicUrl(build_options.update_check_url, "lol-desktop-native/2.0");
     defer std.heap.page_allocator.free(response);
-    return updateDto(response, output);
+    return updateDto(response, self.app_version, output);
 }
 
 fn openGameView(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
@@ -3821,11 +3871,13 @@ fn openGameView(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
     return std.fmt.bufPrint(output, "true", .{});
 }
 
-fn updateDto(response: []const u8, output: []u8) ![]const u8 {
+/// `current_version` 由调用方传入（运行中的应用版本，来自 app.json），
+/// 只有更新源版本严格大于当前版本才返回，避免把自己当成新版本。
+fn updateDto(response: []const u8, current_version: []const u8, output: []u8) ![]const u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{}) catch return error.InvalidUpdateResponse;
     defer parsed.deinit();
     const version = jsonField(parsed.value, "version");
-    if (version.len == 0 or compareVersions(version, "2.0.0") <= 0) return std.fmt.bufPrint(output, "null", .{});
+    if (version.len == 0 or compareVersions(version, current_version) <= 0) return std.fmt.bufPrint(output, "null", .{});
     var writer = std.Io.Writer.fixed(output);
     try writer.writeAll("{\"version\":");
     try jsonString(&writer, version);
@@ -7821,10 +7873,13 @@ test "probes active data during idle gameflow transitions" {
 
 test "returns only newer release versions from the configured update feed" {
     var output: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("{\"version\":\"2.1.0\"}", try updateDto("{\"version\":\"2.1.0\"}", &output));
-    try std.testing.expectEqualStrings("null", try updateDto("{\"version\":\"2.0.0\"}", &output));
-    try std.testing.expectEqualStrings("null", try updateDto("{\"version\":\"1.9.9\"}", &output));
-    try std.testing.expectEqual(@as(i8, 1), compareVersions("v2.0.1-beta.1", "2.0.0"));
+    // 用与 app.json 无关的固定夹具版本：测试不再绑死在实际应用版本上，
+    // 这样 version:check 才能断言「src/ 里不出现当前应用版本字面量」。
+    const current = "3.4.1";
+    try std.testing.expectEqualStrings("{\"version\":\"3.5.0\"}", try updateDto("{\"version\":\"3.5.0\"}", current, &output));
+    try std.testing.expectEqualStrings("null", try updateDto("{\"version\":\"3.4.1\"}", current, &output));
+    try std.testing.expectEqualStrings("null", try updateDto("{\"version\":\"3.3.9\"}", current, &output));
+    try std.testing.expectEqual(@as(i8, 1), compareVersions("v3.4.2-beta.1", "3.4.1"));
 }
 
 test "matches modern live client Riot identities and normalized teams" {

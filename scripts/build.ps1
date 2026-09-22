@@ -7,6 +7,9 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $ConfigPath = Join-Path $Root 'config/native.json'
 $Config = Get-Content -Raw -LiteralPath $ConfigPath | ConvertFrom-Json
+# 打包目录名必须与 build.zig 的 --output 一致，因此同样从 app.json 取版本。
+$Manifest = Get-Content -Raw -LiteralPath (Join-Path $Root 'app.json') | ConvertFrom-Json
+$AppVersion = [string]$Manifest.version
 if (-not $Target) { $Target = [string]$Config.package.target }
 $SdkPath = [string]$Config.nativeSdkPath
 if (-not [IO.Path]::IsPathRooted($SdkPath)) { $SdkPath = Join-Path $Root $SdkPath }
@@ -46,7 +49,7 @@ try {
   & zig @ZigArgs
   if ($LASTEXITCODE -ne 0) { throw "zig build failed with exit code $LASTEXITCODE" }
   $PackageRoot = Join-Path $Root 'zig-out/package'
-  $PackageDir = Join-Path $PackageRoot "lol-desktop-native-2.0.0-$Target-ReleaseFast"
+  $PackageDir = Join-Path $PackageRoot "lol-desktop-native-$AppVersion-$Target-ReleaseFast"
   if (-not $NoArchive -and [bool]$Config.package.archive -and [bool]$Config.package.singleFile -and (Test-Path $PackageDir)) {
     $Binary = Join-Path $PackageDir 'bin/lol-desktop-native.exe'
     $SingleExe = Join-Path $PackageRoot 'lol-desktop-native.exe'
