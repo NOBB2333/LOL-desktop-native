@@ -136,9 +136,17 @@ export const backend = {
     if (usesFixtureData()) return { query: trimmed, hasTag, requiresTag: !hasTag, candidates: [] };
     return command("search_summoner", { query: trimmed });
   },
-  async champions(): Promise<ChampionOverview[]> {
+  /**
+   * 英雄目录 + OP.GG 统计。
+   *
+   * `region` / `tier` 是 OP.GG 的区服与分段口径（`kr` / `euw` / `global` … 与
+   * `emerald_plus` / `master_plus` …）。不传就是默认的 `global` + `emerald_plus`——
+   * 自动化页和实时页只关心英雄名和 id，走默认即可，也就还能共用同一份缓存。
+   * 后端对这两个值有白名单，表外的值落回默认而不是报错。
+   */
+  async champions(region?: string, tier?: string): Promise<ChampionOverview[]> {
     if (usesFixtureData()) return browserBackend.champions();
-    return command("get_champions");
+    return command("get_champions", { region: region?.trim() ?? "", tier: tier?.trim() ?? "" });
   },
   /**
    * 一局的完整十人详情。
@@ -178,6 +186,26 @@ export const backend = {
     const cached = assetRequests.get(key);
     if (cached) return cached;
     const request = command<AssetPayload>("get_asset", { kind, id }).catch((cause) => {
+      assetRequests.delete(key);
+      throw cause;
+    });
+    assetRequests.set(key, request);
+    return request;
+  },
+  /**
+   * 按 LCU 资源路径取图标。
+   *
+   * 领取奖励那类资源只有路径（`/lol-game-data/assets/...`），没有 `(kind, id)` 编号，
+   * 所以单开一条。同一路径的请求会复用同一个 promise。
+   */
+  async assetPath(path: string): Promise<AssetPayload> {
+    const target = path?.trim() ?? "";
+    if (!target) throw new Error("空的资源路径");
+    if (usesFixtureData()) throw new Error("Fixture 使用静态资源");
+    const key = `path:${target}`;
+    const cached = assetRequests.get(key);
+    if (cached) return cached;
+    const request = command<AssetPayload>("get_asset", { path: target }).catch((cause) => {
       assetRequests.delete(key);
       throw cause;
     });

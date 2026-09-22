@@ -6,6 +6,10 @@ const std = @import("std");
 pub const StatsStatus = struct {
     source: []const u8 = "opgg",
     stats_source: []const u8 = "opgg",
+    /// 这份胜率/选取率是哪个区服、哪个分段的口径（OP.GG 的 region / tier 参数）。
+    /// 界面上要写清楚，不然「换了区服数字没动」会显得像没生效。
+    region: []const u8 = "global",
+    tier: []const u8 = "emerald_plus",
     fetched_at_millis: i64 = 0,
     expires_at_millis: ?i64 = null,
     is_stale: bool = false,
@@ -85,6 +89,10 @@ pub fn dtoWithStats(catalog_json: []const u8, stats_json: ?[]const u8, status: S
         try jsonString(&writer, std.fmt.bufPrint(&icon_url, "lcu://champion/{d}", .{id}) catch "lcu://champion");
         try writer.writeAll(",\"baseSource\":\"lcu\",\"statsSource\":");
         try jsonString(&writer, if (main_stats != null) status.stats_source else "unavailable");
+        try writer.writeAll(",\"statsRegion\":");
+        try jsonString(&writer, status.region);
+        try writer.writeAll(",\"statsTier\":");
+        try jsonString(&writer, status.tier);
         try writer.writeAll(",\"dataStatus\":{\"source\":");
         try jsonString(&writer, if (main_stats != null) status.source else "lcu");
         try writer.writeAll(",\"fetchedAt\":");

@@ -1290,14 +1290,19 @@ fn refreshLiveGeneration(self: *Runtime) void {
         };
     }
     const phase = jsonField(root, "phase");
-    hash.update(if (isChampSelectPhase(phase)) "selection" else if (isActiveLivePhase(phase)) "active" else "idle");
+    // `EndOfGame` / `PreEndOfGame` 必须单独成档。它们和对局中的名单完全一样，
+    // 只按「是不是 active」分档的话，进结算根本不改变 key，下面那句「进入结算时
+    // 重新读取战绩」就会被上面的提前 return 吞掉——这条分支因此长期是死代码，
+    // 结算时的段位/战绩一直沿用对局中途的旧值。单独成档后 key 会变，强制刷新才
+    // 真正生效。
+    hash.update(if (isChampSelectPhase(phase)) "selection" else if (isSettledLivePhase(phase)) "settled" else if (isActiveLivePhase(phase)) "active" else "idle");
     const key = hash.final();
     if (key == self.live_session_key) return;
     self.live_session_key = key;
     self.live_generation +%= 1;
     self.live_next_load_ms = 0;
     // 进入结算时重新读取战绩，普通开局交接继续复用未过期缓存。
-    if (std.mem.eql(u8, phase, "EndOfGame")) self.force_profile_refresh = true;
+    if (isSettledLivePhase(phase)) self.force_profile_refresh = true;
     if (self.live_load) |batch| batch.queue.cancelled.store(true, .release);
 }
 
@@ -1811,6 +1816,11 @@ fn isActiveLivePhase(phase: []const u8) bool {
         std.mem.eql(u8, phase, "Watching");
 }
 
+/// 结算阶段：这一局的数值已经定型，段位/战绩要重新读一次。
+fn isSettledLivePhase(phase: []const u8) bool {
+    return std.mem.eql(u8, phase, "EndOfGame") or std.mem.eql(u8, phase, "PreEndOfGame");
+}
+
 fn isChampSelectPhase(phase: []const u8) bool {
     return std.mem.eql(u8, phase, "ChampSelect") or std.mem.eql(u8, phase, "ReadyCheck");
 }
@@ -1885,10 +1895,84 @@ fn isSpectatorPhase(phase: []const u8) bool {
         std.mem.eql(u8, phase, "Watching");
 }
 
+/// 单份快照的「局身份」：局号 + 参与者集合指纹。
+///
+/// 局号并不总是拿得到——Live Client 的根对象把 `id` 写成 `"live-client"` 这种哨兵
+/// 字符串（局号没解析出来时的兜底），`jsonInt` 解析失败就是 0。这时参与者集合是
+/// 唯一还能区分「这一局」和「上一局」的东西。
+const LobbyIdentity = struct {
+    game_id: i64 = 0,
+    /// 各参与者身份的 Wyhash 之和。用求和而不是排序后拼接，就是为了**与顺序无关**
+    /// 又**保留重复度**（异或会让同名的两个座位互相抵消），且不用额外分配。
+    roster: u64 = 0,
+    roster_count: usize = 0,
+};
+
+/// 只公开了本地一个人的占位名单（游戏刚启动那一两个轮询）。
+///
+/// 这时名单本身没有判断价值，仍然允许并入缓存补足十人拓扑——这是 `allPlayers`
+/// 短暂只含本地玩家的已知行为。
+const lobby_single_player_roster: usize = 1;
+
+fn lobbyIdentity(root: std.json.Value) LobbyIdentity {
+    var identity = LobbyIdentity{ .game_id = lobbyGameIdValue(root) };
+    if (root != .object) return identity;
+    var sum: u64 = 0;
+    for ([_][]const u8{ "ally", "enemy" }) |side| {
+        const players = root.object.get(side) orelse continue;
+        if (players != .array) continue;
+        for (players.array.items) |player| {
+            const value = playerPopulationHash(player);
+            if (value == 0) continue;
+            sum +%= value;
+            identity.roster_count += 1;
+        }
+    }
+    identity.roster = sum;
+    return identity;
+}
+
+/// 单个参与者的身份指纹。拿不到任何身份时返回 0（该座位不参与比对）。
+fn playerPopulationHash(player: std.json.Value) u64 {
+    if (player != .object) return 0;
+    const puuid = identityPuuid(player);
+    if (puuid.len > 0 and std.mem.indexOf(u8, puuid, "-slot-") == null) return std.hash.Wyhash.hash(0, puuid);
+    const identity = riotIdentity(player);
+    if (identity.name.len == 0) {
+        // bot 和未解析的占位没有名字，退回座位号，至少能区分不同座位。
+        const cell = jsonInt(player, "cellId");
+        if (cell <= 0) return 0;
+        var hasher = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
+        hasher.update(std.mem.asBytes(&cell));
+        return hasher.final();
+    }
+    var hasher = std.hash.Wyhash.init(0x517c_c1b7_2722_0a95);
+    hasher.update(identity.name);
+    hasher.update("#");
+    hasher.update(identity.tag);
+    return hasher.final();
+}
+
+/// 两份快照是否属于**同一局**。
+///
+/// 局号两边都知道时严格比较。局号缺失时**不能**当成「同一局」：结算后重开的那一局
+/// 同样没有局号，一旦放行，`mergeLobbyProfile` 就会从上一局的缓存开始克隆，把上一局
+/// 的段位/战绩/评分留在这一局的座位上——对局界面里「我自己的数据不刷新」正是这么来的。
+/// 改成比对参与者集合，只对「只有本地一个人」的占位名单继续放行。
 fn lobbyIdsCompatible(left: []const u8, right: []const u8) bool {
-    const left_id = lobbyGameId(left);
-    const right_id = lobbyGameId(right);
-    return left_id == 0 or right_id == 0 or left_id == right_id;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    // 解析不了就维持旧的宽松行为：这条路径上的调用方本来也没有更强的判据。
+    const left_value = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), left, .{}) catch return true;
+    const right_value = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), right, .{}) catch return true;
+    return lobbyIdentitiesCompatible(lobbyIdentity(left_value), lobbyIdentity(right_value));
+}
+
+fn lobbyIdentitiesCompatible(left: LobbyIdentity, right: LobbyIdentity) bool {
+    if (left.game_id > 0 and right.game_id > 0) return left.game_id == right.game_id;
+    if (left.roster_count == 0 or right.roster_count == 0) return true;
+    if (left.roster == right.roster and left.roster_count == right.roster_count) return true;
+    return left.roster_count <= lobby_single_player_roster or right.roster_count <= lobby_single_player_roster;
 }
 
 fn betterCachedLiveLobby(self: *const Runtime, candidate: []const u8, phase: []const u8, dynamic_enriched: bool, output: []u8) ?[]const u8 {
@@ -2114,7 +2198,6 @@ fn mergeLiveLobbySnapshots(base_json: []const u8, dynamic_json: []const u8, dyna
 }
 
 fn mergeLiveLobbySnapshotsPolicy(base_json: []const u8, dynamic_json: []const u8, dynamic_enriched: bool, allow_handoff_ids: bool, output: []u8) ![]const u8 {
-    if (!allow_handoff_ids and !lobbyIdsCompatible(base_json, dynamic_json)) return copyJson(dynamic_json, output);
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2124,6 +2207,8 @@ fn mergeLiveLobbySnapshotsPolicy(base_json: []const u8, dynamic_json: []const u8
     const dynamic_copy = try allocator.dupe(u8, dynamic_json);
     var dynamic = std.json.parseFromSliceLeaky(std.json.Value, allocator, dynamic_copy, .{}) catch return error.LcuInvalidResponse;
     if (base != .object or dynamic != .object) return error.LcuInvalidResponse;
+    // 两边都已经解析好了，直接按对象比对局身份，不再多解析一遍原始 JSON。
+    if (!allow_handoff_ids and !lobbyIdentitiesCompatible(lobbyIdentity(base), lobbyIdentity(dynamic))) return copyJson(dynamic_json, output);
     for ([_][]const u8{ "ally", "enemy" }) |name| {
         const base_team = base.object.get(name) orelse continue;
         const dynamic_team = dynamic.object.getPtr(name) orelse continue;
@@ -2338,12 +2423,18 @@ fn lobbyGameId(value: []const u8) i64 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), value, .{}) catch return 0;
-    if (parsed != .object) return 0;
-    const id = jsonInt(parsed, "id");
+    return lobbyGameIdValue(parsed);
+}
+
+/// 从**已解析**的快照里取局号，给已经持有 `std.json.Value` 的调用方复用。
+fn lobbyGameIdValue(root: std.json.Value) i64 {
+    if (root != .object) return 0;
+    // `jsonInt` 会把 `"123"` 这样的字符串也算出来；`"live-client"` 解析失败得 0。
+    const id = jsonInt(root, "id");
     if (id > 0) return id;
-    const game_id = jsonInt(parsed, "gameId");
+    const game_id = jsonInt(root, "gameId");
     if (game_id > 0) return game_id;
-    if (nestedObject(parsed, "gameData")) |game_data| {
+    if (nestedObject(root, "gameData")) |game_data| {
         const nested_game_id = jsonInt(game_data, "gameId");
         if (nested_game_id > 0) return nested_game_id;
     }
@@ -7425,6 +7516,75 @@ test "maps OP.GG champion stats onto the native champion DTO" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"banRate\":0.030000") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"kda\":3.250000") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"roles\":[\"UTILITY\",\"MIDDLE\"]") != null);
+}
+
+test "局号缺失时不把上一局的玩家资料并进新一局" {
+    // Live Client 根对象的 `id` 是 "live-client" 哨兵（局号没解析出来），两局都缺局号，
+    // 这正是过去 `lobbyGameId` 得 0 就被当成「同一局」的场景。
+    const previous_game =
+        \\{"id":"live-client","phase":"EndOfGame","ally":[{"puuid":"me","gameName":"我","tagLine":"HN1","championId":103,"rankTier":"EMERALD","recentMatches":[{"gameId":9}],"dataComplete":true}],"enemy":[{"puuid":"old-enemy","gameName":"上一局的对手","championId":86}]}
+    ;
+    const next_game =
+        \\{"id":"live-client","phase":"ChampSelect","ally":[{"puuid":"me","gameName":"我","tagLine":"HN1","championId":112,"championName":"奥术先驱","rankTier":"","recentMatches":[],"dataComplete":false}],"enemy":[{"puuid":"new-enemy","gameName":"这一局的对手","championId":64}]}
+    ;
+    var output: [16 * 1024]u8 = undefined;
+    const result = try mergeLiveLobbySnapshots(previous_game, next_game, false, &output);
+    // 整份丢掉上一局：段位/战绩不能跟着同一个人的座位漂到新一局。
+    try std.testing.expectEqualStrings(next_game, result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    const me = parsed.value.object.get("ally").?.array.items[0];
+    try std.testing.expectEqualStrings("", jsonField(me, "rankTier"));
+    try std.testing.expectEqual(@as(i64, 112), jsonInt(me, "championId"));
+    try std.testing.expectEqualStrings("new-enemy", jsonField(parsed.value.object.get("enemy").?.array.items[0], "puuid"));
+}
+
+test "局号都拿到且不相同就不合并" {
+    const previous = "{\"id\":\"111\",\"phase\":\"EndOfGame\",\"ally\":[{\"puuid\":\"me\",\"gameName\":\"我\",\"championId\":103,\"rankTier\":\"EMERALD\"}],\"enemy\":[]}";
+    const next = "{\"id\":\"222\",\"phase\":\"ChampSelect\",\"ally\":[{\"puuid\":\"me\",\"gameName\":\"我\",\"championId\":112,\"rankTier\":\"\"}],\"enemy\":[]}";
+    var output: [8192]u8 = undefined;
+    const result = try mergeLiveLobbySnapshots(previous, next, false, &output);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("", jsonField(parsed.value.object.get("ally").?.array.items[0], "rankTier"));
+}
+
+test "同一局（参与者集合相同）的快速名单仍然并入已富化的缓存" {
+    const enriched =
+        \\{"id":"live-client","phase":"InProgress","ally":[{"puuid":"me","gameName":"我","tagLine":"HN1","championId":103,"rankTier":"EMERALD","recentMatches":[{"gameId":9}],"dataComplete":true},{"puuid":"mate","gameName":"队友","tagLine":"HN2","championId":64}],"enemy":[]}
+    ;
+    const fast =
+        \\{"id":"live-client","phase":"InProgress","ally":[{"puuid":"me","gameName":"我","tagLine":"HN1","championId":103,"championName":"阿狸","rankTier":"","recentMatches":[],"dataComplete":false},{"puuid":"mate","gameName":"队友","tagLine":"HN2","championId":64,"championName":"盲僧","rankTier":"","recentMatches":[],"dataComplete":false}],"enemy":[]}
+    ;
+    var output: [16 * 1024]u8 = undefined;
+    const result = try mergeLiveLobbySnapshots(enriched, fast, false, &output);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    const me = parsed.value.object.get("ally").?.array.items[0];
+    // 快速轮询不许把已经富化出来的段位/战绩擦掉。
+    try std.testing.expectEqualStrings("EMERALD", jsonField(me, "rankTier"));
+    try std.testing.expectEqual(@as(usize, 1), me.object.get("recentMatches").?.array.items.len);
+}
+
+test "只公开本地一个人的占位名单仍然并入缓存补足拓扑" {
+    const cached = "{\"id\":\"live-client\",\"phase\":\"InProgress\",\"ally\":[{\"puuid\":\"me\",\"gameName\":\"我\",\"championId\":103},{\"puuid\":\"mate\",\"gameName\":\"队友\",\"championId\":64}],\"enemy\":[{\"puuid\":\"foe\",\"gameName\":\"敌人\",\"championId\":86}]}";
+    const sparse = "{\"id\":\"live-client\",\"phase\":\"InProgress\",\"ally\":[{\"puuid\":\"me\",\"gameName\":\"我\",\"championId\":103}],\"enemy\":[]}";
+    var output: [16 * 1024]u8 = undefined;
+    const result = try mergeLiveLobbySnapshots(cached, sparse, false, &output);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("ally").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("enemy").?.array.items.len);
+}
+
+test "结算阶段单独成档，进结算一定会改变会话 key" {
+    try std.testing.expect(isSettledLivePhase("EndOfGame"));
+    try std.testing.expect(isSettledLivePhase("PreEndOfGame"));
+    try std.testing.expect(!isSettledLivePhase("InProgress"));
+    try std.testing.expect(!isSettledLivePhase("ChampSelect"));
+    // EndOfGame 同时在 active 里：只按 active 分档的话它和 InProgress 同档，
+    // 进结算不改变 key，forced refresh 就永远轮不到。
+    try std.testing.expect(isActiveLivePhase("EndOfGame"));
 }
 
 test "reads ranked queueMap payloads used by current LCU builds" {

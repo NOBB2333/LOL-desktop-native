@@ -207,7 +207,9 @@ const shortcutLegend = computed(() =>
     })),
 );
 // 英雄目录与自动化页共用同一份 vue-query 缓存（同一个 queryKey），不会多打一次 LCU。
-const champions = useQuery({ queryKey: computed(() => ["automation-champions", app.mode]), queryFn: backend.champions, enabled: computed(() => app.initialized), staleTime: 3600000 });
+// 英雄目录与自动化页共用同一份 vue-query 缓存（同一个 queryKey），不会多打一次 LCU。
+// 必须包一层：vue-query 会把查询上下文当第一个参数传进来，直接引用会把上下文当成 region。
+const champions = useQuery({ queryKey: computed(() => ["automation-champions", app.mode]), queryFn: () => backend.champions(), enabled: computed(() => app.initialized), staleTime: 3600000 });
 const championById = computed(() => new Map((champions.data.value ?? []).map((champion) => [champion.id, champion])));
 
 type ChampionEntry = { id: number; name: string; alias: string; iconUrl: string };

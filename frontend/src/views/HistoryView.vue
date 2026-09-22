@@ -15,7 +15,8 @@ const app = useAppStore();
 const tab = ref<"bp" | "encounters">("bp");
 const bp = useQuery({ queryKey: computed(() => ["bp-history", app.mode]), queryFn: backend.bpHistory, enabled: computed(() => app.initialized) });
 const encounters = useQuery({ queryKey: computed(() => ["encounter-history", app.mode]), queryFn: () => backend.encounters(undefined, 100), enabled: computed(() => app.initialized) });
-const champions = useQuery({ queryKey: computed(() => ["champions", app.mode]), queryFn: backend.champions, enabled: computed(() => app.initialized) });
+// 这里只把英雄名映射成 id，走默认区服/分段即可（包一层：vue-query 会把查询上下文当第一个参数）。
+const champions = useQuery({ queryKey: computed(() => ["champions", app.mode]), queryFn: () => backend.champions(), enabled: computed(() => app.initialized) });
 const championIds = computed(() => new Map((champions.data.value ?? []).map((champion) => [champion.name.trim(), champion.id])));
 const championIdFor = (name: string, recordedId = 0) => recordedId > 0 ? recordedId : championIds.value.get(name.trim()) ?? 0;
 const scoreTone = (ally: number, enemy: number) => ally >= enemy ? "ally" : "enemy";

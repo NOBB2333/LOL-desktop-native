@@ -347,6 +347,7 @@ export const fixtureChampions: ChampionOverview[] = champions.map(([id, name, al
   id, name, alias, abilities: ["被动技能", "技能 Q", "技能 W", "技能 E", "技能 R"], roles: [role], tier: index < 3 ? "S" : index < 7 ? "A" : "B",
   winRate: 0.485 + (index % 6) * 0.009, pickRate: 0.032 + (10 - index) * 0.004, banRate: 0.018 + index * 0.006, kda: 2.1 + index * 0.17,
   iconUrl: `./fixtures/champions/${alias}.png`, baseSource: "fixture", statsSource: "fixture",
+  statsRegion: "global", statsTier: "emerald_plus",
   dataStatus: fixtureStatus(),
 }));
 
@@ -413,12 +414,23 @@ export const fixtureFriends: FriendToolsSnapshot = {
  * 形状与后端 `lol.get_claims` 一致（三个来源各来一两条），**不参与任何真实统计**；
  * 预览里领一条就少一条，方便看「领空之后」的样子。
  */
+/**
+ * 预览用的奖励图标。
+ *
+ * 用内联 SVG 而不是去 CommunityDragon 拉真图：预览环境经常没有外网，真图拉不到就
+ * 只剩兜底字形，反而看不出「有图标」这个分支。真实运行时这里来自 LCU 的 iconUrl。
+ */
+const fixtureRewardIcon = `data:image/svg+xml,${encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" fill="#2c2f4a"/><path d="M32 7 45 27 32 57 19 27Z" fill="#b98bff"/><path d="M32 7 45 27H19Z" fill="#e8dcff"/></svg>',
+)}`;
+
 export const fixtureClaims: ClaimSnapshot = {
   items: [
+    // 三条分支各来一份：真图标 / LCU 路径（拉不到就回退 CDragon）/ 完全没有图标。
     { key: "mission:fixture-1", source: "mission", sourceLabel: "任务", id: "fixture-1", title: "峡谷日常", detail: "蓝色精粹 500", iconUrl: null, count: 1 },
     { key: "mission:fixture-2", source: "mission", sourceLabel: "任务", id: "fixture-2", title: "今日首胜", detail: "钥匙 1", iconUrl: null, count: 1 },
-    { key: "reward:fixture-3", source: "reward", sourceLabel: "奖励", id: "fixture-3", title: "自选皮肤碎片", detail: "皮肤碎片 A · 皮肤碎片 B", iconUrl: null, count: 1 },
-    { key: "event:fixture-4", source: "event", sourceLabel: "事件中心", id: "fixture-4", title: "灵魂莲华", detail: "奖励轨道待领 3 项", iconUrl: null, count: 3 },
+    { key: "reward:fixture-3", source: "reward", sourceLabel: "奖励", id: "fixture-3", title: "自选皮肤碎片", detail: "皮肤碎片 A · 皮肤碎片 B", iconUrl: fixtureRewardIcon, count: 1 },
+    { key: "event:fixture-4", source: "event", sourceLabel: "事件中心", id: "fixture-4", title: "灵魂莲华", detail: "奖励轨道待领 3 项", iconUrl: "/lol-game-data/assets/v1/champion-icons/64.png", count: 3 },
   ],
   sources: [
     { source: "mission", label: "任务", count: 2 },

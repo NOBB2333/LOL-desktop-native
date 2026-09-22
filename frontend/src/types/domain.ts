@@ -380,6 +380,9 @@ export interface ChampionOverview {
   iconUrl: string;
   baseSource: string;
   statsSource: string;
+  /** 胜率/选取率是哪个区服、哪个分段的（OP.GG 的 region / tier）。 */
+  statsRegion: string;
+  statsTier: string;
   dataStatus: DataStatus;
 }
 

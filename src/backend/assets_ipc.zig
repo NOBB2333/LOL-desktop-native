@@ -8,23 +8,80 @@ const lcu = @import("lcu");
 const backend = @import("../backend.zig");
 const champion_mapper = @import("champions.zig");
 
+const ChampionQuery = struct { region: []const u8 = "", tier: []const u8 = "" };
+
+// OP.GG 允许的区服与分段。
+//
+// 抄 LeagueAkari 的 `RegionType` / `TierType`（`shared/types/opgg/index.ts`），
+// 但**用白名单收口**：这两个值会被拼进请求 URL，不能让调用方自由传入。表外的值
+// 一律落回默认，不报错——界面传了个旧名字时，降级到默认口径比整块空掉好。
+const opgg_regions = [_][]const u8{
+    "global", "na", "euw", "eune", "kr", "jp", "br", "lan", "las", "oce",
+    "tr",     "ru", "sg",  "id",   "ph", "th", "vn", "tw",  "me",
+};
+
+const opgg_tiers = [_][]const u8{
+    "all", "ibsg", "gold_plus", "platinum_plus", "emerald_plus", "diamond_plus", "master", "master_plus", "grandmaster", "challenger",
+};
+
+const default_opgg_region = "global";
+const default_opgg_tier = "emerald_plus";
+
+fn normalizeOpggRegion(value: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    for (opgg_regions) |candidate| if (std.ascii.eqlIgnoreCase(candidate, trimmed)) return candidate;
+    return default_opgg_region;
+}
+
+fn normalizeOpggTier(value: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    for (opgg_tiers) |candidate| if (std.ascii.eqlIgnoreCase(candidate, trimmed)) return candidate;
+    return default_opgg_tier;
+}
+
+/// 缓存条目按「区服 + 分段」分开。
+///
+/// 默认那组刻意沿用老 key（`opgg-ranked-emerald-plus`），升级后原来的缓存还能直接
+/// 命中，不至于白刷一次网络。
+fn opggCacheKey(buffer: []u8, region: []const u8, tier: []const u8) []const u8 {
+    if (std.mem.eql(u8, region, default_opgg_region) and std.mem.eql(u8, tier, default_opgg_tier)) return "opgg-ranked-emerald-plus";
+    return std.fmt.bufPrint(buffer, "opgg-ranked-{s}-{s}", .{ region, tier }) catch "opgg-ranked";
+}
+
+fn opggUrl(buffer: []u8, region: []const u8, tier: []const u8) []const u8 {
+    return std.fmt.bufPrint(buffer, "https://lol-api-champion.op.gg/api/{s}/champions/ranked?tier={s}", .{ region, tier }) catch "https://lol-api-champion.op.gg/api/global/champions/ranked?tier=emerald_plus";
+}
+
 pub fn getChampions(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = backend.runtime(context);
-    _ = invocation;
+    // 没带 payload（界面不带参数时）也要能跑，所以解析失败只退回默认值。
+    const request = backend.parsePayload(ChampionQuery, invocation.request.payload) catch null;
+    defer if (request) |parsed| parsed.deinit();
+    const query = if (request) |parsed| parsed.value else ChampionQuery{};
+    const region = normalizeOpggRegion(query.region);
+    const tier = normalizeOpggTier(query.tier);
+    var key_buffer: [96]u8 = undefined;
+    const cache_key = opggCacheKey(&key_buffer, region, tier);
+    var url_buffer: [192]u8 = undefined;
+    const stats_url = opggUrl(&url_buffer, region, tier);
+    const stats_status = .{ .region = region, .tier = tier };
+
     if (self.mode == .live) {
         if (self.io) |io| {
             var client = backend.discoverClient(self, io) catch {
                 if (self.storage) |*store| if (store.get("cache", "champions") catch null) |cached| {
                     defer std.heap.page_allocator.free(cached);
-                    const stats = store.get("cache", "opgg-ranked-emerald-plus") catch null;
+                    const stats = store.get("cache", cache_key) catch null;
                     defer if (stats) |value| std.heap.page_allocator.free(value);
-                    const updated_seconds = store.getUpdatedAt("cache", "opgg-ranked-emerald-plus") catch null;
+                    const updated_seconds = store.getUpdatedAt("cache", cache_key) catch null;
                     const fetched_at = (updated_seconds orelse 0) * std.time.ms_per_s;
                     const expires_at = fetched_at + backend.runtimeCacheTtlMillis(self);
                     const stale = stats != null and backend.runtimeNowMillis(self) > expires_at;
                     return champion_mapper.dtoWithStats(cached, stats, .{
                         .source = if (stale) "sqlite-stale" else "sqlite-fresh",
                         .stats_source = if (stats != null) "sqlite" else "unavailable",
+                        .region = stats_status.region,
+                        .tier = stats_status.tier,
                         .fetched_at_millis = fetched_at,
                         .expires_at_millis = if (stats != null) expires_at else null,
                         .is_stale = stale,
@@ -44,8 +101,8 @@ pub fn getChampions(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
             defer if (cached_stats) |value| std.heap.page_allocator.free(value);
             var cached_at: i64 = 0;
             if (self.storage) |*store| {
-                cached_stats = store.get("cache", "opgg-ranked-emerald-plus") catch null;
-                cached_at = ((store.getUpdatedAt("cache", "opgg-ranked-emerald-plus") catch null) orelse 0) * std.time.ms_per_s;
+                cached_stats = store.get("cache", cache_key) catch null;
+                cached_at = ((store.getUpdatedAt("cache", cache_key) catch null) orelse 0) * std.time.ms_per_s;
             }
             if (cached_stats) |value| if (!champion_mapper.hasRankedStats(value)) {
                 std.heap.page_allocator.free(value);
@@ -59,13 +116,13 @@ pub fn getChampions(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
             defer if (fetched_stats) |value| std.heap.page_allocator.free(value);
             var fetch_failed = false;
             if (!cache_fresh) {
-                fetched_stats = client.getPublicUrl("https://lol-api-champion.op.gg/api/global/champions/ranked?tier=emerald_plus", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) lol-desktop-native/2.0") catch blk: {
+                fetched_stats = client.getPublicUrl(stats_url, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) lol-desktop-native/2.0") catch blk: {
                     fetch_failed = true;
                     break :blk null;
                 };
                 if (fetched_stats) |stats| {
                     if (champion_mapper.hasRankedStats(stats)) {
-                        if (self.storage) |*store| store.put("cache", "opgg-ranked-emerald-plus", stats) catch {};
+                        if (self.storage) |*store| store.put("cache", cache_key, stats) catch {};
                     } else {
                         std.heap.page_allocator.free(stats);
                         fetched_stats = null;
@@ -79,6 +136,8 @@ pub fn getChampions(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
             return champion_mapper.dtoWithStats(champions, stats, .{
                 .source = if (fetched_stats != null) "opgg" else if (stale) "sqlite-stale" else if (cache_fresh) "sqlite-fresh" else "lcu",
                 .stats_source = if (fetched_stats != null) "opgg" else if (stats != null) "sqlite" else "unavailable",
+                .region = stats_status.region,
+                .tier = stats_status.tier,
                 .fetched_at_millis = fetched_at,
                 .expires_at_millis = if (stats != null and fetched_at > 0) fetched_at + ttl else null,
                 .is_stale = stale,
@@ -95,11 +154,26 @@ pub fn getChampions(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
     return std.fmt.bufPrint(output, "[]", .{});
 }
 
+/// LCU 的资源前缀。
+///
+/// 这个命令只允许取游戏数据资源，绝不能变成「任意 LCU 接口的探测器」——所以按
+/// 路径取字节时前缀必须卡死在这里，而不是把用户给的字符串直接拼进请求。
+const lcu_asset_prefix = "/lol-game-data/assets/";
+
+/// CommunityDragon 的默认资产根。
+///
+/// 对齐 LeagueAkari `renderer-shared/providers/akari-resource/storybook.ts` 里的
+/// `CDRAGON_DEFAULT_ASSET_BASE`：LCU 取不到时按同样的规则回退，界面才不至于空白。
+const community_dragon_asset_base = "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default";
+
 pub fn getAsset(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = backend.runtime(context);
-    const payload_json = backend.parsePayload(struct { kind: []const u8 = "", id: i64 = 0 }, invocation.request.payload) catch return error.InvalidAsset;
+    const payload_json = backend.parsePayload(struct { kind: []const u8 = "", id: i64 = 0, path: []const u8 = "" }, invocation.request.payload) catch return error.InvalidAsset;
     defer payload_json.deinit();
     const payload = payload_json.value;
+    // 领取奖励的图标只有路径没有 (kind, id)：任务奖励给的就是
+    // `/lol-game-data/assets/v1/...` 这样的整条资源路径。
+    if (payload.path.len > 0) return assetByPath(self, payload.path, output);
     if (payload.id <= 0) return error.InvalidAsset;
     const kind = assetKind(payload.kind) orelse return error.InvalidAsset;
     if (self.io) |io| {
@@ -112,10 +186,39 @@ pub fn getAsset(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
     return communityDragonAsset(kind, payload.id, output);
 }
 
+/// 按 LCU 资源路径取图标。取不到就回退 CommunityDragon 的同名 URL。
+fn assetByPath(self: *backend.Runtime, path: []const u8, output: []u8) ![]const u8 {
+    if (!isLcuAssetPath(path)) return error.InvalidAsset;
+    if (self.io) |io| {
+        var client = backend.discoverClient(self, io) catch return communityDragonAssetByPath(path, output);
+        defer client.deinit();
+        const bytes = client.get(path) catch return communityDragonAssetByPath(path, output);
+        defer std.heap.page_allocator.free(bytes);
+        return assetByPathDto(path, bytes, output);
+    }
+    return communityDragonAssetByPath(path, output);
+}
+
+fn assetByPathDto(path: []const u8, bytes: []const u8, output: []u8) ![]const u8 {
+    var prefix_buffer: [768]u8 = undefined;
+    var prefix_writer = std.Io.Writer.fixed(&prefix_buffer);
+    try prefix_writer.writeAll("{\"path\":");
+    try backend.jsonString(&prefix_writer, path);
+    try prefix_writer.writeByte(',');
+    return assetBytesDto(prefix_writer.buffered(), bytes, output);
+}
+
 const AssetKind = enum { champion, item, spell, perk, profile };
 
 fn assetKind(value: []const u8) ?AssetKind {
     return std.meta.stringToEnum(AssetKind, value);
+}
+
+/// 是不是一条合法的 LCU 游戏资源路径。
+///
+/// 前缀之后必须还有内容：`/lol-game-data/assets/` 本身不是资源。
+fn isLcuAssetPath(path: []const u8) bool {
+    return path.len > lcu_asset_prefix.len and std.mem.startsWith(u8, path, lcu_asset_prefix);
 }
 
 fn fetchLcuAsset(client: lcu.Client, kind: AssetKind, id: i64) ![]u8 {
@@ -151,17 +254,37 @@ fn fetchLcuAsset(client: lcu.Client, kind: AssetKind, id: i64) ![]u8 {
 }
 
 fn assetDataDto(kind: AssetKind, id: i64, bytes: []const u8, output: []u8) ![]const u8 {
-    const is_jpeg = bytes.len >= 3 and bytes[0] == 0xff and bytes[1] == 0xd8 and bytes[2] == 0xff;
-    const is_png = bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n");
-    if (!is_jpeg and !is_png) return error.AssetNotFound;
-    const mime = if (is_jpeg) "image/jpeg" else "image/png";
-    const prefix = try std.fmt.bufPrint(output, "{{\"kind\":\"{s}\",\"id\":{d},\"mimeType\":\"{s}\",\"dataUrl\":\"data:{s};base64,", .{ @tagName(kind), id, mime, mime });
+    const prefix = try std.fmt.bufPrint(output, "{{\"kind\":\"{s}\",\"id\":{d},", .{ @tagName(kind), id });
+    return assetBytesDto(prefix, bytes, output);
+}
+
+/// 支持的图片类型嗅探。
+///
+/// LCU 的图标不止 PNG/JPEG：部分活动/通行证图标是 SVG，只认 PNG/JPEG 会让它们
+/// 静默退化成占位块。
+fn imageMimeType(bytes: []const u8) ?[]const u8 {
+    if (bytes.len >= 3 and bytes[0] == 0xff and bytes[1] == 0xd8 and bytes[2] == 0xff) return "image/jpeg";
+    if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return "image/png";
+    const head = bytes[0..@min(bytes.len, 256)];
+    if (std.mem.indexOf(u8, head, "<svg") != null) return "image/svg+xml";
+    return null;
+}
+
+/// 把图片字节编码成 `dataUrl` DTO。
+///
+/// `dto_prefix` 是 `{` 之后到 `"mimeType"` 之前的那一段（`{"kind":"item","id":3031,`）。
+/// 它来自调用方自己的栈缓冲，避免和 `output` 重叠。
+fn assetBytesDto(dto_prefix: []const u8, bytes: []const u8, output: []u8) ![]const u8 {
+    const mime = imageMimeType(bytes) orelse return error.AssetNotFound;
+    var head_buffer: [1024]u8 = undefined;
+    const head = try std.fmt.bufPrint(&head_buffer, "{s}\"mimeType\":\"{s}\",\"dataUrl\":\"data:{s};base64,", .{ dto_prefix, mime, mime });
     const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
     const suffix = "\",\"source\":\"lcu\"}";
-    if (prefix.len + encoded_len + suffix.len > output.len) return error.ResponseTooLarge;
-    _ = std.base64.standard.Encoder.encode(output[prefix.len..][0..encoded_len], bytes);
-    @memcpy(output[prefix.len + encoded_len ..][0..suffix.len], suffix);
-    return output[0 .. prefix.len + encoded_len + suffix.len];
+    if (head.len + encoded_len + suffix.len > output.len) return error.ResponseTooLarge;
+    @memcpy(output[0..head.len], head);
+    _ = std.base64.standard.Encoder.encode(output[head.len..][0..encoded_len], bytes);
+    @memcpy(output[head.len + encoded_len ..][0..suffix.len], suffix);
+    return output[0 .. head.len + encoded_len + suffix.len];
 }
 
 fn communityDragonAsset(kind: AssetKind, id: i64, output: []u8) ![]const u8 {
@@ -174,10 +297,89 @@ fn communityDragonAsset(kind: AssetKind, id: i64, output: []u8) ![]const u8 {
     };
     const extension = if (kind == .profile) "jpg" else "png";
     const mime = if (kind == .profile) "image/jpeg" else "image/png";
-    return std.fmt.bufPrint(output, "{{\"kind\":\"{s}\",\"id\":{d},\"mimeType\":\"{s}\",\"dataUrl\":\"https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/v1/{s}/{d}.{s}\",\"source\":\"communitydragon\"}}", .{ @tagName(kind), id, mime, folder, id, extension });
+    return std.fmt.bufPrint(output, "{{\"kind\":\"{s}\",\"id\":{d},\"mimeType\":\"{s}\",\"dataUrl\":\"{s}/v1/{s}/{d}.{s}\",\"source\":\"communitydragon\"}}", .{ @tagName(kind), id, mime, community_dragon_asset_base, folder, id, extension });
+}
+
+/// 按 LCU 资源路径回退到 CommunityDragon。
+///
+/// 规则抄 LeagueAkari：`/lol-game-data/assets/` 之后的相对路径直接接在默认资产根
+/// 后面，并且**整条转小写**（CommunityDragon 的目录是小写的）。
+fn communityDragonAssetByPath(path: []const u8, output: []u8) ![]const u8 {
+    const relative = if (std.mem.startsWith(u8, path, lcu_asset_prefix))
+        path[lcu_asset_prefix.len..]
+    else
+        std.mem.trimStart(u8, path, "/");
+    var url_buffer: [1024]u8 = undefined;
+    var url_writer = std.Io.Writer.fixed(&url_buffer);
+    try url_writer.writeAll(community_dragon_asset_base);
+    try url_writer.writeByte('/');
+    for (relative) |character| try url_writer.writeByte(std.ascii.toLower(character));
+    var dto_buffer: [1536]u8 = undefined;
+    var dto_writer = std.Io.Writer.fixed(&dto_buffer);
+    try dto_writer.writeAll("{\"path\":");
+    try backend.jsonString(&dto_writer, path);
+    // 走到这里说明 LCU 没给字节，真实类型无从得知；这个字段只是提示，前端直接用 URL。
+    try dto_writer.writeAll(",\"mimeType\":\"image/png\",\"dataUrl\":");
+    try backend.jsonString(&dto_writer, url_writer.buffered());
+    try dto_writer.writeAll(",\"source\":\"communitydragon\"}");
+    return backend.copyJson(dto_writer.buffered(), output);
 }
 
 // 就地测试：DTO 组装函数已随模块迁出。
+test "assets by path are restricted to the LCU game-data prefix" {
+    try std.testing.expect(isLcuAssetPath("/lol-game-data/assets/v1/missions/reward.png"));
+    try std.testing.expect(!isLcuAssetPath("/lol-summoner/v1/current-summoner"));
+    try std.testing.expect(!isLcuAssetPath("/lol-game-data/assets/"));
+    try std.testing.expect(!isLcuAssetPath("https://example.com/x.png"));
+}
+
+test "assets by path fall back to community dragon with a lowercased relative path" {
+    var output: [2048]u8 = undefined;
+    const fallback = try communityDragonAssetByPath("/lol-game-data/assets/v1/Missions/Icons/Reward.PNG", &output);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, fallback, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("communitydragon", parsed.value.object.get("source").?.string);
+    try std.testing.expectEqualStrings(
+        "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/v1/missions/icons/reward.png",
+        parsed.value.object.get("dataUrl").?.string,
+    );
+}
+
+test "svg reward icons are no longer rejected as unknown types" {
+    var output: [2048]u8 = undefined;
+    const result = try assetByPathDto("/lol-game-data/assets/v1/icons/event.svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>", &output);
+    try std.testing.expect(std.mem.indexOf(u8, result, "data:image/svg+xml;base64,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"source\":\"lcu\"") != null);
+}
+
+test "opgg query values are whitelisted and unknown ones fall back to the default" {
+    try std.testing.expectEqualStrings("kr", normalizeOpggRegion("KR"));
+    try std.testing.expectEqualStrings("euw", normalizeOpggRegion(" euw "));
+    // 表外的值不能原样进 URL，一律退回默认。
+    try std.testing.expectEqualStrings("global", normalizeOpggRegion("../../etc/passwd"));
+    try std.testing.expectEqualStrings("global", normalizeOpggRegion(""));
+    try std.testing.expectEqualStrings("diamond_plus", normalizeOpggTier("diamond_plus"));
+    try std.testing.expectEqualStrings("emerald_plus", normalizeOpggTier("emerald_plus'; drop table"));
+    try std.testing.expectEqualStrings("emerald_plus", normalizeOpggTier(""));
+}
+
+test "opgg cache key keeps the legacy name for the default region and tier" {
+    var buffer: [96]u8 = undefined;
+    // 默认那组沿用老 key，升级后原缓存还能直接命中。
+    try std.testing.expectEqualStrings("opgg-ranked-emerald-plus", opggCacheKey(&buffer, "global", "emerald_plus"));
+    try std.testing.expectEqualStrings("opgg-ranked-kr-master", opggCacheKey(&buffer, "kr", "master"));
+    // 换区服 / 换分段必须是不同的缓存条目，否则切换之后数字不会变。
+    try std.testing.expect(!std.mem.eql(u8, opggCacheKey(&buffer, "kr", "master"), opggCacheKey(&buffer, "kr", "challenger")));
+}
+
+test "opgg url carries the region and tier" {
+    var buffer: [192]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "https://lol-api-champion.op.gg/api/na/champions/ranked?tier=master_plus",
+        opggUrl(&buffer, "na", "master_plus"),
+    );
+}
+
 test "asset DTO embeds LCU images and uses the profile jpeg fallback" {
     const png = "\x89PNG\r\n\x1a\ncontent";
     var output: [1024]u8 = undefined;
