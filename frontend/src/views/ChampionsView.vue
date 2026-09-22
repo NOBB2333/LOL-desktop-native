@@ -9,6 +9,18 @@ import PageHeader from "../components/PageHeader.vue";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import { championImage, percent } from "../utils/format";
+import {
+  OPGG_REGION_STORAGE_KEY,
+  OPGG_TIER_STORAGE_KEY,
+  isKnownOpggRegion,
+  opggRegionLabel,
+  opggRegionOptions,
+  opggTierLabel,
+  opggTierOptions,
+  platformToOpggRegion,
+  resolveStatsRegion,
+  resolveStatsTier,
+} from "../champions/statsScope";
 
 const app = useAppStore();
 const message = useMessage();
@@ -24,39 +36,21 @@ const viewMode = ref<"list" | "grid">(typeof localStorage === "undefined" ? "lis
  * （emerald_plus 之类）不是一回事，混在一起会让人以为换梯队能换数据口径。
  * 取值必须在后端的白名单里，表外的值后端会静默落回默认。
  */
-const statsRegion = ref(typeof localStorage === "undefined" ? "global" : localStorage.getItem("lol-desktop-champion-region") ?? "global");
-const statsTier = ref(typeof localStorage === "undefined" ? "emerald_plus" : localStorage.getItem("lol-desktop-champion-stats-tier") ?? "emerald_plus");
-const statsRegionOptions = [
-  { label: "全球 Global", value: "global" },
-  { label: "韩服 KR", value: "kr" },
-  { label: "美服 NA", value: "na" },
-  { label: "欧服西欧 EUW", value: "euw" },
-  { label: "欧服北欧 EUNE", value: "eune" },
-  { label: "日服 JP", value: "jp" },
-  { label: "巴西 BR", value: "br" },
-  { label: "拉美北 LAN", value: "lan" },
-  { label: "拉美南 LAS", value: "las" },
-  { label: "大洋洲 OCE", value: "oce" },
-  { label: "土耳其 TR", value: "tr" },
-  { label: "俄服 RU", value: "ru" },
-  { label: "东南亚 SG", value: "sg" },
-  { label: "印尼 ID", value: "id" },
-  { label: "菲律宾 PH", value: "ph" },
-  { label: "泰国 TH", value: "th" },
-  { label: "越南 VN", value: "vn" },
-  { label: "中国台湾 TW", value: "tw" },
-  { label: "中东 ME", value: "me" },
-];
-const statsTierOptions = [
-  { label: "翡翠以上", value: "emerald_plus" },
-  { label: "钻石以上", value: "diamond_plus" },
-  { label: "铂金以上", value: "platinum_plus" },
-  { label: "黄金以上", value: "gold_plus" },
-  { label: "大师以上", value: "master_plus" },
-  { label: "宗师以上", value: "grandmaster" },
-  { label: "王者", value: "challenger" },
-  { label: "全部段位", value: "all" },
-];
+/**
+ * 登录大区的来源：优先 `platformId`（`NA1`/`KR`/`EUW1`），拿不到再看 `region`。
+ * 两个字段在 LCU 不同版本里的形态不一致，所以映射表两种写法都收。
+ */
+const accountPlatform = computed(() => app.connection.platformId ?? app.connection.region);
+
+function readStored(key: string) {
+  return typeof localStorage === "undefined" ? null : localStorage.getItem(key);
+}
+
+const storedRegion = readStored(OPGG_REGION_STORAGE_KEY);
+/** 用户是否手动选过区服。选过就跟用户走，没选过才跟随本机登录大区。 */
+const regionPinned = ref(isKnownOpggRegion(storedRegion));
+const statsRegion = ref(resolveStatsRegion(storedRegion, accountPlatform.value));
+const statsTier = ref(resolveStatsTier(readStored(OPGG_TIER_STORAGE_KEY)));
 const champions = useQuery({
   queryKey: computed(() => ["champions", app.mode, statsRegion.value, statsTier.value]),
   queryFn: () => backend.champions(statsRegion.value, statsTier.value),
@@ -64,16 +58,25 @@ const champions = useQuery({
   staleTime: 120_000,
   retry: 1,
 });
+// 没手动选过区服时，换账号 / 换大区要跟着变——否则登录韩服却一直在看全球数据。
+watch(accountPlatform, (platform) => {
+  if (regionPinned.value) return;
+  statsRegion.value = platformToOpggRegion(platform);
+});
+// 只有用户亲自选过才落盘：「跟随本机大区」算出来的值不该被当成用户选择固化下来，
+// 否则换个大区就再也跟不动了。
 watch([statsRegion, statsTier], () => {
   if (typeof localStorage === "undefined") return;
-  localStorage.setItem("lol-desktop-champion-region", statsRegion.value);
-  localStorage.setItem("lol-desktop-champion-stats-tier", statsTier.value);
+  if (regionPinned.value) localStorage.setItem(OPGG_REGION_STORAGE_KEY, statsRegion.value);
+  localStorage.setItem(OPGG_TIER_STORAGE_KEY, statsTier.value);
 });
-const statsScopeLabel = computed(() => {
-  const region = statsRegionOptions.find((option) => option.value === statsRegion.value)?.label ?? statsRegion.value;
-  const tier = statsTierOptions.find((option) => option.value === statsTier.value)?.label ?? statsTier.value;
-  return `${region} · ${tier}`;
-});
+function chooseRegion(value: string) {
+  regionPinned.value = true;
+  statsRegion.value = value;
+}
+const statsScopeLabel = computed(() => `${opggRegionLabel(statsRegion.value)} · ${opggTierLabel(statsTier.value)}`);
+/** 区服是「跟随本机」算出来的还是用户自己挑的，界面上要说清楚。 */
+const statsRegionFollowed = computed(() => !regionPinned.value);
 const rows = computed(() => champions.data.value ?? []);
 const roleLabels: Record<string, string> = { TOP: "上路", JUNGLE: "打野", MIDDLE: "中路", MID: "中路", BOTTOM: "下路", ADC: "下路", UTILITY: "辅助", SUPPORT: "辅助" };
 const roleLabel = (value: string) => roleLabels[value.toUpperCase()] ?? value;
@@ -107,11 +110,11 @@ async function refresh() { await champions.refetch(); message.success("英雄数
 <template>
   <div class="page-shell champions-page champions-page--dense">
     <PageHeader title="英雄" eyebrow="CHAMPION DATA" meta="统计来自 OP.GG；英雄、装备和图标优先读取 LCU / SQLite 缓存">
-      <div class="champions-toolbar"><NInput v-model:value="search" size="small" placeholder="搜索英雄或别名" clearable><template #prefix><Search :size="14" /></template></NInput><span class="champions-toolbar__scope">统计口径</span><NSelect v-model:value="statsRegion" class="champion-region" size="small" :options="statsRegionOptions" /><NSelect v-model:value="statsTier" class="champion-stats-tier" size="small" :options="statsTierOptions" /><NSelect v-model:value="tier" size="small" :options="[{ label: '全部梯队', value: 'all' }, { label: 'T1', value: 'T1' }, { label: 'T2', value: 'T2' }, { label: 'T3', value: 'T3' }, { label: 'T4', value: 'T4' }, { label: 'T5', value: 'T5' }]" /><NSelect v-model:value="role" size="small" :options="roles" /><NSelect v-model:value="sort" class="champion-sort" size="small" :options="sortOptions" /><div class="view-toggle" aria-label="英雄视图"><button type="button" :class="{ active: viewMode === 'list' }" title="列表视图" @click="setView('list')"><List :size="15" /></button><button type="button" :class="{ active: viewMode === 'grid' }" title="网格视图" @click="setView('grid')"><Grid2X2 :size="15" /></button></div><NButton quaternary size="small" :loading="champions.isFetching.value" @click="refresh"><template #icon><RefreshCw :size="14" /></template>刷新</NButton></div>
+      <div class="champions-toolbar"><NInput v-model:value="search" size="small" placeholder="搜索英雄或别名" clearable><template #prefix><Search :size="14" /></template></NInput><span class="champions-toolbar__scope">统计口径<em v-if="statsRegionFollowed">跟随本机</em></span><NSelect :value="statsRegion" class="champion-region" size="small" :options="opggRegionOptions" :title="statsRegionFollowed ? '默认跟随本机登录大区；手动选一次就固定下来' : '已在手动选择中'" @update:value="chooseRegion" /><NSelect v-model:value="statsTier" class="champion-stats-tier" size="small" :options="opggTierOptions" /><NSelect v-model:value="tier" size="small" :options="[{ label: '全部梯队', value: 'all' }, { label: 'T1', value: 'T1' }, { label: 'T2', value: 'T2' }, { label: 'T3', value: 'T3' }, { label: 'T4', value: 'T4' }, { label: 'T5', value: 'T5' }]" /><NSelect v-model:value="role" size="small" :options="roles" /><NSelect v-model:value="sort" class="champion-sort" size="small" :options="sortOptions" /><div class="view-toggle" aria-label="英雄视图"><button type="button" :class="{ active: viewMode === 'list' }" title="列表视图" @click="setView('list')"><List :size="15" /></button><button type="button" :class="{ active: viewMode === 'grid' }" title="网格视图" @click="setView('grid')"><Grid2X2 :size="15" /></button></div><NButton quaternary size="small" :loading="champions.isFetching.value" @click="refresh"><template #icon><RefreshCw :size="14" /></template>刷新</NButton></div>
     </PageHeader>
     <LoadingState v-if="champions.isLoading.value" label="正在加载英雄统计" />
     <template v-else>
-      <section class="champion-data-banner"><SlidersHorizontal :size="16" /><div><strong>LCU 基础资料 + OP.GG 统计</strong><span>LCU 提供名称、定位和头像；OP.GG 提供胜率、登场率、禁用率、梯队和位置。右上角的<b>统计口径</b>可以换区服与分段，换完之后这些比率会随之变化。网络不可用时统计回退 SQLite 旧快照。</span></div><div class="champion-data-banner__sources"><span class="source-chip source-chip--lcu">LCU 基础</span><span class="source-chip source-chip--opgg">OP.GG · {{ statsScopeLabel }}</span><b>{{ filtered.length }} / {{ rows.length }}</b></div></section>
+      <section class="champion-data-banner"><SlidersHorizontal :size="16" /><div><strong>LCU 基础资料 + OP.GG 统计</strong><span>LCU 提供名称、定位和头像；OP.GG 提供胜率、登场率、禁用率、梯队和位置。右上角的<b>统计口径</b>可以换区服与分段，换完之后这些比率会随之变化：<b>默认跟随你本机登录的大区</b>，手动选过一次就固定下来。注意 OP.GG 不提供中国大陆服数据，国服账号会落回「全球」。网络不可用时统计回退 SQLite 旧快照。</span></div><div class="champion-data-banner__sources"><span class="source-chip source-chip--lcu">LCU 基础</span><span class="source-chip source-chip--opgg">OP.GG · {{ statsScopeLabel }}</span><b>{{ filtered.length }} / {{ rows.length }}</b></div></section>
       <section v-if="viewMode === 'list'" class="champion-table-shell">
         <header class="champion-table-head"><span>英雄</span><span>定位</span><span>梯队</span><span>胜率</span><span>登场率</span><span>禁用率</span><span>KDA</span><span>统计来源</span></header>
         <div v-for="champion in filtered" :key="champion.id" class="champion-table-row"><div class="champion-table-name"><AssetIcon kind="champion" :id="champion.id" :name="champion.name" :fallback-url="champion.iconUrl || championImage(champion.id)" size="md" /><div><strong>{{ champion.name }}</strong><small>{{ champion.alias }}</small></div></div><div class="champion-table-roles"><NTag v-for="item in champion.roles.slice(0, 3)" :key="item" size="small" :bordered="false">{{ roleLabel(item) }}</NTag><span v-if="!champion.roles.length">-</span></div><strong class="champion-tier" :class="tierClass(champion.tier)">{{ champion.tier }}</strong><div class="champion-table-stat"><strong>{{ percent(champion.winRate) }}</strong><i :class="meterClass(champion.winRate)" /></div><span class="champion-table-number">{{ percent(champion.pickRate) }}</span><span class="champion-table-number">{{ percent(champion.banRate) }}</span><span class="champion-table-number">{{ champion.kda ? champion.kda.toFixed(2) : "-" }}</span><span class="champion-source" :data-source="sourceTone(champion.dataStatus.source, champion.dataStatus.isStale)"><small>LCU</small> + {{ sourceLabel(champion.statsSource || champion.dataStatus.source) }}<em v-if="champion.dataStatus.isStale">旧</em></span></div>
@@ -127,6 +130,8 @@ async function refresh() { await champions.refetch(); message.success("英雄数
 .champions-toolbar { display: flex; align-items: center; gap: 5px; }
 .champions-toolbar .n-input { width: 190px; }.champions-toolbar .n-base-selection { width: 112px; }.champions-toolbar .champion-sort { width: 150px; }
 .champions-toolbar__scope { margin-left: 4px; padding-left: 8px; border-left: 1px solid var(--line); color: var(--text-muted); font-size: 10px; white-space: nowrap; }
+/* 「跟随本机」只是状态说明，压到最小，别和真正的控件抢注意力。 */
+.champions-toolbar__scope em { margin-left: 5px; padding: 1px 5px; border-radius: 7px; color: var(--accent); background: var(--accent-soft); font-size: 8px; font-style: normal; }
 .champions-toolbar .champion-region { width: 132px; }.champions-toolbar .champion-stats-tier { width: 112px; }
 .view-toggle { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); }
 .view-toggle button { display: grid; place-items: center; width: 28px; height: 26px; border: 0; border-radius: 3px; color: var(--text-secondary); background: transparent; cursor: pointer; }.view-toggle button.active { color: var(--accent); background: var(--accent-soft); }

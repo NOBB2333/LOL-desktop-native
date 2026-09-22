@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { darkTheme, dateZhCN, NConfigProvider, NMessageProvider, zhCN } from "naive-ui";
-import { BarChart3, BookOpen, Bot, ChevronRight, CircleHelp, Clock3, History, Home, Moon, PanelLeftClose, PanelLeftOpen, Settings, Swords, Sun, UserRound, Wifi, WifiOff, Wrench, X } from "@lucide/vue";
+import { BarChart3, BookOpen, Bot, ChevronRight, CircleHelp, Clock3, History, Home, Moon, PanelLeftClose, PanelLeftOpen, Settings, Swords, Sun, UserRound, Wifi, WifiOff, X } from "@lucide/vue";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useQueryClient } from "@tanstack/vue-query";
 import { RouterLink, RouterView, useRoute, useRouter } from "vue-router";
@@ -27,8 +27,7 @@ const navigation = [
   { to: "/automation", label: "自动化", icon: Bot },
   { to: "/history", label: "历史", icon: History },
   { to: "/friends", label: "好友", icon: UserRound },
-  // 工具箱紧挨着「好友」：这两页都是直接对客户端做动作的，放在一起好找。
-  { to: "/toolkit", label: "工具箱", icon: Wrench },
+  // 「一键领取」并进了自动化页，「客户端急救」并进了对局页右栏，工具箱页已移除。
   { to: "/game", label: "对局", icon: Swords, badge: "实时" },
 ];
 // Keep every phase that can still expose the current ten-player snapshot on

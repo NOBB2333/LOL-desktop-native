@@ -5,6 +5,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 import PageHeader from "../components/PageHeader.vue";
 import AssetIcon from "../components/AssetIcon.vue";
+import ClaimCenter from "../components/ClaimCenter.vue";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { ShortcutTarget } from "../types/domain";
@@ -338,6 +339,9 @@ const targetLabel = (target: ShortcutTarget) => shortcutTargetLabel(target);
         <p v-if="!app.config.automation.shortcuts.length" class="candidate-empty">尚未配置快捷消息</p>
       </div>
     </section>
+
+    <!-- 一键领取：原本是「工具箱」页的一半，搬进来与自动化放在一起（都是替你做掉客户端的例行操作） -->
+    <ClaimCenter />
 
     <!-- 底部说明条 -->
     <footer class="auto-footer">

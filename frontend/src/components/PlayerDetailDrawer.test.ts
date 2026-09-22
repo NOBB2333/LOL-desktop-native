@@ -78,6 +78,16 @@ describe("PlayerDetailDrawer", () => {
   // `player` 是组件的必填 prop，不能用 Record<string, unknown> 兜住——
   // 展开这种索引签名后 `player` 会退化成 unknown，vue-tsc 直接报 TS2322。
   // 只声明这个 helper 真正用到的两个 prop，类型由组件契约本身约束。
+  /**
+   * 等第一次落位跑完。走的是 `nextFrame`（rAF 退化成 16ms 定时器），所以给一点余量。
+   *
+   * ⚠️ **别把「等落位」放在断言高亮之前**。高亮由 `focusedSection` 驱动、挂载后同步就有，
+   * 但组件里有 1600ms 的自动清除定时器；沙箱负载高时事件循环一次停顿就可能超过 1600ms，
+   * 那时 40ms 的等待实际是「等待 1600ms 之后才被调度到」——断言读到的已经是被清掉的状态。
+   * 所以顺序固定：先断言高亮（不需要等），再等落位、断言滚到了谁。
+   */
+  const waitForLanding = () => new Promise((resolve) => setTimeout(resolve, 40));
+
   async function mountScrolledDrawer(props: { player: PlayerProfile | null; focusSection?: "jungle" | null }) {
     const scrolled: Element[] = [];
     Element.prototype.scrollIntoView = function scrollIntoViewSpy(this: Element) { scrolled.push(this); };
@@ -92,8 +102,6 @@ describe("PlayerDetailDrawer", () => {
     mountedDrawers.push(wrapper);
     await flushPromises();
     await nextTick();
-    // 第一次落位走的是 `nextFrame`（rAF 退化成 16ms 定时器），等它跑完。
-    await new Promise((resolve) => setTimeout(resolve, 40));
     return { wrapper, scrolled };
   }
 
@@ -102,23 +110,36 @@ describe("PlayerDetailDrawer", () => {
     const { wrapper, scrolled } = await mountScrolledDrawer({ player: fixtureLobby.ally[1], focusSection: "jungle" });
 
     const section = wrapper.get("[data-testid='jungle-preference']");
-    expect(scrolled).toContain(section.element);
     // 滚到位还不够，得闪一下，否则「停在某一屏」看不出该看哪儿。
+    // 先读高亮，再等落位——理由见 `waitForLanding` 上面那段。
     expect(section.attributes("data-focus")).toBe("true");
+    await waitForLanding();
+    expect(scrolled).toContain(section.element);
   });
+
+  /**
+   * 「不滚」这类**否定断言**必须等过全部补正窗口才成立。
+   *
+   * 组件会把同一个目标在 0 / 160 / 420 / 900ms 各落一次位（抽屉进入动画与上方异步区块
+   * 会持续撑高内容），只等 40ms 等于只否掉了第一次——后面三次照样可能打到这个段上。
+   * 所以这里等 1000ms（900 + 余量），`expect(scrolled).toEqual([])` 才是真的。
+   */
+  const waitForCorrections = () => new Promise((resolve) => setTimeout(resolve, 1000));
 
   it("普通入口（不指定 focusSection）不滚打野那一段", async () => {
     const { wrapper, scrolled } = await mountScrolledDrawer({ player: fixtureLobby.ally[1] });
-
     const section = wrapper.get("[data-testid='jungle-preference']");
-    expect(scrolled).not.toContain(section.element);
+
     expect(section.attributes("data-focus")).toBeUndefined();
+    await waitForCorrections();
+    expect(scrolled).not.toContain(section.element);
   });
 
   it("玩家没有打野样本时不硬滚（抽屉里根本没有那一段）", async () => {
     const { wrapper, scrolled } = await mountScrolledDrawer({ player: fixtureLobby.ally[0], focusSection: "jungle" });
 
     expect(wrapper.find("[data-testid='jungle-preference']").exists()).toBe(false);
+    await waitForCorrections();
     expect(scrolled).toEqual([]);
   });
 

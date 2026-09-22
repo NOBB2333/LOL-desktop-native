@@ -4,7 +4,9 @@ import { NButton, NEmpty, NSwitch, useMessage } from "naive-ui";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 import AssetIcon from "../components/AssetIcon.vue";
+import ClientFirstAid from "../components/ClientFirstAid.vue";
 import LoadingState from "../components/LoadingState.vue";
+import MatchupPanel from "../components/MatchupPanel.vue";
 import MatchDetailCard from "../components/MatchDetailCard.vue";
 import PageHeader from "../components/PageHeader.vue";
 import PlayerCard from "../components/PlayerCard.vue";
@@ -19,10 +21,7 @@ import TeamSummaryCard from "../components/TeamSummaryCard.vue";
 import { backend, isTauri } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { EncounterRecord, LiveLobby, LiveTeam, PlayerProfile } from "../types/domain";
-import { HIGH_WIN_RATE_LABEL, HIGH_WIN_RATE_MIN_SAMPLE, HIGH_WIN_RATE_THRESHOLD } from "../tags/definitions/basic";
-import { deriveTagFacts } from "../tags/facts";
 import { createCoalescedAsyncRunner } from "../utils/coalescedAsync";
-import { roleName } from "../utils/format";
 import { shortcutTargetLabel } from "../shortcuts/targets";
 import { enrichedRosterCoversOverlay, mergeRosterSnapshot, playerCardKey } from "../live/roster";
 import { isActiveGamePhase, isCurrentLiveSnapshot, isVisibleGamePhase, shouldAutoHideLivePanel, shouldResetClearedLivePanel } from "../live/panel";
@@ -191,7 +190,6 @@ const teams = computed<LiveTeam[]>(() => {
 const classicLayout = computed(() => current.value?.layoutKind !== "arena" && teams.value.length <= 2);
 const allyTeam = computed(() => teams.value.find((team) => team.side === "ally") ?? teams.value[0] ?? { id: "ally", label: "我方阵容", side: "ally", players: [], summary: current.value?.allySummary ?? null });
 const enemyTeam = computed(() => teams.value.find((team) => team.side === "enemy") ?? teams.value[1] ?? { id: "enemy", label: "敌方阵容", side: "enemy", players: [], summary: current.value?.enemySummary ?? null });
-const enemyPlayers = computed(() => enemyTeam.value.players);
 /**
  * 实时概览底部的快捷键图例。直接读自动化里的配置，所以在那边加了 / 删了 /
  * 改了按键，这里会自动跟着变——只做展示，不在这里改配置。
@@ -399,30 +397,9 @@ const phaseLabel = computed(() => {
 const gameModeLabel = computed(() => {
   return queueLabel(current.value?.queueId ?? 0, current.value?.gameMode);
 });
-const dangerPoints = computed(() => {
-  if (!current.value) return [];
-  const points: { tone: "danger" | "warning" | "success"; title: string; detail: string }[] = [];
-  const enemy = enemyPlayers.value;
-  // 高风险判定走标签系统同一套事实与阈值，避免与卡片标签出现两套口径。
-  const hot = enemy.find((player) => {
-    const facts = deriveTagFacts(player);
-    return facts.sample >= HIGH_WIN_RATE_MIN_SAMPLE && facts.winRate >= HIGH_WIN_RATE_THRESHOLD;
-  });
-  const premade = enemy.filter((player) => player.isPremade);
-  // 闪现位置忽然变来变去，往往比战绩更能说明「这是不是本人」。
-  const suspiciousFlash = enemy.find((player) => {
-    const facts = deriveTagFacts(player);
-    return facts.flashOnD > 0 && facts.flashOnF > 0;
-  });
-  if (hot) {
-    const recent = hot.recentMatches.slice(0, recentLimit.value);
-    points.push({ tone: "danger", title: `${roleName(hot.assignedPosition)} 位${HIGH_WIN_RATE_LABEL}`, detail: `${hot.gameName} 近${recentLimit.value}场 ${recent.filter((match) => match.win).length} 胜，当前英雄 ${hot.currentChampionGames} 场。` });
-  }
-  if (premade.length >= 2) points.push({ tone: "warning", title: "敌方存在已知组队", detail: `${premade.slice(0, 2).map((player) => player.gameName).join(" + ")} 有共同组队证据。` });
-  if (suspiciousFlash) points.push({ tone: "warning", title: `${roleName(suspiciousFlash.assignedPosition)} 闪现位置可疑`, detail: `${suspiciousFlash.gameName} 的闪现既放在 D 位也放在 F 位，可能是换人上号。` });
-  if (!points.length) points.push({ tone: "success", title: "暂未发现高风险玩家", detail: `当前局没有触发${HIGH_WIN_RATE_LABEL}、组队或闪现位置异常的规则。` });
-  return points;
-});
+/* 右栏的「本局总结」已改为 `MatchupPanel`：胜率估算 + 逐路对位 + 重点关注。
+   原来那三条写死的风险规则（高风险 / 组队 / 可疑闪现）没有丢，
+   现在由 `live/matchup.ts` 的 `focusPoints` 统一产出，并且每条都带数字。 */
 
 function selectPlayer(player: PlayerProfile) { selectedIdentity.value = { puuid: player.puuid, gameName: player.gameName, tagLine: player.tagLine }; selectedMatchId.value = null; drawerFocusSection.value = null; drawerOpen.value = true; }
 function selectPlayerMatch(player: PlayerProfile, gameId: number) { selectedIdentity.value = { puuid: player.puuid, gameName: player.gameName, tagLine: player.tagLine }; selectedMatchId.value = gameId; drawerFocusSection.value = null; drawerOpen.value = true; }
@@ -634,7 +611,7 @@ onBeforeUnmount(() => {
             <div class="game-player-row" :class="{ 'game-player-row--sparse': team.players.length < 5 }" :style="{ '--player-columns': playerColumnCount(team.players.length) }"><PlayerCard v-for="(player, index) in team.players" :key="playerCardKey(player, index)" :player="player" :premade-tone="premadeTone(player)" :recent-limit="recentLimit" :recent-columns="recentColumns" :suppress-encounters="team.side === 'ally' && isMyPartyMember(player)" :data-side="team.side" show-recent :jungle-map="jungleMapFor(player)" :jungle-map-loading="jungleMapLoading" @select="selectPlayer" @select-match="selectPlayerMatch" @select-jungle="selectPlayerJungle" :encounter-records="encounterQuery.data.value" :encounter-loading="encounterQuery.isFetching.value" :encounter-error="encounterQuery.isError.value" :current-game-id="Number(current?.id) || 0" :local-player="localPlayer" @select-encounter="selectEncounter" @retry-encounters="encounterQuery.refetch()" :player-notes="playerNotes.notesFor(player.puuid)" :can-edit-notes="playerNotes.canEdit(player.puuid)" @edit-notes="openTagEditor" /></div>
           </section>
         </div>
-        <aside class="game-summary-column"><div class="game-summary-column__head"><span class="eyebrow">实时概览</span><h2>本局总结</h2><p>{{ dangerPoints.length }} 条规则命中 · {{ teams.length }} 个队伍</p></div><template v-if="classicLayout"><div class="game-summary-team game-summary-team--ally"><strong>我方总结</strong><TeamSummaryCard :summary="current.allySummary" side="ally" /></div><div class="game-summary-team game-summary-team--enemy"><strong>敌方总结</strong><TeamSummaryCard :summary="current.enemySummary" side="enemy" /></div></template><template v-else><div v-for="team in teams.filter((item) => item.summary)" :key="`summary-${team.id}`" class="game-summary-team" :class="`game-summary-team--${team.side}`"><strong>{{ team.side === 'enemy' ? '敌方总结' : '我方总结' }}</strong><TeamSummaryCard :summary="team.summary!" :side="team.side === 'enemy' ? 'enemy' : 'ally'" /></div></template><div class="game-danger-list"><article v-for="(point, index) in dangerPoints" :key="point.title" :data-tone="point.tone"><b>0{{ index + 1 }}</b><div><strong>{{ point.title }}</strong><p>{{ point.detail }}</p></div></article></div><div class="game-automation-quick"><div class="game-automation-quick__head"><span>自动化</span><NSwitch v-model:value="app.config.automation.enabled" size="small" /></div><ul><li><div><strong>自动接受</strong><small>{{ autoAcceptHint }}</small></div><NSwitch :value="app.config.automation.autoAccept" size="small" :disabled="!app.config.automation.enabled" @update:value="setAutomationAction('autoAccept', $event)" /></li><li><div><strong>自动选人</strong><small>{{ autoPickHint }}</small></div><NSwitch :value="app.config.automation.autoPick" size="small" :disabled="!app.config.automation.enabled" @update:value="setAutomationAction('autoPick', $event)" /></li><li><div><strong>自动禁用</strong><small>{{ autoBanHint }}</small></div><NSwitch :value="app.config.automation.autoBan" size="small" :disabled="!app.config.automation.enabled" @update:value="setAutomationAction('autoBan', $event)" /></li></ul><div class="game-automation-pool"><div class="game-automation-pool__row"><span>选用</span><div class="game-automation-pool__icons"><AssetIcon v-for="id in app.config.automation.pickChampionIds" :key="`pick-${id}`" kind="champion" :id="id" :name="championEntry(id).name" :fallback-url="championEntry(id).iconUrl" size="xs" /><small v-if="!app.config.automation.pickChampionIds.length">未设置</small></div></div><div class="game-automation-pool__row"><span>禁用</span><div class="game-automation-pool__icons"><AssetIcon v-for="id in app.config.automation.banChampionIds" :key="`ban-${id}`" kind="champion" :id="id" :name="championEntry(id).name" :fallback-url="championEntry(id).iconUrl" size="xs" /><small v-if="!app.config.automation.banChampionIds.length">未设置</small></div></div></div><div class="game-automation-candidates"><div class="game-automation-candidates__group"><span class="game-automation-candidates__title">自动选人 · 选的是谁</span><ul v-if="pickCandidates.length"><li v-for="(champion, index) in pickCandidates" :key="`pick-name-${champion.id}`"><AssetIcon kind="champion" :id="champion.id" :name="champion.name" :fallback-url="champion.iconUrl" size="xs" /><span class="game-automation-candidates__name">{{ champion.name }}</span><em class="game-automation-candidates__rank">{{ candidateOrdinal(index, '选') }}</em></li></ul><small v-else class="game-automation-candidates__empty">未设置选人候选</small></div><div class="game-automation-candidates__group"><span class="game-automation-candidates__title">自动禁用 · 禁的是谁</span><ul v-if="banCandidates.length"><li v-for="(champion, index) in banCandidates" :key="`ban-name-${champion.id}`"><AssetIcon kind="champion" :id="champion.id" :name="champion.name" :fallback-url="champion.iconUrl" size="xs" /><span class="game-automation-candidates__name">{{ champion.name }}</span><em class="game-automation-candidates__rank">{{ candidateOrdinal(index, '禁用') }}</em></li></ul><small v-else class="game-automation-candidates__empty">未设置禁用候选</small></div></div></div><div class="game-quick-filter"><span class="game-quick-filter__title">数据</span><div class="game-quick-filter__row"><div><strong>仅显示排位数据</strong><small>{{ rankedOnlyHint }}</small></div><NSwitch v-model:value="app.config.providers.rankedOnly" size="small" aria-label="仅显示排位数据" /></div></div><div class="game-summary-foot game-shortcut-legend"><span>快捷键</span><ul v-if="shortcutLegend.length"><li v-for="shortcut in shortcutLegend" :key="shortcut.id"><strong>{{ shortcut.key }}</strong><small>{{ shortcut.label }} · {{ shortcut.detail }}</small></li></ul><small v-else>自动化里还没有启用快捷消息</small></div></aside>
+        <aside class="game-summary-column"><div class="game-summary-column__head"><span class="eyebrow">实时概览</span><h2>本局总结</h2><p>对决分析 · {{ teams.length }} 个队伍 · 个人明细见左侧卡片</p></div><template v-if="classicLayout"><div class="game-summary-team game-summary-team--ally"><strong>我方总结</strong><TeamSummaryCard :summary="current.allySummary" side="ally" /></div><div class="game-summary-team game-summary-team--enemy"><strong>敌方总结</strong><TeamSummaryCard :summary="current.enemySummary" side="enemy" /></div></template><template v-else><div v-for="team in teams.filter((item) => item.summary)" :key="`summary-${team.id}`" class="game-summary-team" :class="`game-summary-team--${team.side}`"><strong>{{ team.side === 'enemy' ? '敌方总结' : '我方总结' }}</strong><TeamSummaryCard :summary="team.summary!" :side="team.side === 'enemy' ? 'enemy' : 'ally'" /></div></template><MatchupPanel :allies="allyTeam.players" :enemies="enemyTeam.players" :ally-summary="allyTeam.summary" :enemy-summary="enemyTeam.summary" /><div class="game-automation-quick"><div class="game-automation-quick__head"><span>自动化</span><NSwitch v-model:value="app.config.automation.enabled" size="small" /></div><ul><li><div><strong>自动接受</strong><small>{{ autoAcceptHint }}</small></div><NSwitch :value="app.config.automation.autoAccept" size="small" :disabled="!app.config.automation.enabled" @update:value="setAutomationAction('autoAccept', $event)" /></li><li><div><strong>自动选人</strong><small>{{ autoPickHint }}</small></div><NSwitch :value="app.config.automation.autoPick" size="small" :disabled="!app.config.automation.enabled" @update:value="setAutomationAction('autoPick', $event)" /></li><li><div><strong>自动禁用</strong><small>{{ autoBanHint }}</small></div><NSwitch :value="app.config.automation.autoBan" size="small" :disabled="!app.config.automation.enabled" @update:value="setAutomationAction('autoBan', $event)" /></li></ul><div class="game-automation-pool"><div class="game-automation-pool__row"><span>选用</span><div class="game-automation-pool__icons"><AssetIcon v-for="id in app.config.automation.pickChampionIds" :key="`pick-${id}`" kind="champion" :id="id" :name="championEntry(id).name" :fallback-url="championEntry(id).iconUrl" size="xs" /><small v-if="!app.config.automation.pickChampionIds.length">未设置</small></div></div><div class="game-automation-pool__row"><span>禁用</span><div class="game-automation-pool__icons"><AssetIcon v-for="id in app.config.automation.banChampionIds" :key="`ban-${id}`" kind="champion" :id="id" :name="championEntry(id).name" :fallback-url="championEntry(id).iconUrl" size="xs" /><small v-if="!app.config.automation.banChampionIds.length">未设置</small></div></div></div><div class="game-automation-candidates"><div class="game-automation-candidates__group"><span class="game-automation-candidates__title">自动选人 · 选的是谁</span><ul v-if="pickCandidates.length"><li v-for="(champion, index) in pickCandidates" :key="`pick-name-${champion.id}`"><AssetIcon kind="champion" :id="champion.id" :name="champion.name" :fallback-url="champion.iconUrl" size="xs" /><span class="game-automation-candidates__name">{{ champion.name }}</span><em class="game-automation-candidates__rank">{{ candidateOrdinal(index, '选') }}</em></li></ul><small v-else class="game-automation-candidates__empty">未设置选人候选</small></div><div class="game-automation-candidates__group"><span class="game-automation-candidates__title">自动禁用 · 禁的是谁</span><ul v-if="banCandidates.length"><li v-for="(champion, index) in banCandidates" :key="`ban-name-${champion.id}`"><AssetIcon kind="champion" :id="champion.id" :name="champion.name" :fallback-url="champion.iconUrl" size="xs" /><span class="game-automation-candidates__name">{{ champion.name }}</span><em class="game-automation-candidates__rank">{{ candidateOrdinal(index, '禁用') }}</em></li></ul><small v-else class="game-automation-candidates__empty">未设置禁用候选</small></div></div></div><div class="game-quick-filter"><span class="game-quick-filter__title">数据</span><div class="game-quick-filter__row"><div><strong>仅显示排位数据</strong><small>{{ rankedOnlyHint }}</small></div><NSwitch v-model:value="app.config.providers.rankedOnly" size="small" aria-label="仅显示排位数据" /></div></div><!-- 客户端急救：从工具箱搬来的，界面卡死时就近可用 --><ClientFirstAid /><div class="game-summary-foot game-shortcut-legend"><span>快捷键</span><ul v-if="shortcutLegend.length"><li v-for="shortcut in shortcutLegend" :key="shortcut.id"><strong>{{ shortcut.key }}</strong><small>{{ shortcut.label }} · {{ shortcut.detail }}</small></li></ul><small v-else>自动化里还没有启用快捷消息</small></div></aside>
       </section>
       <section v-else class="game-history-panel">
         <header><div><span class="eyebrow">最近对局 / 回顾</span><h2>当前没有可读取的十人阵容</h2><p>{{ phaseLabel }} 阶段保留对局页；下面显示最近一局完整数据，可展开查看十人阵容与 BP。</p></div><NButton quaternary size="small" :loading="lobby.isFetching.value" @click="refresh"><template #icon><RefreshCw :size="14" /></template>刷新状态</NButton></header>
@@ -1021,49 +998,6 @@ onBeforeUnmount(() => {
   border-radius: 6px;
   padding: 8px 10px;
 }
-.game-danger-list {
-  display: grid;
-  gap: 6px;
-  padding-top: 4px;
-}
-.game-danger-list article {
-  display: grid;
-  grid-template-columns: 24px 1fr;
-  gap: 8px;
-  padding: 8px;
-  border-radius: 6px;
-  border: 1px solid var(--line);
-  border-left: 3px solid var(--line-strong);
-  background: var(--surface-raised);
-}
-.game-danger-list article[data-tone="danger"] {
-  border-left-color: var(--red);
-  background: color-mix(in srgb, var(--red) 5%, var(--surface-raised));
-}
-.game-danger-list article[data-tone="warning"] {
-  border-left-color: var(--amber);
-  background: color-mix(in srgb, var(--amber) 5%, var(--surface-raised));
-}
-.game-danger-list article[data-tone="success"] {
-  border-left-color: var(--green);
-  background: color-mix(in srgb, var(--green) 5%, var(--surface-raised));
-}
-.game-danger-list b {
-  color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 800;
-}
-.game-danger-list strong {
-  color: var(--text-primary);
-  font-size: 11px;
-  font-weight: 700;
-}
-.game-danger-list p {
-  margin: 3px 0 0;
-  color: var(--text-secondary);
-  font-size: 9px;
-  line-height: 1.35;
-}
 .game-summary-foot {
   display: grid;
   gap: 2px;
@@ -1282,7 +1216,6 @@ onBeforeUnmount(() => {
     grid-template-columns: 1fr;
   }
   .game-summary-column__head,
-  .game-danger-list,
   .game-summary-foot {
     grid-column: 1;
   }
