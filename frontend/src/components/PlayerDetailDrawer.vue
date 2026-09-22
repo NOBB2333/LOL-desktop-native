@@ -146,7 +146,7 @@ const { matchForRow, loading: expandedDetailLoading, error: expandedDetailError 
  * 样本是「本人近期打野局」的 gameId，不按英雄筛：用户要的是「近期抓野路线」，
  * 卡到当前英雄往往只剩一两局，画出来没有意义。
  *
- * 必须等抽屉打开才请求——一次要读最多 10 局的 SGP DETAILS，虽然后端有落盘缓存，
+ * 必须等抽屉打开才请求——一次要读最多 20 局的 SGP DETAILS，虽然后端有落盘缓存，
  * 也没必要在浏览列表时替每个人都拉一遍。查询键带上 gameId 串，换人/换场次自动分开缓存。
  */
 const jungleGameIds = computed(() => (props.player?.recentMatches ?? [])

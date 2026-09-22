@@ -161,8 +161,9 @@ describe("PlayerCard", () => {
     championId: 64,
     zone: { top: 0.3, mid: 0.4, bot: 0.3 },
     camps: {
-      blueOwn: { blue: 2, red: 0, wolves: 1, raptors: 0 },
-      blueInvade: { blue: 0, red: 0, wolves: 0, raptors: 0 },
+      blueOwn: { blue: 2, red: 0, wolves: 0, raptors: 0 },
+      // 蓝方场次跑到红方半区开 = 红方半区那个落点的「入侵开」
+      blueInvade: { blue: 0, red: 0, wolves: 0, raptors: 1 },
       redOwn: { blue: 0, red: 1, wolves: 0, raptors: 0 },
       redInvade: { blue: 0, red: 0, wolves: 0, raptors: 0 },
     },
@@ -176,16 +177,31 @@ describe("PlayerCard", () => {
     level4Points: [],
   };
 
-  it("本局打野的卡片上直接内嵌路线图，不需要点开抽屉", () => {
+  it("本局打野的卡片上直接内嵌路线图，且带足文字说明", () => {
     // fixture 里 ally[1] 是打野（带 junglePreference），路线图应就地展开。
     const wrapper = mount(PlayerCard, { props: { player: fixtureLobby.ally[1], jungleMap: junglePathMap } });
 
     const block = wrapper.get("[data-testid='player-card-jungle-map']");
     expect(block.text()).toContain("打野路线图");
     expect(block.text()).toContain("3 局样本");
-    // inline 变体：卡片宽度只有 180~260px，塞不下侧栏，只能是正方形自适应 + 两行速览。
+    // inline 变体：卡片宽度只有 180~260px，塞不下侧栏，只能是正方形自适应 + 几行文字。
     expect(block.find("[data-testid='jungle-route-map']").classes()).toContain("jungle-map--inline");
     expect(block.findAll("[data-testid='jungle-camp-marker']").length).toBeGreaterThan(0);
+    // 只画圆圈不写字，图上就是几个没有含义的色块 —— 每个营地都必须在图上带名字。
+    expect(block.findAll(".jungle-map__camp-label").map((node) => node.text())).toEqual(["蓝", "红", "F6"]);
+    // 入侵描边要单独标出来（黄圈 + 黄字），否则和常规开分不清。
+    expect(block.findAll(".jungle-map__camp-label--invade").map((node) => node.text())).toEqual(["F6"]);
+    // 首清按 AK 的 campStart 口径写成「常规开 N%（营地 开 M%）」。
+    expect(block.text()).toContain("蓝方 常规开 100%（蓝 Buff 开 100%）");
+    expect(block.text()).toContain("蓝方 入侵开 50%（F6 开 100%）");
+    // 抓人给的是「几局」而不是光一个百分比，和 AK 的 level3Gank 文案一致。
+    expect(block.text()).toContain("3 级抓 1 / 3 局");
+    expect(block.text()).toContain("4 级抓 2 / 3 局");
+    // 图例是「看不懂」的解药：图上每类记号都得有对应文字。
+    expect(block.text()).toContain("每分钟位置");
+    expect(block.text()).toContain("参与击杀");
+    expect(block.text()).toContain("3 / 4 级抓");
+    expect(block.text()).toContain("常规开 / 入侵开");
   });
 
   it("路线数据还没回来时给出占位文案，不留下空块", () => {

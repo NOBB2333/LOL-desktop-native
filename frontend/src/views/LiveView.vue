@@ -297,7 +297,7 @@ const playerNotes = usePlayerNotes(lobbyPuuids, () => localPlayer.value?.puuid ?
  * 本局打野的近期路线图（玩家卡上那块内嵌地图的数据源）。
  *
  * 只给「本局打野」拉数据，这既是 AK 的口径（`showJunglePathing` 只对当前打野
- * 生效），也是必须的：一次要读最多 10 局的 SGP DETAILS，而战绩里有打野样本的
+ * 生效），也是必须的：一次要读最多 20 局的 SGP DETAILS，而战绩里有打野样本的
  * 玩家一局可能有三四个，十个人都拉会在载入阶段刷几十个请求。一局最多两个打野
  * （每边一个），后端还有落盘缓存，成本可控——和玩家详情抽屉里那份是同一套数据。
  *

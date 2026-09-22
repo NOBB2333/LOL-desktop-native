@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { JungleCampCounts } from "../types/domain";
 import {
+  JUNGLE_CAMP_SHORT_LABELS,
   JUNGLE_CAMP_SPOTS,
   campCountsTotal,
   campMarkerSize,
@@ -40,12 +41,23 @@ describe("campCountsTotal", () => {
 });
 
 describe("describeCamps", () => {
-  it("按次数降序取前两个，占比以该组总次数为基数", () => {
-    expect(describeCamps(camps({ blue: 1, red: 2 }))).toBe("红 Buff 67% · 蓝 Buff 33%");
+  it("按次数降序取前两个，占比以该组总次数为基数，并按 AK 的文案带上「开」", () => {
+    expect(describeCamps(camps({ blue: 1, red: 2 }))).toBe("红 Buff 开 67% · 蓝 Buff 开 33%");
   });
 
   it("没有样本时不吐空字符串，给出可读占位", () => {
     expect(describeCamps(camps())).toBe("无样本");
+  });
+});
+
+describe("JUNGLE_CAMP_SHORT_LABELS", () => {
+  it("八个营地都有短标签，且短到能贴在地图圆圈旁边", () => {
+    for (const spot of JUNGLE_CAMP_SPOTS) {
+      const label = JUNGLE_CAMP_SHORT_LABELS[spot.camp];
+      expect(label).toBeTruthy();
+      // 卡片上的图只有 190px 宽，标签超过 3 个字就会压到别的落点上。
+      expect(label.length).toBeLessThanOrEqual(3);
+    }
   });
 });
 

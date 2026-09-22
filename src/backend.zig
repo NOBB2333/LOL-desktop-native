@@ -2901,6 +2901,14 @@ fn getMatchDetail(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     return error.MatchDetailUnavailable;
 }
 
+/// 打野路线图最多解析多少场逐帧数据。
+///
+/// 对齐 LeagueAkari 的 `gameDetailsLoadCount`（默认 20）——它也是给每个玩家拉
+/// 最近 20 局的 DETAILS，打野分析在那之上算。每场冷缓存各要一次 SGP 请求
+/// （命中 `jungleDetails` 落盘缓存就直接返回，不重复打网），所以别无限往上抬：
+/// 这里是「一场一场串行拉」的，条数直接等于最坏情况下的往返次数。
+const jungle_path_sample_limit: usize = 20;
+
 /// 打野路线图：按 gameId 逐帧还原该玩家近期的野区动线。
 ///
 /// 只收 gameId 而不是整份 MatchSummary——帧数据后端本来就有，快捷消息里的
@@ -2908,8 +2916,8 @@ fn getMatchDetail(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
 /// 摘要既浪费，又可能和缓存口径漂开（摘要里的 position 只是「那一局打了什么位置」，
 /// 和逐帧数据不是一回事）。
 ///
-/// 逐场解析，最多 10 场；一场都没解析出帧数据时返回 `PathUnavailable`，
-/// 调用方按「暂无路线数据」处理，不当作错误弹窗。
+/// 逐场解析，最多 `jungle_path_sample_limit` 场；一场都没解析出帧数据时返回
+/// `PathUnavailable`，调用方按「暂无路线数据」处理，不当作错误弹窗。
 fn getJunglePath(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
     const payload_json = parsePayload(struct {
@@ -2936,7 +2944,7 @@ fn getJunglePath(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
     var aggregate = jungle_analysis.Aggregate{ .path = &collector };
     var analyzed: usize = 0;
     for (payload.gameIds) |game_id| {
-        if (analyzed == 10) break;
+        if (analyzed >= jungle_path_sample_limit) break;
         if (game_id <= 0) continue;
         if (addJungleGameDetails(self, client, sgp_context, &aggregate, game_id, payload.puuid)) analyzed += 1;
     }

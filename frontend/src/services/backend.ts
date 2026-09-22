@@ -153,7 +153,8 @@ export const backend = {
    */
   async junglePath(puuid: string, selfPuuid: string, gameIds: number[], championId = 0): Promise<JunglePathMap | null> {
     const target = puuid?.trim() ?? "";
-    const ids = [...new Set(gameIds.filter((id) => Number.isFinite(id) && id > 0))].slice(0, 10);
+    // 上限与后端 `jungle_path_sample_limit` 一致，对齐 AK 的 gameDetailsLoadCount（20）。
+    const ids = [...new Set(gameIds.filter((id) => Number.isFinite(id) && id > 0))].slice(0, 20);
     if (!target || !ids.length) return null;
     // 浏览器预览下没有逐帧数据可解，用 fixture 顶上，保证路线图这块看得见。
     if (usesFixtureData()) return browserBackend.junglePath(target, ids);

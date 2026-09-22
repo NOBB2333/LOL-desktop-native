@@ -45,7 +45,7 @@ const emit = defineEmits<{
  * 路线图只画在「本局打野」的卡上。
  *
  * 这是 AK 的默认口径（`showJunglePathing` 只对当前打野生效），也是必要的：
- * 一次要读最多 10 局的 SGP DETAILS，而 `recentMatches` 里有打野样本的玩家
+ * 一次要读最多 20 局的 SGP DETAILS，而 `recentMatches` 里有打野样本的玩家
  * 一局可能有三四个，全员都拉会让载入阶段刷几十个请求。
  *
  * 判定复用 `live/gameMap.ts` 的那一份，对局页用同一个条件决定去拉谁。

@@ -59,6 +59,19 @@ export const JUNGLE_CAMP_LABELS: Record<JungleCamp, string> = {
   raptors: "F6",
 };
 
+/**
+ * 地图上贴在营地圆圈旁边的短标签。
+ *
+ * `JUNGLE_CAMP_LABELS` 是给文字面板用的全称，卡片上那张图只有 190px 宽、
+ * 圆圈本身才 5~11px，「蓝 Buff」根本放不下。这里给一套一两个字的。
+ */
+export const JUNGLE_CAMP_SHORT_LABELS: Record<JungleCamp, string> = {
+  blue: "蓝",
+  red: "红",
+  wolves: "三狼",
+  raptors: "F6",
+};
+
 export const JUNGLE_ZONE_LABELS: Record<JungleZone, string> = {
   top: "上路",
   mid: "中路",
@@ -101,6 +114,9 @@ export function campCountsTotal(counts: Record<JungleCamp, number>): number {
 /**
  * 「哪个野怪开得多」——按次数降序取前 `limit` 个，带上占比。
  * 与后端 `writeClearPattern` 的口径一致（占比基数是该组的总次数，不是场次）。
+ *
+ * 文案对齐 AK 的 `campStart`（`三狼 开 100%`）：带上「开」字才读得懂这是
+ * 「这组样本里从哪个野怪起的」，否则就只是几个营地名加百分比，看不出在说什么。
  */
 export function describeCamps(counts: Record<JungleCamp, number>, limit = 2): string {
   const total = campCountsTotal(counts);
@@ -109,7 +125,7 @@ export function describeCamps(counts: Record<JungleCamp, number>, limit = 2): st
     .filter((camp) => (counts[camp] ?? 0) > 0)
     .sort((left, right) => (counts[right] ?? 0) - (counts[left] ?? 0))
     .slice(0, limit)
-    .map((camp) => `${JUNGLE_CAMP_LABELS[camp]} ${Math.round(((counts[camp] ?? 0) / total) * 100)}%`)
+    .map((camp) => `${JUNGLE_CAMP_LABELS[camp]} 开 ${Math.round(((counts[camp] ?? 0) / total) * 100)}%`)
     .join(" · ");
 }
 
