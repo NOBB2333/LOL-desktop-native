@@ -217,5 +217,29 @@ describe("PlayerCard", () => {
     const wrapper = mount(PlayerCard, { props: { player: fixtureLobby.ally[0], jungleMap: junglePathMap } });
 
     expect(wrapper.find("[data-testid='player-card-jungle-map']").exists()).toBe(false);
+    // 连入口按钮也不该有，否则点进去是个空抽屉。
+    expect(wrapper.find("[data-testid='player-card-jungle-link']").exists()).toBe(false);
+  });
+
+  it("点卡片上的打野那块发出 select-jungle，而不是普通的 select", () => {
+    // 「打野偏好」行和路线图必须是**一个**入口：打野分析在抽屉里排在好几个 section
+    // 之后，只有单独一条 select-jungle 才能让抽屉滚过去。这里同时验证 @click.stop
+    // 生效——事件没冒泡到卡片根，所以不会顺带冒出一个「开抽屉停在顶部」的 select。
+    const wrapper = mount(PlayerCard, { props: { player: fixtureLobby.ally[1], jungleMap: junglePathMap } });
+
+    void wrapper.get("[data-testid='player-card-jungle-link']").trigger("click");
+
+    expect(wrapper.emitted("select-jungle")).toEqual([[fixtureLobby.ally[1]]]);
+    expect(wrapper.emitted("select")).toBeUndefined();
+  });
+
+  it("打野入口把「打野偏好」和路线图都包在里面", () => {
+    const wrapper = mount(PlayerCard, { props: { player: fixtureLobby.ally[1], jungleMap: junglePathMap } });
+
+    const link = wrapper.get("[data-testid='player-card-jungle-link']");
+    expect(link.text()).toContain("打野偏好");
+    expect(link.find("[data-testid='player-card-jungle-map']").exists()).toBe(true);
+    // 路线图还没回来时入口也得在，否则用户点不开抽屉看打野分析。
+    expect(mount(PlayerCard, { props: { player: fixtureLobby.ally[1] } }).find("[data-testid='player-card-jungle-link']").exists()).toBe(true);
   });
 });

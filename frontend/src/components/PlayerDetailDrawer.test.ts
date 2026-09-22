@@ -1,18 +1,19 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { QueryClient, VueQueryPlugin } from "@tanstack/vue-query";
+import { nextTick } from "vue";
 import type { Plugin } from "vue";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fixtureEncounters, fixtureLobby, fixtureMatches } from "../fixtures/data";
 import PlayerDetailDrawer from "./PlayerDetailDrawer.vue";
 
-const { encounters, matches, matchDetail, push } = vi.hoisted(() => ({ encounters: vi.fn(), matches: vi.fn(), matchDetail: vi.fn(), push: vi.fn() }));
+const { encounters, matches, matchDetail, junglePath, push } = vi.hoisted(() => ({ encounters: vi.fn(), matches: vi.fn(), matchDetail: vi.fn(), junglePath: vi.fn(), push: vi.fn() }));
 
 vi.mock("vue-router", () => ({
   useRouter: () => ({ push }),
 }));
 
 vi.mock("../services/backend", () => ({
-  backend: { encounters, matches, matchDetail },
+  backend: { encounters, matches, matchDetail, junglePath },
   isTauri: () => false,
 }));
 
@@ -50,6 +51,71 @@ describe("PlayerDetailDrawer", () => {
       if (!found) throw new Error("该对局的完整详情不可用");
       return structuredClone(found);
     });
+    junglePath.mockReset();
+    junglePath.mockResolvedValue(null);
+  });
+
+  /**
+   * 打野分析排在「分析标签 / 共同战绩 / 组队信息」后面，抽屉打开时默认停在顶部，
+   * 所以从卡片上的打野入口进来必须额外滚一次。
+   *
+   * jsdom 不实现 `scrollIntoView`，这里自己装一个把「滚的是哪个元素」记下来。
+   * 抽屉必须 `attachTo` 到 document —— 组件里用 `isConnected` 挡掉「已经不在文档上
+   * 的旧目标」，detached 的树会让断言永远看不到滚动。
+   */
+  const originalScrollIntoView = Element.prototype.scrollIntoView;
+  let mountedDrawers: ReturnType<typeof mount>[] = [];
+
+  afterEach(() => {
+    // 卸载是必须的：补正滚动挂在 160/420/900ms 的定时器上，不卸载的话
+    // 上一个用例的定时器会打进球面下一个用例的 spy（已经踩过一次）。
+    for (const drawer of mountedDrawers) drawer.unmount();
+    mountedDrawers = [];
+    Element.prototype.scrollIntoView = originalScrollIntoView;
+  });
+
+  async function mountScrolledDrawer(props: Record<string, unknown>) {
+    const scrolled: Element[] = [];
+    Element.prototype.scrollIntoView = function scrollIntoViewSpy(this: Element) { scrolled.push(this); };
+    const wrapper = mount(PlayerDetailDrawer, {
+      props: { show: true, ...props },
+      attachTo: document.body,
+      global: {
+        plugins: testPlugins(),
+        stubs: { Drawer: DrawerStub, DrawerContent: DrawerContentStub, AssetIcon: true, EncounterMatchModal: true },
+      },
+    });
+    mountedDrawers.push(wrapper);
+    await flushPromises();
+    await nextTick();
+    // 第一次落位走的是 `nextFrame`（rAF 退化成 16ms 定时器），等它跑完。
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    return { wrapper, scrolled };
+  }
+
+  it("从卡片打野入口进来时滚到打野分析那一段", async () => {
+    // fixture 里只有打野位带 junglePreference，抽屉里才会有那一段。
+    const { wrapper, scrolled } = await mountScrolledDrawer({ player: fixtureLobby.ally[1], focusSection: "jungle" });
+
+    const section = wrapper.get("[data-testid='jungle-preference']");
+    expect(scrolled).toContain(section.element);
+    // 滚到位还不够，得闪一下，否则「停在某一屏」看不出该看哪儿。
+    expect(section.attributes("data-focus")).toBe("true");
+  });
+
+  it("普通入口（不指定 focusSection）不滚打野那一段", async () => {
+    const { wrapper, scrolled } = await mountScrolledDrawer({ player: fixtureLobby.ally[1] });
+
+    const section = wrapper.get("[data-testid='jungle-preference']");
+    expect(scrolled).not.toContain(section.element);
+    expect(section.attributes("data-focus")).toBeUndefined();
+  });
+
+  it("玩家没有打野样本时不硬滚（抽屉里根本没有那一段）", async () => {
+    const { wrapper, scrolled } = await mountScrolledDrawer({ player: fixtureLobby.ally[0], focusSection: "jungle" });
+
+    expect(wrapper.find("[data-testid='jungle-preference']").exists()).toBe(false);
+    expect(scrolled).toEqual([]);
   });
 
   it("先前玩家的慢请求不会覆盖当前玩家相遇记录", async () => {

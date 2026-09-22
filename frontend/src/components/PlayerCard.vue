@@ -36,6 +36,13 @@ const props = withDefaults(
 const emit = defineEmits<{
   select: [player: PlayerProfile];
   "select-match": [player: PlayerProfile, gameId: number];
+  /**
+   * 点卡片上「打野」那一块。
+   *
+   * 跟 `select` 分开是必须的：`select` 开的抽屉停在顶部，而打野分析排在
+   * 分析标签 / 共同战绩 / 组队信息之后，得额外叫抽屉滚过去。
+   */
+  "select-jungle": [player: PlayerProfile];
   "select-encounter": [player: PlayerProfile, records: EncounterRecord[]];
   "retry-encounters": [];
   "edit-notes": [player: PlayerProfile];
@@ -343,22 +350,35 @@ function selectFromKeyboard(event: KeyboardEvent) {
       </div>
     </div>
 
-    <div v-if="player.junglePreference" class="bp-player-card__jungle" :data-style="player.junglePreference.style" :title="player.junglePreference.evidence">
-      <MapPinned :size="12" />
-      <span>打野偏好</span>
-      <strong>{{ player.junglePreference.label }}</strong>
-      <small>{{ player.junglePreference.sampleSize }} 场 · {{ Math.round(player.junglePreference.winRate * 100) }}%</small>
-    </div>
-
-    <div v-if="showJungleMap" class="bp-player-card__jungle-map" data-testid="player-card-jungle-map">
-      <div class="bp-player-card__jungle-map-head">
-        <span>打野路线图</span>
-        <small v-if="jungleMap">{{ jungleMap.games }} 局样本</small>
-        <small v-else-if="jungleMapLoading">解析逐帧数据…</small>
-        <small v-else>暂无逐帧数据</small>
+    <!-- 「打野偏好」这一行和下面的路线图合成**一个**可点区域：点它开的抽屉会直接落到
+         「打野分析」那一段。必须 `@click.stop`，否则事件冒泡到卡片根的 `select`，
+         抽屉就只会停在顶部（原来就是这个表现）。 -->
+    <button
+      v-if="player.junglePreference || showJungleMap"
+      type="button"
+      class="bp-player-card__jungle-link"
+      data-testid="player-card-jungle-link"
+      :title="`在详情里查看 ${player.gameName} 的完整打野分析`"
+      :aria-label="`查看 ${player.gameName} 的打野分析`"
+      @click.stop="emit('select-jungle', player)"
+    >
+      <div v-if="player.junglePreference" class="bp-player-card__jungle" :data-style="player.junglePreference.style" :title="player.junglePreference.evidence">
+        <MapPinned :size="12" />
+        <span>打野偏好</span>
+        <strong>{{ player.junglePreference.label }}</strong>
+        <small>{{ player.junglePreference.sampleSize }} 场 · {{ Math.round(player.junglePreference.winRate * 100) }}%</small>
       </div>
-      <JungleRouteMap v-if="jungleMap" :path="jungleMap" variant="inline" />
-    </div>
+
+      <div v-if="showJungleMap" class="bp-player-card__jungle-map" data-testid="player-card-jungle-map">
+        <div class="bp-player-card__jungle-map-head">
+          <span>打野路线图</span>
+          <small v-if="jungleMap">{{ jungleMap.games }} 局样本</small>
+          <small v-else-if="jungleMapLoading">解析逐帧数据…</small>
+          <small v-else>暂无逐帧数据</small>
+        </div>
+        <JungleRouteMap v-if="jungleMap" :path="jungleMap" variant="inline" />
+      </div>
+    </button>
 
     <!-- 特色标签区：统一由标签系统渲染，顺序与开关见 frontend/src/tags -->
     <footer class="bp-player-card__tags">
@@ -998,6 +1018,12 @@ function selectFromKeyboard(event: KeyboardEvent) {
   font-weight: 600;
 }
 
+/* 打野入口：把「打野偏好」行 + 路线图包成一个可点区域（点了抽屉直接落到打野分析）。
+   卡片根是 flex column，所以这里也用 flex column —— 换成普通 block 的话，内部两个
+   `margin-top: 7px` 会隔着按钮边界塌陷，间距就和原来对不上了。 */
+.bp-player-card__jungle-link { display: flex; flex-direction: column; width: 100%; min-width: 0; margin: 0; padding: 0; border: 0; color: inherit; background: transparent; font: inherit; text-align: left; cursor: pointer; }
+.bp-player-card__jungle-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.bp-player-card__jungle-link:hover .bp-player-card__jungle-map-head span { color: var(--accent); }
 .bp-player-card__jungle { display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; align-items: center; gap: 5px; min-height: 25px; margin-top: 7px; padding: 4px 6px; border-left: 2px solid var(--blue); color: var(--text-secondary); background: var(--blue-soft); font-size: 9px; }
 .bp-player-card__jungle svg { color: var(--blue); }
 .bp-player-card__jungle strong { overflow: hidden; color: var(--text-primary); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }

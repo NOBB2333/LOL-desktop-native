@@ -26,6 +26,11 @@ const props = defineProps<{
   player: PlayerProfile | null;
   lobby?: LiveLobby | null;
   initialMatchId?: number | null;
+  /**
+   * 打开时要直接落到的区块。目前只有 `"jungle"`——玩家卡上点「打野」那块进来时，
+   * 抽屉要滚到打野分析，而不是停在顶部（打野分析排在好几个 section 之后）。
+   */
+  focusSection?: "jungle" | null;
   suppressEncounters?: boolean;
   localPlayer?: PlayerProfile | null;
   playerNotes?: string[];
@@ -42,6 +47,10 @@ const expandedMatchId = ref<number | null>(null);
 /** 已经自动展开过的 initialMatchId；避免后台刷新数据时把用户手动收起的行再次弹开。 */
 let autoExpandedMatchId: number | null = null;
 const matchesSection = ref<HTMLElement | null>(null);
+const jungleSection = ref<HTMLElement | null>(null);
+/** 刚被打野入口送进来的那一段，短暂高亮一下——只滚不说话，用户还是不知道看哪儿。 */
+const focusedSection = ref<"jungle" | null>(null);
+const focusHighlightMs = 1600;
 const selectedEncounterRecords = ref<EncounterRecord[]>([]);
 const encounterModalOpen = ref(false);
 const router = useRouter();
@@ -221,6 +230,53 @@ function scrollToMatchInDrawer(gameId: number, attempt = 0) {
     if (attempt === 0) window.setTimeout(() => scrollToMatchInDrawer(gameId, 1), 320);
   });
 }
+/**
+ * 把某个 section 滚到抽屉可视区顶部。
+ *
+ * 分几次落位是刻意的：抽屉自己的进入动画、以及排在它**上面**的几个异步区块
+ * （分析标签、共同战绩、组队信息）都会在首帧之后继续撑高内容，目标元素的上边界
+ * 一直在动，只滚一次会停在半路。打野分析恰好排在它们后面，所以这个补正必须有。
+ * 抽屉已关、或元素已经被换掉（不再挂在文档上）就不再滚——这些补正各自挂着定时器，
+ * 关掉之后还去滚只是白跑，还可能把已经换掉的旧目标滚进来。
+ */
+const sectionScrollDelays = [0, 160, 420, 900];
+function scrollToSection(element: HTMLElement | null) {
+  if (!element) return;
+  for (const delay of sectionScrollDelays) {
+    const land = () => {
+      if (!props.show || !element.isConnected) return;
+      element.scrollIntoView?.({ behavior: "smooth", block: "start" });
+    };
+    if (delay === 0) nextFrame(land);
+    else window.setTimeout(land, delay);
+  }
+}
+/** section 要等 `v-if="player"` 与打野样本就位才渲染，所以先按帧等它出现。 */
+function scrollToJungleSection(attempt = 0) {
+  void nextTick(() => {
+    const section = jungleSection.value;
+    if (!section) {
+      if (attempt < 8) nextFrame(() => scrollToJungleSection(attempt + 1));
+      return;
+    }
+    scrollToSection(section);
+  });
+}
+/**
+ * 玩家卡上点「打野」那块进来的入口。
+ *
+ * `flush: "post"` 不能省：要等 `v-if` 那一段真的渲染出来，否则取到的是 null。
+ * 没有打野样本时抽屉里根本没有这一段，直接放行（不滚，也不高亮）。
+ */
+watch([() => props.show, () => props.focusSection, () => props.player?.puuid], () => {
+  focusedSection.value = null;
+  if (!props.show || props.focusSection !== "jungle" || !props.player?.junglePreference) return;
+  focusedSection.value = "jungle";
+  window.setTimeout(() => {
+    if (focusedSection.value === "jungle") focusedSection.value = null;
+  }, focusHighlightMs);
+  scrollToJungleSection();
+}, { immediate: true, flush: "post" });
 watch([() => props.show, () => props.initialMatchId, () => detailedMatchQuery.data.value], async () => {
   if (!props.show || props.initialMatchId == null || autoExpandedMatchId === props.initialMatchId) return;
   const matches = detailedMatchQuery.data.value;
@@ -262,7 +318,7 @@ function sideFor(player: PlayerProfile) {
         <PlayerTagMetPopover :games="encounterGames" :total="Math.max(encounterGames.length, player.encounterCount)" :target-name="player.gameName" :last-met-at="player.lastEncounteredAt ?? ''" hide-summary @inspect="openEncounterGame" />
       </section>
       <section v-if="player.isPremade" class="player-drawer__section"><header><div><span class="eyebrow">组队信息</span><h3>本局开黑</h3></div><span>LCU 当前局信息</span></header><div class="player-drawer__party"><Link2 :size="16" /><span>{{ player.premadeWith.length ? `与 ${player.premadeWith.join("、")} 一起组队` : "检测到组队，但客户端未返回队友名称" }}</span></div></section>
-      <section v-if="player.junglePreference" class="player-drawer__section player-drawer__jungle" data-testid="jungle-preference"><header><div><span class="eyebrow">打野分析</span><h3><MapPinned :size="15" />打野偏好</h3></div><span>基于最近 {{ player.junglePreference.sampleSize }} 场打野</span></header><div class="player-drawer__jungle-head" :data-style="player.junglePreference.style"><div><small>风格判断</small><strong>{{ player.junglePreference.label }}</strong></div><p>{{ player.junglePreference.evidence }}</p></div><div class="player-drawer__jungle-metrics"><div><span>胜率</span><strong>{{ percent(player.junglePreference.winRate) }}</strong><small>{{ player.junglePreference.wins }} 胜 / {{ player.junglePreference.sampleSize }} 场</small></div><div><span>平均 KDA</span><strong>{{ player.junglePreference.averageKda.toFixed(1) }}</strong><small>打野样本</small></div><div><span>平均参团</span><strong>{{ percent(player.junglePreference.averageKillParticipation) }}</strong><small>击杀与助攻参与</small></div><div><span>分均补刀</span><strong>{{ player.junglePreference.averageCsPerMinute.toFixed(1) }}</strong><small>兵线与野怪合计</small></div><div><span>前期参与击杀</span><strong>{{ player.junglePreference.averageEarlyTakedowns?.toFixed(1) ?? "--" }}</strong><small>{{ player.junglePreference.averageEarlyTakedowns === null ? "SGP 暂无数据" : "场均精确挑战数据" }}</small></div><div><span>资源参与</span><strong>{{ player.junglePreference.averageObjectiveTakedowns?.toFixed(1) ?? "--" }}</strong><small>小龙 / 峡谷 / 大龙</small></div><div><span>反野数量</span><strong>{{ player.junglePreference.averageEnemyJungleMonsters?.toFixed(1) ?? "--" }}</strong><small>场均敌方野区击杀</small></div><div><span>本局英雄样本</span><strong>{{ player.junglePreference.currentChampionGames }}</strong><small>近期打野局</small></div></div><div v-if="player.junglePreference.mainChampions.length" class="player-drawer__jungle-champions"><span>常用打野</span><div><span v-for="champion in player.junglePreference.mainChampions" :key="champion.championId"><AssetIcon kind="champion" :id="champion.championId" :name="champion.championName" size="sm" /><strong>{{ champion.championName }}</strong><small>{{ champion.games }} 场 · {{ percent(champion.winRate) }}</small></span></div></div><div class="player-drawer__jungle-map" data-testid="jungle-route"><div class="player-drawer__jungle-map-head"><strong>打野路线图</strong><span>近期打野局前 15 分钟逐帧落点 · {{ jungleGameIds.length }} 局样本</span></div><JungleRouteMap v-if="junglePath" :path="junglePath" /><div v-else-if="junglePathLoading" class="player-drawer__match-status">正在解析逐帧路线数据…</div><div v-else class="player-drawer__match-status" :data-tone="junglePathError ? 'warning' : null">{{ junglePathError || "这批对局没有可用的逐帧数据（SGP DETAILS 缺失）" }} <button v-if="junglePathError" type="button" class="player-drawer__retry" @click="junglePathQuery.refetch()">重试</button></div></div></section>
+      <section v-if="player.junglePreference" ref="jungleSection" class="player-drawer__section player-drawer__jungle" data-testid="jungle-preference" :data-focus="focusedSection === 'jungle' ? 'true' : undefined"><header><div><span class="eyebrow">打野分析</span><h3><MapPinned :size="15" />打野偏好</h3></div><span>基于最近 {{ player.junglePreference.sampleSize }} 场打野</span></header><div class="player-drawer__jungle-head" :data-style="player.junglePreference.style"><div><small>风格判断</small><strong>{{ player.junglePreference.label }}</strong></div><p>{{ player.junglePreference.evidence }}</p></div><div class="player-drawer__jungle-metrics"><div><span>胜率</span><strong>{{ percent(player.junglePreference.winRate) }}</strong><small>{{ player.junglePreference.wins }} 胜 / {{ player.junglePreference.sampleSize }} 场</small></div><div><span>平均 KDA</span><strong>{{ player.junglePreference.averageKda.toFixed(1) }}</strong><small>打野样本</small></div><div><span>平均参团</span><strong>{{ percent(player.junglePreference.averageKillParticipation) }}</strong><small>击杀与助攻参与</small></div><div><span>分均补刀</span><strong>{{ player.junglePreference.averageCsPerMinute.toFixed(1) }}</strong><small>兵线与野怪合计</small></div><div><span>前期参与击杀</span><strong>{{ player.junglePreference.averageEarlyTakedowns?.toFixed(1) ?? "--" }}</strong><small>{{ player.junglePreference.averageEarlyTakedowns === null ? "SGP 暂无数据" : "场均精确挑战数据" }}</small></div><div><span>资源参与</span><strong>{{ player.junglePreference.averageObjectiveTakedowns?.toFixed(1) ?? "--" }}</strong><small>小龙 / 峡谷 / 大龙</small></div><div><span>反野数量</span><strong>{{ player.junglePreference.averageEnemyJungleMonsters?.toFixed(1) ?? "--" }}</strong><small>场均敌方野区击杀</small></div><div><span>本局英雄样本</span><strong>{{ player.junglePreference.currentChampionGames }}</strong><small>近期打野局</small></div></div><div v-if="player.junglePreference.mainChampions.length" class="player-drawer__jungle-champions"><span>常用打野</span><div><span v-for="champion in player.junglePreference.mainChampions" :key="champion.championId"><AssetIcon kind="champion" :id="champion.championId" :name="champion.championName" size="sm" /><strong>{{ champion.championName }}</strong><small>{{ champion.games }} 场 · {{ percent(champion.winRate) }}</small></span></div></div><div class="player-drawer__jungle-map" data-testid="jungle-route"><div class="player-drawer__jungle-map-head"><strong>打野路线图</strong><span>近期打野局前 15 分钟逐帧落点 · {{ jungleGameIds.length }} 局样本</span></div><JungleRouteMap v-if="junglePath" :path="junglePath" /><div v-else-if="junglePathLoading" class="player-drawer__match-status">正在解析逐帧路线数据…</div><div v-else class="player-drawer__match-status" :data-tone="junglePathError ? 'warning' : null">{{ junglePathError || "这批对局没有可用的逐帧数据（SGP DETAILS 缺失）" }} <button v-if="junglePathError" type="button" class="player-drawer__retry" @click="junglePathQuery.refetch()">重试</button></div></div></section>
       <section class="player-drawer__section"><header><div><span class="eyebrow">评分依据</span><h3>评分构成</h3></div></header><div class="player-drawer__breakdown"><div v-for="item in player.score.components" :key="item.key"><div><span>{{ item.label }}</span><b>{{ item.score.toFixed(1) }} / {{ item.maxScore }}</b></div><i :class="meterClass(item.maxScore ? item.score / item.maxScore : 0)" /><small>{{ item.evidence }}</small></div></div></section>
       <section class="player-drawer__section"><header><div><span class="eyebrow">英雄池</span><h3>主要英雄</h3></div><span>{{ Math.round(player.championPoolConcentration * 100) }}% 集中度</span></header><div class="player-drawer__champion-list"><div v-for="champion in player.topChampions" :key="champion.championId"><AssetIcon kind="champion" :id="champion.championId" :name="champion.championName" size="md" /><strong>{{ champion.championName }}</strong><span>{{ champion.wins }} 胜</span><b>{{ champion.games }} 把</b></div></div></section>
       <section v-if="lobbyPlayers.length" class="player-drawer__section"><header><div><span class="eyebrow">当前阵容</span><h3>本局玩家</h3></div><span>{{ lobbyPlayers.length }} 人 · 当前玩家高亮</span></header><div class="player-drawer__lobby"><section v-for="team in lobbyTeams" :key="team.id" class="player-drawer__lobby-team" :data-side="team.side"><header><strong>{{ team.label }}</strong><span>{{ team.players.length }} 人</span></header><div class="player-drawer__lobby-list"><button v-for="item in team.players" :key="item.puuid" type="button" class="player-drawer__lobby-player" :class="{ 'player-drawer__lobby-player--self': item.puuid === player.puuid }" :data-side="sideFor(item)" @click="openHistory(item)"><AssetIcon kind="champion" :id="item.championId" :name="item.championName" :fallback-url="championImage(item.championId)" size="sm" /><span><strong>{{ item.gameName }}<em v-if="item.puuid === player.puuid">本人</em></strong><small>{{ item.championName }} · {{ roleName(item.assignedPosition) }}</small></span><b>{{ item.recentMatches.length ? percent(item.recentMatches.filter((match) => match.win).length / item.recentMatches.length) : "--" }}</b></button></div></section></div></section>
@@ -289,6 +345,13 @@ function sideFor(player: PlayerProfile) {
 .player-drawer__overview strong { margin-top: 8px; font-size: 17px; }
 .player-drawer__overview small { margin-top: 3px; color: var(--text-secondary); font-size: 9px; }
 .player-drawer__section { padding: 15px 0; border-top: 1px solid var(--line); }
+/* 从卡片上的打野入口跳进来时闪一下：滚动到位也只是「停在某一屏」，不标一下
+   还是不知道该看哪块。用背景+左侧竖条做一次淡出，不动布局（避免二次位移）。 */
+.player-drawer__jungle[data-focus="true"] { animation: player-drawer-section-focus 1.6s ease-out; }
+@keyframes player-drawer-section-focus {
+  0% { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+  100% { background: transparent; box-shadow: inset 3px 0 0 transparent; }
+}
 .player-drawer__section header { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 12px; color: var(--text-secondary); font-size: 10px; }
 .player-drawer__section h3 { margin: 3px 0 0; color: var(--text-primary); font-size: 14px; }
 .player-drawer__retry { padding: 0; border: 0; color: var(--accent); background: transparent; font: inherit; cursor: pointer; text-decoration: underline; }
