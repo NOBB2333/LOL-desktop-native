@@ -67,7 +67,8 @@ pub const Client = struct {
 
     pub fn discover(allocator: std.mem.Allocator, io: std.Io, configured: []const []const u8, env_map: ?*const std.process.Environ.Map) !Client {
         if (builtin.os.tag == .windows) {
-            if (discoverProcessNative(allocator, io)) |command_line| {
+            const probe = discoverProcessNative(allocator, io);
+            if (probe.command_line) |command_line| {
                 if (fromCommandLine(command_line)) |credentials| {
                     const owned = try ownCredentials(allocator, credentials);
                     allocator.free(command_line);
@@ -80,18 +81,29 @@ pub const Client = struct {
                 } else |_| {}
                 allocator.free(command_line);
             }
-            if (discoverProcess(allocator, io)) |command_line| {
-                if (fromCommandLine(command_line)) |credentials| {
-                    const owned = try ownCredentials(allocator, credentials);
+            // ⚠️ 只有**确认进程存在**时才值得动用 WMI 兜底。
+            //
+            // 那个兜底脚本本身就是 `Get-CimInstance Win32_Process -Filter "Name='LeagueClientUx.exe'"`
+            // ——进程不存在它必然查空。而它的代价是**起一个 PowerShell 进程**（启动开销
+            // 几百毫秒 + WMI 查询），远贵于一次 Toolhelp 扫描。
+            //
+            // 以前这里不看 `seen`，于是客户端没开时每轮连接刷新（5 秒）都要 spawn 一次
+            // PowerShell，这就是「后台一直在扫什么」的真身。客户端在跑、只是命令行读不到
+            // （比如管理员权限启动）时 `seen` 为 true，兜底照旧生效。
+            if (probe.seen) {
+                if (discoverProcess(allocator, io)) |command_line| {
+                    if (fromCommandLine(command_line)) |credentials| {
+                        const owned = try ownCredentials(allocator, credentials);
+                        allocator.free(command_line);
+                        return .{ .allocator = allocator, .io = io, .credentials = owned };
+                    } else |_| {}
+                    if (fromLockfile(command_line)) |credentials| {
+                        const owned = try ownCredentials(allocator, credentials);
+                        allocator.free(command_line);
+                        return .{ .allocator = allocator, .io = io, .credentials = owned };
+                    } else |_| {}
                     allocator.free(command_line);
-                    return .{ .allocator = allocator, .io = io, .credentials = owned };
-                } else |_| {}
-                if (fromLockfile(command_line)) |credentials| {
-                    const owned = try ownCredentials(allocator, credentials);
-                    allocator.free(command_line);
-                    return .{ .allocator = allocator, .io = io, .credentials = owned };
-                } else |_| {}
-                allocator.free(command_line);
+                }
             }
         }
         for (configured) |path| {
@@ -154,17 +166,21 @@ pub const Client = struct {
     /// 调用方据此降级为「只用当前大区的 LCU 查询」。
     pub fn discoverRiotClient(allocator: std.mem.Allocator, io: std.Io) !Client {
         if (builtin.os.tag == .windows) {
-            if (discoverProcessNative(allocator, io)) |command_line| {
+            const probe = discoverProcessNative(allocator, io);
+            if (probe.command_line) |command_line| {
                 defer allocator.free(command_line);
                 if (fromRiotClientCommandLine(command_line)) |credentials| {
                     return .{ .allocator = allocator, .io = io, .credentials = try ownCredentials(allocator, credentials) };
                 } else |_| {}
             }
-            if (discoverProcess(allocator, io)) |command_line| {
-                defer allocator.free(command_line);
-                if (fromRiotClientCommandLine(command_line)) |credentials| {
-                    return .{ .allocator = allocator, .io = io, .credentials = try ownCredentials(allocator, credentials) };
-                } else |_| {}
+            // 与 `discover` 同理：进程不在就没什么可问 WMI 的，别白起一个 PowerShell。
+            if (probe.seen) {
+                if (discoverProcess(allocator, io)) |command_line| {
+                    defer allocator.free(command_line);
+                    if (fromRiotClientCommandLine(command_line)) |credentials| {
+                        return .{ .allocator = allocator, .io = io, .credentials = try ownCredentials(allocator, credentials) };
+                    } else |_| {}
+                }
             }
         }
         return error.NotRunning;
@@ -497,23 +513,35 @@ fn discoverProcess(allocator: std.mem.Allocator, io: std.Io) ?[]u8 {
 /// The Rust client handles that case with Toolhelp + QueryFullProcessImageName;
 /// keep the same native path here so a normal user launch can still locate the
 /// client-side lockfile without requiring an elevated PowerShell process.
-fn discoverProcessNative(allocator: std.mem.Allocator, io: std.Io) ?[]u8 {
-    if (builtin.os.tag != .windows) return null;
+/// `discoverProcessNative` 的探测结果。
+///
+/// 分成两件事是有意义的：`seen`（进程在不在）非常便宜——Toolhelp 快照里每个进程都
+/// 直接带 `szExeFile`，不用碰进程句柄；`command_line`（凭据读没读到）才需要开句柄。
+/// 调用方靠 `seen` 决定要不要动用 WMI 兜底，见 `discover` 里的说明。
+const ProcessProbe = struct {
+    seen: bool = false,
+    command_line: ?[]u8 = null,
+};
+
+fn discoverProcessNative(allocator: std.mem.Allocator, io: std.Io) ProcessProbe {
+    if (builtin.os.tag != .windows) return .{};
     const api = windows_process_api;
-    const snapshot = api.CreateToolhelp32Snapshot(api.TH32CS_SNAPPROCESS, 0) orelse return null;
-    if (@intFromPtr(snapshot) == std.math.maxInt(usize)) return null;
+    const snapshot = api.CreateToolhelp32Snapshot(api.TH32CS_SNAPPROCESS, 0) orelse return .{};
+    if (@intFromPtr(snapshot) == std.math.maxInt(usize)) return .{};
     defer _ = api.CloseHandle(snapshot);
 
     var entry: api.ProcessEntry32W = undefined;
     entry.dwSize = @sizeOf(api.ProcessEntry32W);
-    if (api.Process32FirstW(snapshot, &entry) == 0) return null;
+    if (api.Process32FirstW(snapshot, &entry) == 0) return .{};
+    var seen = false;
     while (true) {
         if (api.isLeagueClientUx(entry.szExeFile[0..])) {
-            if (discoverNativeProcessCredentials(allocator, io, entry.th32ProcessID)) |value| return value;
+            seen = true;
+            if (discoverNativeProcessCredentials(allocator, io, entry.th32ProcessID)) |value| return .{ .seen = true, .command_line = value };
         }
         if (api.Process32NextW(snapshot, &entry) == 0) break;
     }
-    return null;
+    return .{ .seen = seen };
 }
 
 fn discoverNativeProcessCredentials(allocator: std.mem.Allocator, io: std.Io, pid: u32) ?[]u8 {

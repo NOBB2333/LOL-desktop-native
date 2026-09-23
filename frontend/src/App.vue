@@ -30,10 +30,12 @@ const navigation = [
   { to: "/history", label: "历史", icon: History },
   { to: "/friends", label: "好友", icon: UserRound },
   // 「一键领取」并进了自动化页，「客户端急救」并进了对局页右栏，工具箱页已移除。
-  { to: "/game", label: "对局", icon: Swords, badge: "实时" },
   // 一键启动从顶栏搬成了独立页：启动是一次性动作，不该长期占着顶栏；
   // 「装在哪、有哪些入口」倒是值得常驻（见 ClientView 的说明）。
+  // 顺序上「客户端」紧挨在「对局」上面：客户端没起来的场景就是先来这一页，
+  // 再进对局页看实时数据，「对局」因此放最下面。
   { to: "/client", label: "客户端", icon: Rocket },
+  { to: "/game", label: "对局", icon: Swords, badge: "实时" },
 ];
 // Keep every phase that can still expose the current ten-player snapshot on
 // the game workspace, including reconnect, spectator, and settlement aliases.
@@ -72,6 +74,14 @@ let lastAutomationProbeAt = 0;
 const matchHistoryRefreshTimers: ReturnType<typeof setTimeout>[] = [];
 const normalEventPollIntervalMs = 1000;
 const automationEventPollIntervalMs = 750;
+/**
+ * 客户端没连上时的轮询间隔。
+ *
+ * 事件队列是后端从 LCU 推过来的——**客户端没起来就永远不会有事件**，还按 750ms
+ * 去问一遍纯属白跑（每次都是一趟原生桥往返）。连接状态由 5 秒一次的状态轮询负责，
+ * 一旦连上这里立刻回到正常节奏，所以最多慢 3 秒，感知不到。
+ */
+const disconnectedEventPollIntervalMs = 3000;
 const automationProbeIntervalMs = 500;
 const eventDrivenConnectionMinIntervalMs = 1000;
 
@@ -101,6 +111,22 @@ watch(() => app.lastSavedAt, () => {
   void queryClient.resetQueries({ queryKey: [MATCH_HISTORY_QUERY_ROOT] });
   void queryClient.resetQueries({ queryKey: ["lobby"] });
 });
+
+/**
+ * 首次落地：客户端没在跑的时候，直接把用户送到「客户端」页。
+ *
+ * 判据只在 `app.initialized` 变 true 的那一瞬间取**一次**——之后用户点哪儿就是哪儿。
+ * 否则客户端中途掉线会把正在看战绩的人弹走（那是打断，不是帮忙）。
+ * 严格条件另有三条：还在首页、实时模式、以及确实没连上——用户若主动切到演示模式，
+ * 说明他就是想在没有客户端的情况下翻页面，不该被推回启动页。
+ */
+let landingDecided = false;
+watch(() => app.initialized, (ready) => {
+  if (!ready || landingDecided) return;
+  landingDecided = true;
+  if (route.path !== "/" || app.mode !== "live" || app.connection.status === "connected") return;
+  void router.replace("/client");
+}, { immediate: true });
 
 function scheduleMatchHistoryRefresh() {
   invalidateMatchHistory();
@@ -158,7 +184,10 @@ async function runAutomationIfNeeded(events: { uri: string; phase?: string }[]) 
 async function pollLcuEvents() {
   if (!app.initialized || app.mode !== "live" || lcuEventPollRunning) return;
   const now = Date.now();
-  const interval = automationEnabled() ? automationEventPollIntervalMs : normalEventPollIntervalMs;
+  // 没连上就慢跑：见 `disconnectedEventPollIntervalMs` 的说明。
+  const interval = app.connection.status !== "connected"
+    ? disconnectedEventPollIntervalMs
+    : (automationEnabled() ? automationEventPollIntervalMs : normalEventPollIntervalMs);
   if (now - lastLcuEventPollAt < interval) return;
   lastLcuEventPollAt = now;
   lcuEventPollRunning = true;
