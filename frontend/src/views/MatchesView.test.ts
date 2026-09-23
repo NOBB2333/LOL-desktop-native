@@ -2,6 +2,7 @@ import { QueryClient, VueQueryPlugin } from "@tanstack/vue-query";
 import { flushPromises, mount } from "@vue/test-utils";
 import { describe, expect, it } from "vitest";
 import MatchesView from "./MatchesView.vue";
+import { fixtureConfig, fixtureMatches } from "../fixtures/data";
 
 /**
  * 这一层只盯「账号信息条」这一件事（用户反馈过战绩页看不到等级和段位）：
@@ -9,7 +10,10 @@ import MatchesView from "./MatchesView.vue";
  * - 在查别人时改读**被查玩家**，并且跨区拿不到数据时显示「—」而不是「无段位」。
  * 对局列表本身有别的用例覆盖，这里让它空着。
  */
-const { route } = vi.hoisted(() => ({ route: { query: {} as Record<string, unknown> } }));
+const { route, backendState } = vi.hoisted(() => ({
+  route: { query: {} as Record<string, unknown> },
+  backendState: { matchRows: [] as unknown[] },
+}));
 
 vi.mock("vue-router", () => ({
   useRoute: () => route,
@@ -57,7 +61,7 @@ vi.mock("../stores/app", async () => {
 vi.mock("../services/backend", () => ({
   isTauri: () => false,
   backend: {
-    matches: async () => [],
+    matches: async () => backendState.matchRows as never,
     encounters: async () => [],
     friends: async () => ({ groups: [], friends: [] }),
     matchDetail: async () => null,
@@ -126,5 +130,30 @@ describe("MatchesView 账号信息条", () => {
     expect(strip).toContain("—");
     expect(strip).not.toContain("未定级");
     expect(strip).not.toContain("Lv.318");
+  });
+});
+
+describe("MatchesView 过滤口径", () => {
+  it("「仅显示排位」不在前端二次筛选，采信数据源返回的那一页", async () => {
+    backendState.matchRows = [
+      { ...fixtureMatches[0], gameId: 9001, queueId: 420, queueName: "单双排" },
+      { ...fixtureMatches[1], gameId: 9002, queueId: 450, queueName: "极地大乱斗" },
+    ];
+    const previous = fixtureConfig.providers.rankedOnly;
+    fixtureConfig.providers.rankedOnly = true;
+    try {
+      route.query = {};
+      const wrapper = mountView();
+      await flushPromises();
+
+      // 后端是**先筛选再分页**（`matchHistoryDtoPageWithFilters`，有同名后端用例守着），
+      // 所以打开开关时返回的这一页本来就全是排位。前端再筛一遍不加信息量，反而会在
+      // 开关刚切换、配置还没落到后端时把整页削成几条——用户看到的就是
+      // 「只把上一次请求的结果过了一遍」。这里锁死：返回什么就显示什么。
+      expect(wrapper.text()).toContain("显示 2 条");
+    } finally {
+      fixtureConfig.providers.rankedOnly = previous;
+      backendState.matchRows = [];
+    }
   });
 });

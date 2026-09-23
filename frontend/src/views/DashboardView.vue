@@ -19,16 +19,24 @@ const app = useAppStore();
 const message = useMessage();
 const matches = useQuery({ queryKey: computed(() => matchHistoryQueryKey({ mode: app.mode, platformId: app.connection.platformId, gameName: app.connection.gameName, tagLine: app.connection.tagLine, page: 0, pageSize: 10, hideUnfinishedMatches: app.config.providers.hideUnfinishedMatches, rankedOnly: app.config.providers.rankedOnly })), queryFn: () => backend.matches(), enabled: computed(() => app.initialized), staleTime: 60_000, refetchInterval: computed(() => app.initialized && app.mode === "live" ? 15_000 : false) });
 const encounters = useQuery({ queryKey: computed(() => ["dashboard-encounters", app.mode, app.connection.platformId, app.connection.gameName, app.connection.tagLine]), queryFn: () => backend.encounters(undefined, 40), enabled: computed(() => app.initialized), staleTime: 20_000, refetchInterval: computed(() => app.initialized && app.mode === "live" ? 15_000 : false) });
+const fetchedRows = computed(() => matches.data.value);
+/**
+ * 是否在吃 LCU 兜底快照。
+ *
+ * 兜底快照（`app.bootstrap.dashboard.recentMatches`）是重连时直接落盘的**原始**数据，
+ * 没经过任何开关；而 `backend.matches()` 那一份后端已经**先筛选再分页**过了。
+ * 所以开关只对兜底快照在本地补筛一次——两套口径同时生效才会把整页削成几条。
+ */
+const usingBootstrap = computed(() => !fetchedRows.value?.length);
 const rawRows = computed(() => {
   // The native bridge can legitimately return an empty page while LCU is
   // reconnecting. Keep the bootstrap snapshot visible until a non-empty page
   // arrives so the dashboard never collapses into a blank history panel.
-  const fetched = matches.data.value;
-  return fetched?.length ? fetched : app.bootstrap.dashboard.recentMatches;
+  return fetchedRows.value?.length ? fetchedRows.value : app.bootstrap.dashboard.recentMatches;
 });
 const rows = computed(() => {
-  const visible = visibleMatches(rawRows.value, app.config.providers.hideUnfinishedMatches, app.config.providers.rankedOnly);
-  return visible.slice(0, 10);
+  const source = usingBootstrap.value ? visibleMatches(rawRows.value, app.config.providers.hideUnfinishedMatches, app.config.providers.rankedOnly) : rawRows.value;
+  return source.slice(0, 10);
 });
 const relationRows = computed(() => {
   const fetched = encounters.data.value;

@@ -69,6 +69,36 @@ jobs:
           sdk_path="$(npm root --global)/@native-sdk/cli"
           zig build test -Dplatform=null "-Dnative-sdk-path=$sdk_path" --summary all
 
+  backend-tests-windows:
+    name: Zig Backend Tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Setup Zig
+        uses: vercel-labs/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Install Native SDK
+        run: npm install --global @native-sdk/cli@0.10.1
+
+      # Windows 独有的代码路径——注册表读取（腾讯服 InstallPath / WeGame DefaultIcon）、
+      # Toolhelp 进程快照、各 Win32 API 声明——在 ubuntu 的 `-Dplatform=null` 下被
+      # `builtin.os.tag` 判成死代码，**一行都不会被编译**。只跑 Linux 等于这些路径零覆盖，
+      # 而客户端探测这类功能恰好只会跑在 Windows 上。
+      - name: Test Zig backend
+        shell: pwsh
+        run: |
+          $sdk = Join-Path (npm root --global) '@native-sdk/cli'
+          zig build test -Dplatform=windows "-Dnative-sdk-path=$sdk" --summary all
+
   windows-build:
     name: Build Windows EXE
     needs: test

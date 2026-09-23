@@ -12,7 +12,6 @@ import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { MatchSummary, RankQueueSummary, SummonerSearchCandidate, SummonerSearchResult } from "../types/domain";
 import { championImage, rankName, roleName, shortDate } from "../utils/format";
-import { visibleMatches } from "../matches/filters";
 import { localPlayerRiotId, searchLocalPlayers } from "../matches/localPlayers";
 import { matchHistoryQueryKey } from "../matches/query";
 import { useMatchDetail } from "../composables/useMatchDetail";
@@ -60,8 +59,15 @@ const selectedId = ref<number | null>(null);
 const detailOpen = ref(true);
 const expandedId = ref<number | null>(null);
 const matches = useQuery({ queryKey: computed(() => matchHistoryQueryKey({ mode: app.mode, platformId: app.connection.platformId, gameName: app.connection.gameName, tagLine: app.connection.tagLine, summonerName: activeSummoner.value, page: page.value, pageSize, hideUnfinishedMatches: app.config.providers.hideUnfinishedMatches, rankedOnly: app.config.providers.rankedOnly })), queryFn: () => backend.matches(activeSummoner.value, page.value, pageSize), enabled: computed(() => app.initialized), staleTime: 60_000, refetchOnMount: true });
-const rawRows = computed(() => matches.data.value ?? []);
-const rows = computed(() => visibleMatches(rawRows.value, app.config.providers.hideUnfinishedMatches, app.config.providers.rankedOnly));
+/**
+ * 「仅显示排位 / 隐藏未完成」**只有后端一个口径**。
+ *
+ * 后端 `matchHistoryDtoPageWithFilters` 是**先筛选再分页**（不是筛完截断），所以打开
+ * 开关拿到的是「整整一页排位」，而不是「最近 10 局里恰好是排位的那几条」。前端再筛一遍
+ * 既筛不出新东西，又会在开关刚切换、配置还没落到后端时把整页削成几条——看起来就像
+ * 「只把上一次请求的结果过了一遍」。这里直接采信数据源。
+ */
+const rows = computed(() => matches.data.value ?? []);
 watch(() => [app.config.providers.hideUnfinishedMatches, app.config.providers.rankedOnly], () => {
   page.value = 0;
   queue.value = "all";

@@ -710,6 +710,38 @@ pub fn commandLane(name: []const u8) CommandLane {
     return .query;
 }
 
+/// 完全不读 `Runtime` 任何字段的 state 通道命令，`invokeQueued` 会**放锁**执行它们。
+///
+/// `.state` 通道原本是「短暂读一下内存」的代名词，所以整段都在 `command_mutex` 里跑。
+/// 但窗**口置顶/聚焦是真正的系统调用**，慢起来会把同一条命令面后面的所有东西
+/// （roster/events 轮询、全部查询）一起卡住——而这些命令连 `self` 都没碰，
+/// 不存在和 `save_config`、连接刷新竞争的可能，没有理由占着锁。
+///
+/// 往这里加命令前先确认：handler 里**一个** `self.xxx` 字段都不读
+/// （`_ = context;` 是最可靠的信号）。测试会断言每个名字都是已登记的 `.state` 命令。
+const stateless_commands = [_][]const u8{
+    "lol.open_game_view",
+    "lol.validate_shortcut_template",
+};
+
+fn statelessCommand(name: []const u8) bool {
+    for (stateless_commands) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
+test "无锁命令都在 state 通道且真的不读 Runtime" {
+    for (stateless_commands) |name| {
+        try std.testing.expectEqual(CommandLane.state, commandLane(name));
+    }
+    try std.testing.expect(statelessCommand("lol.open_game_view"));
+    // 会写 Runtime 的命令绝不能被列进来。
+    try std.testing.expect(!statelessCommand("lol.save_config"));
+    try std.testing.expect(!statelessCommand("lol.get_live_lobby"));
+    try std.testing.expect(!statelessCommand("lol.set_data_mode"));
+}
+
 fn querySnapshot(self: *Runtime) !*Runtime {
     const snapshot = try std.heap.page_allocator.create(Runtime);
     snapshot.* = Runtime.init();
@@ -794,6 +826,13 @@ pub fn invokeQueued(self: *Runtime, handler: native_sdk.bridge.Handler, invocati
         return handler.invoke_fn(self, invocation, output);
     }
     if (commandLane(handler.name) == .state) {
+        // 无状态命令（见 `stateless_commands`）先放锁再执行：它们不读 `self` 的任何字段，
+        // 却可能在窗口置顶/聚焦这类系统调用上慢下来，没必要让整条命令面等它。
+        // 取消判据在上面统一检查过了，放锁不会漏掉「已取消」。
+        if (statelessCommand(handler.name)) {
+            self.command_mutex.unlock();
+            return handler.invoke_fn(self, invocation, output);
+        }
         defer self.command_mutex.unlock();
         return handler.invoke_fn(self, invocation, output);
     }
