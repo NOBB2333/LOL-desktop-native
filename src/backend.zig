@@ -4181,6 +4181,16 @@ fn ratio(value: i64, total: i64) f64 {
     return @as(f64, @floatFromInt(value)) / @as(f64, @floatFromInt(total));
 }
 
+/// 参团率：(击杀 + 助攻) / 全队击杀，钳制在 100% 以内。
+///
+/// 为什么要钳制：被防御塔 / 小兵终结的死亡（处决）会给附近敌人记**助攻**，却不给
+/// 任何人记**击杀**，于是分子（击杀+助攻）统计到的参与会比分母（队员击杀之和）多，
+/// 算出来可能超过 100%——界面上就出现过「150% 参团」这种怪数字。对绝大多数对局
+/// 没有影响（击杀+助攻很少超过全队击杀），只把极端值拉回上限。
+fn killParticipationRatio(kills: i64, assists: i64, team_kills: i64) f64 {
+    return @min(ratio(kills + assists, team_kills), 1.0);
+}
+
 /// 队伍占比：队伍总量为 0 时返回 `null`（数据缺失），而不是 0 —— 前端据此把该局
 /// 排除在相关均值之外，而不是用一个假 0 把均值拉低。
 /// 见 LeagueAkari `computeSingleSummary` 的 `*PercentageOfTeam` 系列。
@@ -4428,7 +4438,7 @@ fn writeParticipant(writer: *std.Io.Writer, participant: std.json.Value, self_te
     try writeSummonerSpells(writer, participant);
     try writer.writeAll(",\"runes\":");
     try writeRunes(writer, participant);
-    try writer.print(",\"heal\":{d},\"damageShare\":{d:.4},\"damageTakenShare\":{d:.4},\"killParticipation\":{d:.4},\"towerDamage\":{d},\"turretKills\":{d},\"wardsPlaced\":{d},\"wardsKilled\":{d},\"visionScore\":{d},\"visionWardsBought\":{d},\"sightWardsBought\":{d}}}", .{ statInt(participant, "totalHeal"), ratio(damage, team_damage), ratio(taken, team_taken), ratio(kills + assists, team_kills), statInt(participant, "damageDealtToTurrets"), statInt(participant, "turretKills"), statInt(participant, "wardsPlaced"), statInt(participant, "wardsKilled"), statInt(participant, "visionScore"), statInt(participant, "visionWardsBoughtInGame"), statInt(participant, "sightWardsBoughtInGame") });
+    try writer.print(",\"heal\":{d},\"damageShare\":{d:.4},\"damageTakenShare\":{d:.4},\"killParticipation\":{d:.4},\"towerDamage\":{d},\"turretKills\":{d},\"wardsPlaced\":{d},\"wardsKilled\":{d},\"visionScore\":{d},\"visionWardsBought\":{d},\"sightWardsBought\":{d}}}", .{ statInt(participant, "totalHeal"), ratio(damage, team_damage), ratio(taken, team_taken), killParticipationRatio(kills, assists, team_kills), statInt(participant, "damageDealtToTurrets"), statInt(participant, "turretKills"), statInt(participant, "wardsPlaced"), statInt(participant, "wardsKilled"), statInt(participant, "visionScore"), statInt(participant, "visionWardsBoughtInGame"), statInt(participant, "sightWardsBoughtInGame") });
 }
 
 fn participantPosition(participant: std.json.Value) []const u8 {
@@ -4699,7 +4709,7 @@ fn matchHistoryDtoPageWithFilters(json: []const u8, catalog_json: []const u8, se
         const team_kills = teamStat(participants, self_team_id, "kills");
         const damage_share = ratio(damage, team_damage);
         const taken_share = ratio(taken, team_taken);
-        const kill_participation = ratio(kills + assists, team_kills);
+        const kill_participation = killParticipationRatio(kills, assists, team_kills);
         const performance = matchPerformance(win, kills, deaths, assists, damage_share);
         const is_mvp = first_participant != .null and teamParticipantCount(participants, self_team_id) >= 2 and
             participantScore(first_participant, team_damage) >= bestTeamScore(participants, self_team_id, team_damage);
@@ -6183,7 +6193,7 @@ fn writeRecentMatchesFiltered(writer: *std.Io.Writer, history_json: []const u8, 
             if (explicit_damage_share > 1) explicit_damage_share / 100.0 else explicit_damage_share
         else
             ratio(damage, team_damage);
-        const kill_participation = ratio(kills + assists, team_kills);
+        const kill_participation = killParticipationRatio(kills, assists, team_kills);
         const performance = matchPerformance(statBool(participant, "win"), kills, deaths, assists, damage_share);
         const is_mvp = teamParticipantCount(participants, team_id) >= 2 and
             participantScore(participant, team_damage) >= bestTeamScore(participants, team_id, team_damage);
@@ -8221,8 +8231,16 @@ test "returns only newer release versions from the configured update feed" {
     try std.testing.expectEqual(@as(i8, 1), compareVersions("v3.4.2-beta.1", "3.4.1"));
 }
 
-test "release notes 截断落在 UTF-8 字符边界上" {
-    var output: [2048]u8 = undefined;
+test "参团率钳制在 100% 以内（处决死亡给助攻不给击杀的数据现象）" {
+    // 正常对局：8 杀 4 助攻 / 全队 20 杀 = 60%。
+    try std.testing.expectEqual(@as(f64, 0.6), killParticipationRatio(8, 4, 20));
+    // 极端对局：击杀+助攻 21 超过全队击杀 14（处决死亡记助攻不记击杀）→ 钳到 100%。
+    try std.testing.expectEqual(@as(f64, 1.0), killParticipationRatio(6, 15, 14));
+    // 没有击杀信息的对局：分母 0 回落 0，不产生 NaN。
+    try std.testing.expectEqual(@as(f64, 0), killParticipationRatio(3, 5, 0));
+}
+
+test "release notes 截断落在 UTF-8 字符边界上" {    var output: [2048]u8 = undefined;
     const current = "3.4.1";
     // 400 个三字节汉字 = 1200 字节，正好在上限内；再加一个就超，必须截断且不出现半个字符。
     const long_notes = "好" ** 401;
