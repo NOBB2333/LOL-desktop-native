@@ -4,6 +4,7 @@ import { BarChart3, BookOpen, Bot, ChevronRight, CircleHelp, Clock3, History, Ho
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useQueryClient } from "@tanstack/vue-query";
 import { RouterLink, RouterView, useRoute, useRouter } from "vue-router";
+import AnnouncementBell from "./components/AnnouncementBell.vue";
 import AssetIcon from "./components/AssetIcon.vue";
 import logoUrl from "./assets/lol-mark.png";
 import { backend, isTauri } from "./services/backend";
@@ -275,6 +276,7 @@ onBeforeUnmount(() => {
           <header class="topbar" :class="{ 'topbar--immersive': immersive }">
             <div class="breadcrumb"><span>桌上英雄联盟</span><ChevronRight :size="14" /><strong>{{ String(route.meta.title) }}</strong></div>
             <div class="topbar-actions">
+              <AnnouncementBell />
               <button class="topbar-icon-button" type="button" :aria-label="dark ? '切换浅色模式' : '切换深色模式'" :title="dark ? '浅色模式' : '深色模式'" @click="toggleTheme"><Moon v-if="dark" :size="16" /><Sun v-else :size="16" /></button>
               <RouterLink to="/settings" class="topbar-account" title="打开设置">
                 <AssetIcon kind="profile" :id="profileIconId(account.profileIconId)" :name="accountName" :fallback-url="profileIconImage(account.profileIconId)" round size="sm" />

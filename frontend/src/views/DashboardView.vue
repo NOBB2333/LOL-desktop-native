@@ -395,32 +395,40 @@ function toggleMatch(gameId: number) {
 
           <div class="relationship-list">
 
+            <!-- key 带 gameId：encounters 是「每局每人」一行，同一玩家会出现多次，
+                 只用 puuid 做 key 会重复（Vue 会告警且复用错行）。 -->
             <div
               v-for="record in relationRows.slice(0, 6)"
-              :key="record.puuid"
+              :key="`${record.puuid}-${record.gameId}`"
               class="relationship-row"
             >
 
-              <div class="relationship-avatar">
-                {{ record.gameName.slice(0, 1) }}
-              </div>
+              <AssetIcon
+                kind="champion"
+                :id="record.championId"
+                :name="record.championName || record.gameName"
+                :fallback-url="championImage(record.championId)"
+                class="relationship-avatar"
+              />
 
               <div class="relationship-info">
                 <strong>
-                  {{ record.gameName }}
+                  {{ record.gameName }}<small v-if="record.tagLine">#{{ record.tagLine }}</small>
                 </strong>
 
                 <span>
-                  {{
-                    record.side === "ally"
-                      ? "常见队友"
-                      : "曾经遇到"
-                  }}
-                  ·
-                  {{ record.championName }}
-                  ·
+                  <em
+                    class="relationship-side"
+                    :data-side="record.side"
+                  >{{ record.side === "ally" ? "队友" : "对手" }}</em>
+                  {{ record.championName }} · {{ record.queueName || "对局" }} ·
                   {{ relativeTime(record.encounteredAt) }}
                 </span>
+
+                <small
+                  v-if="record.kills != null"
+                  class="relationship-kda"
+                >对方 {{ record.kills }}/{{ record.deaths }}/{{ record.assists }}<template v-if="record.selfKills != null"> · 我方 {{ record.selfKills }}/{{ record.selfDeaths }}/{{ record.selfAssists }}</template></small>
               </div>
 
               <div
@@ -1251,11 +1259,48 @@ function toggleMatch(gameId: number) {
   font-weight: 600;
 }
 
+.relationship-info strong small {
+  margin-left: 3px;
+  color: var(--text-muted);
+  font-size: 9px;
+  font-weight: 500;
+}
+
 .relationship-info span {
   display: block;
   margin-top: 3px;
   color: var(--text-muted);
   font-size: 9px;
+}
+
+/* 队友 / 对手小徽标：一眼分清阵营，比纯文字更省读的时间。 */
+.relationship-side {
+  display: inline-block;
+  margin-right: 5px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.relationship-side[data-side="ally"] {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+}
+
+.relationship-side[data-side="enemy"] {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+}
+
+/* 双方 KDA：关系记录最核心的信息就是「那局打得怎么样」，放第三行小字。 */
+.relationship-kda {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-secondary);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
 }
 
 .relationship-result {

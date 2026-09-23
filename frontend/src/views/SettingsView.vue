@@ -396,6 +396,18 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
 .save-indicator[data-state="saved"] .save-dot { background: var(--green); }
 .save-indicator[data-state="error"] { border-color: var(--red); color: var(--red); }
 .save-indicator[data-state="error"] .save-dot { background: var(--red); }
+/* 写盘中的脉冲：让「保存中」有生命感，也提示此刻别关窗口。 */
+.save-indicator[data-state="saving"] .save-dot,
+.save-indicator[data-state="dirty"] .save-dot {
+  animation: save-dot-pulse 1.1s ease-in-out infinite;
+}
+@keyframes save-dot-pulse {
+  50% { opacity: 0.35; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .save-indicator[data-state="saving"] .save-dot,
+  .save-indicator[data-state="dirty"] .save-dot { animation: none; }
+}
 
 /* 导航 */
 .settings-nav {
@@ -420,6 +432,8 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
 .settings-nav__item svg { color: var(--accent); flex: 0 0 auto; }
 .settings-nav__item span { flex: 1; }
 .settings-nav__item:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.settings-nav__item:focus-visible,
+.theme-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .settings-nav__arrow { color: var(--text-muted); font-style: normal; font-size: 14px; margin-left: auto; }
 
 /* body */
@@ -446,10 +460,11 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
   place-items: center;
   width: 32px;
   height: 32px;
-  border: 1px solid var(--line);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line));
   border-radius: 7px;
   color: var(--accent);
   background: var(--accent-soft);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--accent) 14%, transparent);
   flex: 0 0 32px;
 }
 .settings-section__header .eyebrow { display: block; margin-bottom: 3px; }
@@ -474,7 +489,10 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
   min-height: 62px;
   padding: 12px 20px;
   border-bottom: 1px solid var(--line);
+  /* 轻微的悬停反馈：让「每一行都是一个可操作的设置」这件事可感知。 */
+  transition: background 0.12s;
 }
+.settings-row:hover { background: var(--surface-muted); }
 .settings-row:last-child { border-bottom: 0; }
 .settings-row--top { align-items: flex-start; padding-top: 16px; }
 .settings-row--disabled { opacity: 0.5; }
@@ -505,6 +523,7 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
   text-align: right;
 }
 .settings-input:focus { border-color: var(--accent); }
+.settings-input:not(:disabled):hover { border-color: var(--line-strong); }
 .settings-input:disabled { opacity: 0.45; cursor: not-allowed; }
 .settings-unit { font-size: 12px; color: var(--text-secondary); white-space: nowrap; }
 
@@ -564,7 +583,7 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
   transition: border-color 0.15s, color 0.15s, background 0.15s;
 }
 .theme-btn.is-active { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
-.theme-swatch { width: 12px; height: 12px; border-radius: 3px; flex: 0 0 12px; }
+.theme-swatch { width: 12px; height: 12px; border-radius: 3px; flex: 0 0 12px; box-shadow: inset 0 0 0 1px rgb(0 0 0 / 0.18); }
 .theme-swatch--mint { background: #0f766e; }
 .theme-swatch--paper { background: #b45309; }
 .theme-swatch--night { background: #475569; }
