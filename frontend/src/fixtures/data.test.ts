@@ -44,5 +44,7 @@ describe("fixture data", () => {
     expect(room.teams).toHaveLength(1);
     expect(room.teams?.[0].label).toBe("房间成员");
     expect(room.enemySummary.score).toBeGreaterThan(0);
+    // 「上一局对局信息」在房间里会露出来，fixture 得给出同一局，否则预览是空的。
+    expect(room.recentMatch?.gameId).toBe(fixtureMatches[0].gameId);
   });
 });

@@ -282,6 +282,13 @@ export function createFixtureRoomLobby(rankedOnly: boolean): LiveLobby {
   // 敌方为空时不能重算摘要：`summary` 空数组会 reduce 到 NaN 并抛错。房间阶段本来
   // 也不渲染敌方，沿用原值即可。
   value.teams = [{ id: "room", label: "房间成员", side: "ally", players: room, summary: value.allySummary }];
+  // 房间里「上一局对局信息」那块是露出来的（`LiveView` 的条件是 `!hasLobbyPlayers || isRoomPhase`），
+  // 真机上它读后端 `matches/current` 缓存里的最新一局。fixture 不补这一条，预览就永远停在
+  // 一句「暂无可回看的历史对局」上，看着像功能没做。
+  // 必须取 `fixtureMatches[0]`——得和 `browserBackend.matches()` 返回的是同一局，
+  // 否则展开详情会 join 不上（历史页踩过这个坑）。房间 fixture 本来就是「刚打完一局回到房间」，
+  // 所以这一条也确实就是「上一局」。
+  value.recentMatch = fixtureMatches[0] ?? null;
   return value;
 }
 
