@@ -7,12 +7,15 @@ export interface NativeSdkApi {
     set(options: { service: string; account: string; secret: string }): Promise<boolean>;
     delete(options: { service: string; account: string }): Promise<boolean>;
   };
+  /** 宿主系统服务。外链统一走 `os.openUrl`，见 `openExternalUrl`。 */
+  os?: {
+    openUrl(value: string): Promise<boolean>;
+  };
 }
 
 declare global {
   interface Window { zero?: NativeSdkApi; }
 }
-
 export const NATIVE_INVOCATION_CONCURRENCY = 4;
 
 export function createInvocationScheduler(maxConcurrency = NATIVE_INVOCATION_CONCURRENCY) {
@@ -91,4 +94,32 @@ export function listenNative<T>(name: string, callback: (detail: T) => void): ()
   const bridge = window.zero;
   if (!bridge) return () => undefined;
   return bridge.on<T>(name, callback);
+}
+
+/**
+ * 外链一律交给**系统默认浏览器**。
+ *
+ * 应用内的 WebView 没有地址栏、没有后退、也吃不到用户的浏览器插件/登录态，把
+ * GitHub 这类页面开在里面等于把人困住（只有一个窗口还关不掉），所以走宿主提供的
+ * `os.openUrl`。宿主侧受 `app.json` 的 `security.navigation.external_links` 白名单
+ * 管控——**新加外链域名时那份白名单也要跟着加**，否则这里会静默失败。
+ *
+ * 浏览器预览 / 单测没有宿主桥，退回新标签页。
+ */
+export async function openExternalUrl(url: string): Promise<boolean> {
+  // 只放行 http(s)：宿主本身也拒绝 mailto/file 之类的协议。
+  if (!/^https?:\/\//i.test(url)) return false;
+  const open = window.zero?.os?.openUrl;
+  if (!open) {
+    window.open(url, "_blank", "noopener,noreferrer");
+    return true;
+  }
+  try {
+    await open(url);
+    return true;
+  } catch {
+    // 白名单没覆盖这个域名时宿主会拒绝。不抛错（调用方是点击事件，抛出去就是
+    // unhandled rejection），交给调用方决定怎么提示。
+    return false;
+  }
 }

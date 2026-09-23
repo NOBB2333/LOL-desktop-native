@@ -9,15 +9,16 @@ import MatchDetailCard from "../components/MatchDetailCard.vue";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { RankQueueSummary } from "../types/domain";
-import { championImage, percent, platformRegionGuide, platformRegionName, platformRegionOverview, profileIconId, profileIconImage, rankName, relativeTime } from "../utils/format";
+import { championImage, percent, platformRegionGuide, platformRegionName, platformRegionOverview, profileIconId, profileIconImage, rankName } from "../utils/format";
 import { visibleMatches } from "../matches/filters";
 import { matchHistoryQueryKey } from "../matches/query";
+import { aggregateRelationships, lastSeenLabel, relationLabel } from "../encounters/relationships";
 import { useMatchDetail } from "../composables/useMatchDetail";
 
 const app = useAppStore();
 const message = useMessage();
 const matches = useQuery({ queryKey: computed(() => matchHistoryQueryKey({ mode: app.mode, platformId: app.connection.platformId, gameName: app.connection.gameName, tagLine: app.connection.tagLine, page: 0, pageSize: 10, hideUnfinishedMatches: app.config.providers.hideUnfinishedMatches, rankedOnly: app.config.providers.rankedOnly })), queryFn: () => backend.matches(), enabled: computed(() => app.initialized), staleTime: 60_000, refetchInterval: computed(() => app.initialized && app.mode === "live" ? 15_000 : false) });
-const encounters = useQuery({ queryKey: computed(() => ["dashboard-encounters", app.mode, app.connection.platformId, app.connection.gameName, app.connection.tagLine]), queryFn: () => backend.encounters(undefined, 20), enabled: computed(() => app.initialized), staleTime: 20_000, refetchInterval: computed(() => app.initialized && app.mode === "live" ? 15_000 : false) });
+const encounters = useQuery({ queryKey: computed(() => ["dashboard-encounters", app.mode, app.connection.platformId, app.connection.gameName, app.connection.tagLine]), queryFn: () => backend.encounters(undefined, 40), enabled: computed(() => app.initialized), staleTime: 20_000, refetchInterval: computed(() => app.initialized && app.mode === "live" ? 15_000 : false) });
 const rawRows = computed(() => {
   // The native bridge can legitimately return an empty page while LCU is
   // reconnecting. Keep the bootstrap snapshot visible until a non-empty page
@@ -33,6 +34,12 @@ const relationRows = computed(() => {
   const fetched = encounters.data.value;
   return fetched?.length ? fetched : app.bootstrap.dashboard.recentEncounters;
 });
+/**
+ * 关系记录按玩家聚合：单局行只能看「这一局」，用户要的是「一共多少局、最近什么时候」。
+ * 分母是本次分析窗口内的不同对局数（后端最多给 40 局），文案上必须写成「近 N 局」。
+ */
+const relationAggregates = computed(() => aggregateRelationships(relationRows.value));
+const relationWindow = computed(() => relationAggregates.value[0]?.windowGames ?? 0);
 const account = computed(() => app.connection);
 const regionValue = computed(() => account.value.platformId || account.value.region);
 const regionDisplay = computed(() => platformRegionName(regionValue.value));
@@ -382,6 +389,14 @@ function toggleMatch(gameId: number) {
               </div>
 
               <h2>常见队友与对手</h2>
+
+              <p
+                v-if="relationAggregates.length"
+                class="relationship-summary"
+              >
+                分析最近 {{ relationWindow }} 局 · 遇到 {{ relationAggregates.length }} 人 ·
+                按相遇次数排序
+              </p>
             </div>
 
             <RouterLink
@@ -395,19 +410,18 @@ function toggleMatch(gameId: number) {
 
           <div class="relationship-list">
 
-            <!-- key 带 gameId：encounters 是「每局每人」一行，同一玩家会出现多次，
-                 只用 puuid 做 key 会重复（Vue 会告警且复用错行）。 -->
-            <div
-              v-for="record in relationRows.slice(0, 6)"
-              :key="`${record.puuid}-${record.gameId}`"
+            <RouterLink
+              v-for="record in relationAggregates.slice(0, 6)"
+              :key="record.puuid"
+              :to="{ path: '/history', query: { player: record.puuid, tab: 'players' } }"
               class="relationship-row"
             >
 
               <AssetIcon
                 kind="champion"
-                :id="record.championId"
-                :name="record.championName || record.gameName"
-                :fallback-url="championImage(record.championId)"
+                :id="record.last.championId"
+                :name="record.last.championName || record.gameName"
+                :fallback-url="championImage(record.last.championId)"
                 class="relationship-avatar"
               />
 
@@ -417,35 +431,27 @@ function toggleMatch(gameId: number) {
                 </strong>
 
                 <span>
-                  <em
-                    class="relationship-side"
-                    :data-side="record.side"
-                  >{{ record.side === "ally" ? "队友" : "对手" }}</em>
-                  {{ record.championName }} · {{ record.queueName || "对局" }} ·
-                  {{ relativeTime(record.encounteredAt) }}
+                  {{ relationLabel(record) }} · 最近 {{ lastSeenLabel(record) || "—" }} ·
+                  {{ record.last.championName }} {{ record.last.kills }}/{{ record.last.deaths }}/{{ record.last.assists }}
                 </span>
 
-                <small
-                  v-if="record.kills != null"
-                  class="relationship-kda"
-                >对方 {{ record.kills }}/{{ record.deaths }}/{{ record.assists }}<template v-if="record.selfKills != null"> · 我方 {{ record.selfKills }}/{{ record.selfDeaths }}/{{ record.selfAssists }}</template></small>
+                <small class="relationship-kda">
+                  共 {{ record.totalGames }} 局<template v-if="record.last.queueName"> · {{ record.last.queueName }}</template><template v-if="record.decidedGames"> · 我方 {{ record.wins }} 胜 {{ record.decidedGames - record.wins }} 负</template>
+                </small>
               </div>
 
               <div
                 class="relationship-result"
-                :data-result="
-                  record.result === '胜利'
-                    ? 'win'
-                    : 'loss'
-                "
+                :data-result="record.decidedGames && record.winRate >= 0.5 ? 'win' : 'loss'"
               >
-                {{ record.result || "--" }}
+                <strong>{{ record.decidedGames ? Math.round(record.winRate * 100) + "%" : "--" }}</strong>
+                <small>胜率</small>
               </div>
 
-            </div>
+            </RouterLink>
 
             <div
-              v-if="!relationRows.length"
+              v-if="!relationAggregates.length"
               class="empty-state"
             >
               暂无关系记录
@@ -1228,13 +1234,28 @@ function toggleMatch(gameId: number) {
   padding: 4px 18px 8px;
 }
 
+/* 关系记录：按玩家聚合后的三行信息（名字 / 关系与最近一局 / 场次与胜负）。 */
+.relationship-summary {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
 .relationship-row {
   display: grid;
   grid-template-columns: 34px minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
   min-height: 54px;
+  padding: 6px 8px;
   border-bottom: 1px solid var(--line);
+  color: inherit;
+  text-decoration: none;
+  transition: background 0.12s;
+}
+
+.relationship-row:hover {
+  background: var(--surface-raised);
 }
 
 .relationship-row:last-child {
@@ -1273,28 +1294,7 @@ function toggleMatch(gameId: number) {
   font-size: 9px;
 }
 
-/* 队友 / 对手小徽标：一眼分清阵营，比纯文字更省读的时间。 */
-.relationship-side {
-  display: inline-block;
-  margin-right: 5px;
-  padding: 1px 5px;
-  border-radius: 4px;
-  font-size: 8px;
-  font-style: normal;
-  font-weight: 700;
-}
-
-.relationship-side[data-side="ally"] {
-  color: var(--green);
-  background: color-mix(in srgb, var(--green) 12%, transparent);
-}
-
-.relationship-side[data-side="enemy"] {
-  color: var(--red);
-  background: color-mix(in srgb, var(--red) 12%, transparent);
-}
-
-/* 双方 KDA：关系记录最核心的信息就是「那局打得怎么样」，放第三行小字。 */
+/* 场次与胜负：关系记录的核心数字，放第三行小字。 */
 .relationship-kda {
   display: block;
   margin-top: 2px;
@@ -1303,16 +1303,32 @@ function toggleMatch(gameId: number) {
   font-variant-numeric: tabular-nums;
 }
 
+/* 胜率：右侧两行小面板（数值 + 说明），比单个「胜利/失败」字更能说明关系。 */
 .relationship-result {
+  display: grid;
+  justify-items: end;
+  gap: 1px;
   font-size: 9px;
   font-weight: 600;
 }
 
-.relationship-result[data-result="win"] {
+.relationship-result strong {
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.relationship-result small {
+  color: var(--text-muted);
+  font-size: 8px;
+  font-weight: 500;
+}
+
+.relationship-result[data-result="win"] strong {
   color: var(--green);
 }
 
-.relationship-result[data-result="loss"] {
+.relationship-result[data-result="loss"] strong {
   color: var(--red);
 }
 

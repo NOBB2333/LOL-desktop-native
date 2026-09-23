@@ -348,7 +348,10 @@
         "http://127.0.0.1:49173"
       ],
       "external_links": {
-        "action": "deny"
+        "action": "open_system_browser",
+        "allowed_urls": [
+          "https://github.com/NOBB2333/*"
+        ]
       }
     }
   },

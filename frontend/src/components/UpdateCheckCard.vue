@@ -15,6 +15,7 @@ import { ExternalLink, RefreshCw } from "@lucide/vue";
 import { NButton } from "naive-ui";
 import { onMounted, ref } from "vue";
 import { backend } from "../services/backend";
+import { openExternalUrl } from "../services/native";
 import { useAppStore } from "../stores/app";
 import type { ReleaseUpdate } from "../types/domain";
 
@@ -52,6 +53,12 @@ const publishedDate = () => {
   return /^\d{4}-\d{2}-\d{2}/.test(raw) ? raw.slice(0, 10) : "";
 };
 
+/** Release 页面走系统浏览器；`href` 保留是为了右键复制链接 / 无障碍语义。 */
+function openRelease() {
+  const url = update.value?.url;
+  if (url) void openExternalUrl(url);
+}
+
 onMounted(check);
 </script>
 
@@ -74,7 +81,7 @@ onMounted(check);
         <span v-if="publishedDate()">发布于 {{ publishedDate() }}</span>
       </div>
       <pre v-if="update.notes" class="update-check__notes">{{ update.notes }}</pre>
-      <a class="update-check__link" :href="update.url" target="_blank" rel="noreferrer">
+      <a class="update-check__link" :href="update.url" @click.prevent="openRelease">
         <ExternalLink :size="13" />打开 Release 页面下载
       </a>
     </div>

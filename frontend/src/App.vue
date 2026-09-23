@@ -8,7 +8,7 @@ import AnnouncementBell from "./components/AnnouncementBell.vue";
 import AssetIcon from "./components/AssetIcon.vue";
 import logoUrl from "./assets/lol-mark.png";
 import { backend, isTauri } from "./services/backend";
-import { listenNative } from "./services/native";
+import { listenNative, openExternalUrl } from "./services/native";
 import { useAppStore } from "./stores/app";
 import type { AccountPresence } from "./types/domain";
 import { profileIconId, profileIconImage } from "./utils/format";
@@ -81,6 +81,11 @@ function isActive(to: string) {
 
 function toggleTheme() {
   app.config.appearance.colorMode = dark.value ? "light" : "dark";
+}
+
+/** 项目地址交给系统浏览器：应用内 WebView 没地址栏，开在里面就出不来了。 */
+function openProjectUrl() {
+  void openExternalUrl(PROJECT_URL);
 }
 
 function invalidateMatchHistory() {
@@ -269,7 +274,7 @@ onBeforeUnmount(() => {
           </nav>
           <div class="sidebar-foot">
             <RouterLink to="/settings" class="nav-item" :class="{ active: route.path === '/settings' }" aria-label="设置"><Settings :size="17" /><span>设置</span></RouterLink>
-            <a :href="PROJECT_URL" target="_blank" rel="noreferrer" class="nav-item muted" aria-label="项目地址"><CircleHelp :size="17" /><span>项目地址</span></a>
+            <a :href="PROJECT_URL" class="nav-item muted" aria-label="项目地址" @click.prevent="openProjectUrl"><CircleHelp :size="17" /><span>项目地址</span></a>
           </div>
         </aside>
         <main class="main-area">
