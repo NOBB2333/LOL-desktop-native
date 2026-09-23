@@ -4032,18 +4032,46 @@ fn openGameView(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
     return std.fmt.bufPrint(output, "true", .{});
 }
 
+/// 更新源是 GitHub Release API（`releases/latest`）。选它而不是自维护 latest.json：
+/// 发版走 `generate_release_notes`，API 里版本、发布时间、说明、链接都是现成的，
+/// 不需要 CI 再多上传一个会忘掉的清单文件。
 /// `current_version` 由调用方传入（运行中的应用版本，来自 app.json），
-/// 只有更新源版本严格大于当前版本才返回，避免把自己当成新版本。
+/// 只有更新版本严格大于当前版本才返回，避免把自己当成新版本。
 fn updateDto(response: []const u8, current_version: []const u8, output: []u8) ![]const u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{}) catch return error.InvalidUpdateResponse;
     defer parsed.deinit();
-    const version = jsonField(parsed.value, "version");
+    const tag = jsonField(parsed.value, "tag_name");
+    // tag 形如 v2.5.0：比对与展示都不带 v。
+    const version = if (tag.len > 0 and (tag[0] == 'v' or tag[0] == 'V')) tag[1..] else tag;
     if (version.len == 0 or compareVersions(version, current_version) <= 0) return std.fmt.bufPrint(output, "null", .{});
     var writer = std.Io.Writer.fixed(output);
     try writer.writeAll("{\"version\":");
     try jsonString(&writer, version);
+    // 标题/发布时间/链接原样透传给设置页；说明截到 UTF-8 边界，防止超长 release
+    // notes 撑爆桥的输出缓冲（generate_release_notes 会带完整 diff 链接，很容易超）。
+    try writer.writeAll(",\"title\":");
+    try jsonString(&writer, jsonField(parsed.value, "name"));
+    try writer.writeAll(",\"publishedAt\":");
+    try jsonString(&writer, jsonField(parsed.value, "published_at"));
+    try writer.writeAll(",\"url\":");
+    try jsonString(&writer, jsonField(parsed.value, "html_url"));
+    try writer.writeAll(",\"notes\":");
+    try jsonString(&writer, utf8Truncate(jsonField(parsed.value, "body"), max_release_notes_bytes));
     try writer.writeByte('}');
     return writer.buffered();
+}
+
+/// release notes 的透传上限。桥的输出缓冲远大于此，设上限只为兜住「说明里贴了
+/// 整段变更日志」的极端情况；前端展示本来也只取前面一段。
+const max_release_notes_bytes = 1200;
+
+/// 把文本截到不超过 `max` 字节、且不把多字节字符切一半的位置。
+fn utf8Truncate(text: []const u8, max: usize) []const u8 {
+    if (text.len <= max) return text;
+    var end = max;
+    // 续字节（10xxxxxx）不属于字符开头，往前退到起始字节为止。
+    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+    return text[0..end];
 }
 
 fn compareVersions(left: []const u8, right: []const u8) i8 {
@@ -8175,14 +8203,39 @@ test "probes active data during idle gameflow transitions" {
 }
 
 test "returns only newer release versions from the configured update feed" {
-    var output: [256]u8 = undefined;
+    var output: [2048]u8 = undefined;
     // 用与 app.json 无关的固定夹具版本：测试不再绑死在实际应用版本上，
     // 这样 version:check 才能断言「src/ 里不出现当前应用版本字面量」。
     const current = "3.4.1";
-    try std.testing.expectEqualStrings("{\"version\":\"3.5.0\"}", try updateDto("{\"version\":\"3.5.0\"}", current, &output));
-    try std.testing.expectEqualStrings("null", try updateDto("{\"version\":\"3.4.1\"}", current, &output));
-    try std.testing.expectEqualStrings("null", try updateDto("{\"version\":\"3.3.9\"}", current, &output));
+    // GitHub Release API 形状：tag_name 带 v 前缀，说明/时间/链接原样透传。
+    const release = "{\"tag_name\":\"v3.5.0\",\"name\":\"桌上英雄联盟 Native v3.5.0\",\"published_at\":\"2026-09-20T12:00:00Z\",\"html_url\":\"https://github.com/NOBB2333/LOL-desktop-native/releases/tag/v3.5.0\",\"body\":\"修复若干问题\"}";
+    try std.testing.expectEqualStrings(
+        "{\"version\":\"3.5.0\",\"title\":\"桌上英雄联盟 Native v3.5.0\",\"publishedAt\":\"2026-09-20T12:00:00Z\",\"url\":\"https://github.com/NOBB2333/LOL-desktop-native/releases/tag/v3.5.0\",\"notes\":\"修复若干问题\"}",
+        try updateDto(release, current, &output),
+    );
+    // 同版本与旧版本都输出 null（前端据此显示「已是最新」）。
+    try std.testing.expectEqualStrings("null", try updateDto("{\"tag_name\":\"v3.4.1\"}", current, &output));
+    try std.testing.expectEqualStrings("null", try updateDto("{\"tag_name\":\"3.3.9\"}", current, &output));
+    // body 为 null（GitHub 偶发）不能炸，落成空串。
+    try std.testing.expect(std.mem.indexOf(u8, try updateDto("{\"tag_name\":\"v3.5.0\",\"body\":null}", current, &output), "\"notes\":\"\"") != null);
     try std.testing.expectEqual(@as(i8, 1), compareVersions("v3.4.2-beta.1", "3.4.1"));
+}
+
+test "release notes 截断落在 UTF-8 字符边界上" {
+    var output: [2048]u8 = undefined;
+    const current = "3.4.1";
+    // 400 个三字节汉字 = 1200 字节，正好在上限内；再加一个就超，必须截断且不出现半个字符。
+    const long_notes = "好" ** 401;
+    var release_buffer: [1600]u8 = undefined;
+    const release = try std.fmt.bufPrint(&release_buffer, "{{\"tag_name\":\"v3.5.0\",\"body\":\"{s}\"}}", .{long_notes});
+    const dto = try updateDto(release, current, &output);
+    // 截断后最多 1200 字节的说明 = 400 个汉字（整字符），不会出现替换符或半个「好」。
+    const notes_pattern = "\"notes\":\"";
+    const start = std.mem.indexOf(u8, dto, notes_pattern).? + notes_pattern.len;
+    const end = std.mem.lastIndexOf(u8, dto, "\"}").?;
+    const notes = dto[start..end];
+    try std.testing.expect(notes.len <= max_release_notes_bytes);
+    try std.testing.expectEqual(@as(usize, 0), notes.len % 3);
 }
 
 test "matches modern live client Riot identities and normalized teams" {

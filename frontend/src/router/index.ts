@@ -15,6 +15,7 @@ const router = createRouter({
     { path: "/toolkit", redirect: "/automation" },
     { path: "/history", name: "history", component: () => import("../views/HistoryView.vue"), meta: { title: "历史" } },
     { path: "/friends", name: "friends", component: () => import("../views/FriendsView.vue"), meta: { title: "好友工具" } },
+    { path: "/client", name: "client", component: () => import("../views/ClientView.vue"), meta: { title: "客户端" } },
     { path: "/settings", name: "settings", component: () => import("../views/SettingsView.vue"), meta: { title: "设置" } },
   ],
 });

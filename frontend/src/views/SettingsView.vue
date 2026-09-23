@@ -4,6 +4,7 @@ import { NButton, NInput, NSelect, NSwitch, useMessage } from "naive-ui";
 import { computed } from "vue";
 import ModeSwitch from "../components/ModeSwitch.vue";
 import PageHeader from "../components/PageHeader.vue";
+import UpdateCheckCard from "../components/UpdateCheckCard.vue";
 import { useAppStore } from "../stores/app";
 import { normalizePlayerTagSettings, playerTagSettingItems, type PlayerTagSettings } from "../tags/settings";
 
@@ -349,6 +350,10 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
             <div class="settings-row__control">
               <code class="settings-version">v{{ app.bootstrap.appVersion }}</code>
             </div>
+          </div>
+          <!-- 更新检查只在打开设置页时触发一次（卡片 onMounted），平时不轮询。 -->
+          <div class="settings-row">
+            <UpdateCheckCard />
           </div>
         </div>
       </section>

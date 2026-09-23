@@ -53,6 +53,7 @@ import type {
   MatchSummary,
   MatchTimeline,
   PlayerProfile,
+  ReleaseUpdate,
   RestoreFriendResult,
   ShortcutValidation,
   SpectateResult,
@@ -376,6 +377,19 @@ export const browserBackend = {
   },
   clientInstallations(): ClientInstallations {
     return structuredClone(fixtureClientInstallations);
+  },
+  /**
+   * 预览里的「发现新版本」：fixture 版本永远比 appVersion 新一档，这样浏览器预览
+   * 就能稳定看到「有更新」的完整 UI；「已是最新」与「检查失败」的状态由测试覆盖。
+   */
+  checkUpdate(): ReleaseUpdate | null {
+    return {
+      version: "2.6.0",
+      title: "桌上英雄联盟 Native v2.6.0",
+      publishedAt: "2026-09-20T12:00:00Z",
+      url: "https://github.com/NOBB2333/LOL-desktop-native/releases",
+      notes: "预览数据：这里显示的是 Release 说明的前一段内容。\n支持多行。",
+    };
   },
   /**
    * 预览里不真的拉进程，只回报「会启动哪一个」。

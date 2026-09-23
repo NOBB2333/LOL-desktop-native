@@ -778,6 +778,25 @@ export interface ClientInstallations {
   entries: ClientLaunchEntry[];
 }
 
+/**
+ * GitHub Release 上的新版本（`lol.check_update`）。
+ *
+ * 原生侧只有在新版本严格大于当前版本时才返回内容；查不到更新时前端拿到的是 null，
+ * 「已是最新」就是 null 的另一种说法。
+ */
+export interface ReleaseUpdate {
+  /** 不带 v 前缀的版本号（后端已从 tag_name 剥掉）。 */
+  version: string;
+  /** Release 标题。 */
+  title: string;
+  /** ISO 8601 发布时间。 */
+  publishedAt: string;
+  /** Release 页面链接。 */
+  url: string;
+  /** Release 说明（后端截断过，可能不是全文）。 */
+  notes: string;
+}
+
 export interface ClientLaunchResult {
   ok: boolean;
   reason: string;

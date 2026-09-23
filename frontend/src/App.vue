@@ -1,11 +1,10 @@
 <script setup lang="ts">
 import { darkTheme, dateZhCN, NConfigProvider, NMessageProvider, zhCN } from "naive-ui";
-import { BarChart3, BookOpen, Bot, ChevronRight, CircleHelp, Clock3, History, Home, Moon, PanelLeftClose, PanelLeftOpen, Settings, Swords, Sun, UserRound, Wifi, WifiOff, X } from "@lucide/vue";
+import { BarChart3, BookOpen, Bot, ChevronRight, CircleHelp, Clock3, History, Home, Moon, PanelLeftClose, PanelLeftOpen, Rocket, Settings, Swords, Sun, UserRound, Wifi, WifiOff, X } from "@lucide/vue";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useQueryClient } from "@tanstack/vue-query";
 import { RouterLink, RouterView, useRoute, useRouter } from "vue-router";
 import AssetIcon from "./components/AssetIcon.vue";
-import ClientLauncherButton from "./components/ClientLauncherButton.vue";
 import logoUrl from "./assets/lol-mark.png";
 import { backend, isTauri } from "./services/backend";
 import { listenNative } from "./services/native";
@@ -31,6 +30,9 @@ const navigation = [
   { to: "/friends", label: "好友", icon: UserRound },
   // 「一键领取」并进了自动化页，「客户端急救」并进了对局页右栏，工具箱页已移除。
   { to: "/game", label: "对局", icon: Swords, badge: "实时" },
+  // 一键启动从顶栏搬成了独立页：启动是一次性动作，不该长期占着顶栏；
+  // 「装在哪、有哪些入口」倒是值得常驻（见 ClientView 的说明）。
+  { to: "/client", label: "客户端", icon: Rocket },
 ];
 // Keep every phase that can still expose the current ten-player snapshot on
 // the game workspace, including reconnect, spectator, and settlement aliases.
@@ -273,7 +275,6 @@ onBeforeUnmount(() => {
           <header class="topbar" :class="{ 'topbar--immersive': immersive }">
             <div class="breadcrumb"><span>桌上英雄联盟</span><ChevronRight :size="14" /><strong>{{ String(route.meta.title) }}</strong></div>
             <div class="topbar-actions">
-              <ClientLauncherButton />
               <button class="topbar-icon-button" type="button" :aria-label="dark ? '切换浅色模式' : '切换深色模式'" :title="dark ? '浅色模式' : '深色模式'" @click="toggleTheme"><Moon v-if="dark" :size="16" /><Sun v-else :size="16" /></button>
               <RouterLink to="/settings" class="topbar-account" title="打开设置">
                 <AssetIcon kind="profile" :id="profileIconId(account.profileIconId)" :name="accountName" :fallback-url="profileIconImage(account.profileIconId)" round size="sm" />

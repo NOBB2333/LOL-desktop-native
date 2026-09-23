@@ -29,6 +29,7 @@ import type {
   LiveLobby,
   MatchSummary,
   MatchTimeline,
+  ReleaseUpdate,
   RestoreFriendResult,
   ShortcutValidation,
   SpectateResult,
@@ -417,13 +418,12 @@ export const backend = {
     if (usesFixtureData()) return browserBackend.validateShortcutTemplate(template);
     return command("validate_shortcut_template", { template });
   },
-  async checkUpdate(): Promise<string> {
-    if (!isTauri()) return "浏览器预览不检查更新";
-    try {
-      const result = await command<{ version?: string } | null>("check_update");
-      return result?.version ? `发现新版本 ${result.version}` : "当前已是最新版本";
-    } catch {
-      return "更新服务暂不可用";
-    }
+  /**
+   * 检查 GitHub Release 上的新版本。网络失败抛错由调用方兜底成「暂时不可用」；
+   * 返回 null 表示已是最新。
+   */
+  async checkUpdate(): Promise<ReleaseUpdate | null> {
+    if (usesFixtureData()) return browserBackend.checkUpdate();
+    return command<ReleaseUpdate | null>("check_update");
   },
 };
