@@ -252,6 +252,11 @@ export interface PlayerProfile {
   championId: number;
   championName: string;
   profileIconId: number;
+  /**
+   * 召唤师等级。后端逐人取（`/lol-summoner/v2/summoners/puuid/{puuid}`），
+   * 拿不到时为 null —— 界面上要区分「没这个数据」和「等级 0」，所以别用 0 兜底。
+   */
+  summonerLevel?: number | null;
   assignedPosition: string;
   summonerSpells?: SpellSummary[];
   rankTier: string;
@@ -483,6 +488,15 @@ export interface SummonerSearchCandidate {
   gameName: string;
   tagLine: string;
   puuid: string;
+  /**
+   * 等级与段位由本地 LCU 补（同大区才有）。
+   *
+   * 跨区候选是通过 Riot Client 解析出来的，本机没有那个大区的段位数据，所以这三项
+   * 会是 null —— 界面要显示「—」，不要退化成「无段位」，那是两件不同的事。
+   */
+  summonerLevel?: number | null;
+  soloRank?: RankQueueSummary | null;
+  flexRank?: RankQueueSummary | null;
 }
 
 export interface SummonerSearchResult {

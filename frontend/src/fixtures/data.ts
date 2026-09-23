@@ -165,6 +165,7 @@ function makePlayer(index: number, ally: boolean, rankedOnly = false): PlayerPro
     championId: id,
     championName,
     profileIconId: 29 + index,
+    summonerLevel: 285 + index * 63 + (ally ? 0 : 29),
     assignedPosition: role,
     rankTier,
     rankDivision,
@@ -486,7 +487,7 @@ export const fixtureBootstrap: AppBootstrap = {
   configPath: "~/.lol_desktop/config.jsonc",
   databasePath: "~/.lol_desktop/lol-desktop.sqlite3",
   appDataPath: "~/.lol_desktop",
-  appVersion: "2.0.0",
+  appVersion: "2.5.0",
 };
 
 /**

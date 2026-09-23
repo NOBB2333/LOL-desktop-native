@@ -48,6 +48,7 @@ import type {
   PlayerProfile,
   ShortcutValidation,
   SpectateResult,
+  SummonerSearchResult,
 } from "../types/domain";
 
 /**
@@ -205,6 +206,36 @@ export const browserBackend = {
     const source = visibleMatches(fixtureMatches, browserState.config.providers.hideUnfinishedMatches, browserState.config.providers.rankedOnly);
     const start = page * pageSize;
     return structuredClone(source.slice(start, start + pageSize));
+  },
+  /**
+   * 预览模式下的玩家解析。
+   *
+   * 真机上这步是「Riot Client 精确解析 → 本地 LCU 补等级与段位」。预览里没有客户端，
+   * 所以改成在 fixture 的十人名单里找同名的人：命中就带着等级、单双与灵活段位回来，
+   * 让战绩页顶部的账号信息条在预览里也能看到真实排版（否则那一块永远是「—」）。
+   */
+  searchSummoner(query: string): SummonerSearchResult {
+    const trimmed = query.trim();
+    const hasTag = trimmed.includes("#");
+    if (!trimmed) return { query: "", hasTag, requiresTag: false, candidates: [] };
+    const [rawName, rawTag = ""] = trimmed.split("#");
+    const gameName = rawName.trim();
+    const tagLine = rawTag.trim();
+    const hit = [...fixtureLobby.ally, ...fixtureLobby.enemy].find((player) => player.gameName === gameName && (!tagLine || player.tagLine === tagLine));
+    if (!hit) return { query: trimmed, hasTag, requiresTag: !hasTag, candidates: [] };
+    return {
+      query: trimmed,
+      hasTag,
+      requiresTag: false,
+      candidates: [{
+        gameName: hit.gameName,
+        tagLine: hit.tagLine,
+        puuid: hit.puuid,
+        summonerLevel: hit.summonerLevel ?? null,
+        soloRank: hit.soloRank ?? null,
+        flexRank: hit.flexRank ?? null,
+      }],
+    };
   },
   champions(): ChampionOverview[] {
     return structuredClone(fixtureChampions);

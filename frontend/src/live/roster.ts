@@ -77,6 +77,9 @@ function mergePlayer(original: PlayerProfile, dynamic: PlayerProfile) {
     championId: hasChampion ? dynamic.championId : original.championId,
     championName: hasChampion ? dynamic.championName : original.championName,
     profileIconId: dynamic.profileIconId || original.profileIconId,
+    // 等级只有富化结果里一定有，快速快照通常是 null；null 要能穿透到原始值，
+    // 所以用 `??` 而不是 `||`（而且 0 在这里是非法值，不能被当成「有值」）。
+    summonerLevel: dynamic.summonerLevel ?? original.summonerLevel ?? null,
     assignedPosition: knownPosition(dynamic.assignedPosition) ? dynamic.assignedPosition : original.assignedPosition,
     isPremade,
     premadeWith,

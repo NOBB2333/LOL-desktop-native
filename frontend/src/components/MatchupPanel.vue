@@ -11,7 +11,7 @@
  */
 import { computed } from "vue";
 import AssetIcon from "./AssetIcon.vue";
-import type { PlayerProfile, TeamSummary } from "../types/domain";
+import type { PlayerProfile } from "../types/domain";
 import { aggregateTeam, estimateWinRate, focusPoints, hasLaneCoverage, laneMatchups, matchVerdict } from "../live/matchup";
 import { AKARI_MAX_SCORE } from "../tags/akari";
 import { championImage } from "../utils/format";
@@ -19,8 +19,6 @@ import { championImage } from "../utils/format";
 const props = defineProps<{
   allies: PlayerProfile[];
   enemies: PlayerProfile[];
-  allySummary: TeamSummary | null;
-  enemySummary: TeamSummary | null;
 }>();
 
 const matchups = computed(() => laneMatchups(props.allies, props.enemies));

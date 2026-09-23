@@ -13,7 +13,7 @@ import MatchupPanel from "./MatchupPanel.vue";
  */
 function mountPanel(allies = fixtureLobby.ally, enemies = fixtureLobby.enemy) {
   return mount(MatchupPanel, {
-    props: { allies, enemies, allySummary: fixtureLobby.allySummary, enemySummary: fixtureLobby.enemySummary },
+    props: { allies, enemies },
     global: { stubs: { AssetIcon: true } },
   });
 }

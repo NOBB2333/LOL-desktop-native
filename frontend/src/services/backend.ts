@@ -133,7 +133,7 @@ export const backend = {
     const trimmed = query.trim();
     const hasTag = trimmed.includes("#");
     if (!trimmed) return { query: "", hasTag, requiresTag: false, candidates: [] };
-    if (usesFixtureData()) return { query: trimmed, hasTag, requiresTag: !hasTag, candidates: [] };
+    if (usesFixtureData()) return browserBackend.searchSummoner(trimmed);
     return command("search_summoner", { query: trimmed });
   },
   /**

@@ -10,8 +10,8 @@ import MatchHistoryDetail from "../components/MatchHistoryDetail.vue";
 import PageHeader from "../components/PageHeader.vue";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
-import type { MatchSummary, SummonerSearchCandidate, SummonerSearchResult } from "../types/domain";
-import { championImage, roleName, shortDate } from "../utils/format";
+import type { MatchSummary, RankQueueSummary, SummonerSearchCandidate, SummonerSearchResult } from "../types/domain";
+import { championImage, rankName, roleName, shortDate } from "../utils/format";
 import { visibleMatches } from "../matches/filters";
 import { localPlayerRiotId, searchLocalPlayers } from "../matches/localPlayers";
 import { matchHistoryQueryKey } from "../matches/query";
@@ -84,6 +84,41 @@ const averageDamage = computed(() => completedRows.value.length ? (completedRows
 const averageKda = computed(() => completedRows.value.length ? (completedRows.value.reduce((sum, match) => sum + (match.kills + match.assists) / Math.max(1, match.deaths), 0) / completedRows.value.length).toFixed(2) : "0.00");
 const queueOptions = computed(() => [{ label: "全部模式", value: "all" }, ...Array.from(new Set(rows.value.map((match) => match.queueName))).map((value) => ({ label: value, value }))]);
 const hasNextPage = computed(() => rows.value.length === pageSize);
+
+/**
+ * 正在查看的玩家的等级与段位。
+ *
+ * 当前账号直接读 `app.connection`——后端每次刷新连接时本来就带回了等级与两个段位。
+ * 查别人时本地没有第二份来源，只能把同一个解析命令再跑一次（候选里已经带上 LCU
+ * 补的等级、单双与灵活段位）。跨区候选这三项是 null，界面显示「—」而不是「无段位」。
+ */
+const subjectProfile = useQuery({
+  queryKey: computed(() => ["summoner-profile", app.mode, activeSummoner.value.trim()]),
+  queryFn: async () => {
+    const found = await backend.searchSummoner(activeSummoner.value.trim());
+    return found.candidates.find((candidate) => candidate.puuid && candidate.puuid === app.connection.puuid) ?? found.candidates[0] ?? null;
+  },
+  enabled: computed(() => app.initialized && Boolean(activeSummoner.value.trim())),
+  staleTime: 300_000,
+});
+const viewingOther = computed(() => Boolean(activeSummoner.value.trim()));
+const viewedProfile = computed(() => (viewingOther.value ? subjectProfile.data.value ?? null : null));
+const subjectProfileLoading = computed(() => viewingOther.value && !viewedProfile.value && (subjectProfile.isPending.value || subjectProfile.isFetching.value));
+const viewedLevel = computed(() => (viewingOther.value ? viewedProfile.value?.summonerLevel ?? null : app.connection.summonerLevel));
+const viewedSolo = computed(() => (viewingOther.value ? viewedProfile.value?.soloRank ?? null : app.connection.soloRank));
+const viewedFlex = computed(() => (viewingOther.value ? viewedProfile.value?.flexRank ?? null : app.connection.flexRank));
+const currentAccountRiotId = computed(() => {
+  const name = app.connection.gameName ?? app.connection.summonerName ?? "";
+  if (!name) return "";
+  return app.connection.tagLine ? `${name}#${app.connection.tagLine}` : name;
+});
+const viewedName = computed(() => (viewingOther.value ? activeSummoner.value : currentAccountRiotId.value));
+
+/** 「翡翠 II · 63 LP」；缺数据显示「—」，不写「无段位」（那是另一个含义）。 */
+function rankLabel(rank: RankQueueSummary | null | undefined) {
+  if (!rank || !rank.tier) return "—";
+  return `${rankName(rank.tier)} ${rank.division} · ${rank.leaguePoints} LP`;
+}
 
 const resultLabel = (match: MatchSummary) => match.durationMinutes === 0 ? "未完成" : match.result;
 const resultClass = (match: MatchSummary) => match.durationMinutes === 0 ? "unfinished" : match.result === "胜利" ? "win" : "loss";
@@ -198,6 +233,23 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
       <div class="matches-page-actions"><NButton quaternary size="small" :loading="matches.isFetching.value" @click="refresh"><template #icon><RefreshCw :size="14" /></template>刷新</NButton><NButton secondary size="small" @click="setViewMode(viewMode === 'detail' ? 'index' : 'detail')"><template #icon><List :size="14" /></template>{{ viewMode === "detail" ? "切换索引模式" : "返回完整列表" }}</NButton></div>
     </PageHeader>
 
+    <!--
+      账号信息条：等级＋两个段位是「这个号大概什么水平」最快的读数，以前整页没有。
+      当前账号取连接状态；查别人时取解析命令补回来的那一份（跨区玩家本机没有数据）。
+    -->
+    <section class="matches-account-strip" data-testid="matches-account-strip">
+      <div class="matches-account-strip__who">
+        <span class="eyebrow">{{ viewingOther ? "正在查看" : "当前账号" }}</span>
+        <strong>{{ viewedName || "—" }}</strong>
+      </div>
+      <div class="matches-account-strip__stat"><span>等级</span><strong>{{ viewedLevel ? `Lv.${viewedLevel}` : "—" }}</strong></div>
+      <div class="matches-account-strip__stat"><span>单双排</span><strong>{{ rankLabel(viewedSolo) }}</strong></div>
+      <div class="matches-account-strip__stat"><span>灵活组排</span><strong>{{ rankLabel(viewedFlex) }}</strong></div>
+      <p v-if="viewingOther && !viewedProfile && !subjectProfileLoading" class="matches-account-strip__hint">
+        本机解析不到这位玩家的等级与段位：跨区玩家在本地客户端没有段位数据，下面只显示对局记录。
+      </p>
+    </section>
+
     <section class="matches-query-panel">
       <form class="matches-query-form" @submit.prevent="searchSummoner">
         <label class="matches-query-field"><span>查询其他玩家</span><NInput v-model:value="summonerQuery" size="large" placeholder="名字，或完整的 名字#标签（例如 玩家名#12345）" clearable><template #prefix><Search :size="16" /></template></NInput></label>
@@ -285,6 +337,13 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
 <style scoped>
 .matches-page--workspace { width: 100%; max-width: none; }
 .matches-page-actions { display: flex; align-items: center; gap: 5px; }
+/* 账号信息条：沿用「1px 边框 + 分格」的语言，与查询面板、汇总条保持一致。 */
+.matches-account-strip { display: grid; grid-template-columns: minmax(190px, 1.6fr) repeat(3, minmax(112px, 1fr)); align-items: stretch; gap: 1px; margin-bottom: 14px; border: 1px solid var(--line); background: var(--line); }
+.matches-account-strip > div { display: grid; align-content: center; gap: 3px; min-width: 0; min-height: 58px; padding: 10px 14px; background: var(--surface); }
+.matches-account-strip__who strong { overflow: hidden; color: var(--text-primary); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.matches-account-strip__stat span { color: var(--text-secondary); font-size: 10px; }
+.matches-account-strip__stat strong { overflow: hidden; color: var(--text-primary); font-size: 15px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.matches-account-strip__hint { grid-column: 1 / -1; margin: 0; padding: 7px 14px; color: var(--text-secondary); background: var(--surface); font-size: 9px; line-height: 1.5; }
 .matches-query-panel { display: grid; gap: 11px; margin-bottom: 14px; padding: 14px 16px; border: 1px solid var(--line); background: var(--surface); }.matches-query-form { display: grid; grid-template-columns: minmax(280px, 1fr) auto; align-items: end; gap: 10px 14px; }.matches-query-field { display: grid; gap: 5px; min-width: 0; }.matches-query-field > span { color: var(--text-primary); font-size: 11px; font-weight: 700; }.matches-query-field .n-input { width: min(100%, 620px); }.matches-query-submit { justify-self: end; min-width: 116px; }.matches-query-form > p { grid-column: 1 / -1; margin: 0; color: var(--text-secondary); font-size: 9px; }.matches-filter-row { display: grid; grid-template-columns: auto minmax(190px, 1fr) 120px 150px auto; align-items: center; gap: 7px; padding-top: 10px; border-top: 1px solid var(--line); }.matches-filter-title { display: inline-flex; align-items: center; gap: 5px; color: var(--text-muted); font-size: 9px; }.matches-filter-count { justify-self: end; color: var(--text-secondary); font-size: 9px; font-variant-numeric: tabular-nums; }
 .matches-candidates { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding-top: 10px; border-top: 1px solid var(--line); }.matches-candidates__label { color: var(--text-muted); font-size: 9px; }
 /* 本地档案是「猜测」而不是「精确命中」，用虚线把它和上面的精确匹配区分开。 */
@@ -299,5 +358,5 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
 .matches-detail-panel { min-height: 590px; overflow: hidden; }.matches-detail-empty { display: grid; place-items: center; align-content: center; min-height: 590px; padding: 30px; color: var(--text-secondary); text-align: center; }.matches-detail-empty h2 { margin: 10px 0 0; color: var(--text-primary); font-size: 17px; }.matches-detail-empty p { max-width: 290px; margin: 7px auto 0; font-size: 10px; line-height: 1.5; }.history-detail-enter-active, .history-detail-leave-active { transition: opacity 180ms ease, transform 220ms cubic-bezier(.23, 1, .32, 1); }.history-detail-enter-from { opacity: 0; transform: translateX(24px); }.history-detail-leave-to { opacity: 0; transform: translateX(-12px); }
 .matches-pagination { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; padding: 10px 14px; border: 1px solid var(--line); color: var(--text-secondary); background: var(--surface); font-size: 10px; }.matches-pagination > div { display: flex; gap: 6px; }
 @media (max-width: 980px) { .matches-workspace { grid-template-columns: minmax(205px, .3fr) minmax(0, 1fr); }.matches-filter-row { grid-template-columns: auto minmax(150px, 1fr) 108px 132px auto; }.matches-index__list { max-height: none; } }
-@media (max-width: 760px) { .matches-query-form { grid-template-columns: 1fr; }.matches-query-submit { justify-self: start; }.matches-filter-row { grid-template-columns: 1fr 1fr; }.matches-filter-title { grid-column: 1 / -1; }.matches-filter-count { justify-self: start; }.matches-workspace { grid-template-columns: 1fr; }.matches-detail-panel { min-height: 0; }.matches-detail-empty { min-height: 240px; }.matches-index__list { max-height: 420px; }.matches-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }.matches-summary__result { grid-column: 1 / -1; } }
+@media (max-width: 760px) { .matches-query-form { grid-template-columns: 1fr; }.matches-query-submit { justify-self: start; }.matches-account-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }.matches-account-strip__who { grid-column: 1 / -1; }.matches-filter-row { grid-template-columns: 1fr 1fr; }.matches-filter-title { grid-column: 1 / -1; }.matches-filter-count { justify-self: start; }.matches-workspace { grid-template-columns: 1fr; }.matches-detail-panel { min-height: 0; }.matches-detail-empty { min-height: 240px; }.matches-index__list { max-height: 420px; }.matches-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }.matches-summary__result { grid-column: 1 / -1; } }
 </style>

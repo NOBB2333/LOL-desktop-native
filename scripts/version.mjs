@@ -10,9 +10,12 @@
  * 3. check 额外断言 src/ 下没有残留的「当前应用版本」字面量，防止再退回硬编码。
  *
  * 用法：
- *   node scripts/version.mjs set 2.1.0   # 写入 app.json 并同步派生字段
+ *   node scripts/version.mjs set 2.5.0   # 写入 app.json 并同步派生字段（唯一的改版本入口）
  *   node scripts/version.mjs sync        # 按 app.json 同步派生字段
  *   node scripts/version.mjs check       # 校验全部一致
+ *
+ * 发布流程：`set <新版本>` → 提交 → 打 tag `v<新版本>` → 推送。
+ * CI 会跑同一个 `check`，并断言 tag 与 app.json.version 一致，所以本地过了云端就会过。
  */
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
@@ -48,6 +51,24 @@ function readManifestVersion() {
     throw new Error(`${manifestFile} 的 version 必须是有效 SemVer，例如 2.1.0`);
   }
   return version;
+}
+
+/**
+ * 把「不是合法 SemVer」说清楚，而不是只回一句用法。
+ *
+ * 单独认「两段」这一种：口语里说「发 2.5」时，顺手就会写成 `2.5`，但它不是合法 SemVer ——
+ * `native check` 的 manifest 校验和 CI 的 `v<版本>` tag 比对都会因此挂掉，而报错如果只说
+ * 「用法：… set <SemVer>」，写错的人只能自己猜到底哪里不对。这里直接把该写什么给出来。
+ */
+function describeInvalidVersion(requested) {
+  const twoSegment = /^(\d+)\.(\d+)$/.exec(requested);
+  if (twoSegment) {
+    return (
+      `"${requested}" 不是合法 SemVer：版本号必须是「主.次.修订」三段。\n` +
+      `  想发 ${requested} 的话请用 ${requested}.0，git tag 也要打成 v${requested}.0。`
+    );
+  }
+  return `"${requested}" 不是合法 SemVer。用法：node scripts/version.mjs set <主.次.修订>，例如 set 2.5.0`;
 }
 
 function collectMatches(file, kind) {
@@ -122,12 +143,16 @@ const [requested] = rawArgs[0] === "--" ? rawArgs.slice(1) : rawArgs;
 try {
   switch (command) {
     case "set": {
-      if (!requested || !semverPattern.test(requested)) {
-        throw new Error("用法：node scripts/version.mjs set <SemVer>，例如 set 2.1.0");
+      if (!requested) {
+        throw new Error("用法：node scripts/version.mjs set <主.次.修订>，例如 set 2.5.0");
+      }
+      if (!semverPattern.test(requested)) {
+        throw new Error(describeInvalidVersion(requested));
       }
       writeDerivedVersion({ file: manifestFile, kind: "json", occurrences: 1 }, requested);
       sync(requested);
       console.log(`版本已更新为 ${requested}（已同步 ${targets.length} 个派生文件）`);
+      console.log(`发布时 git tag 用 v${requested}（CI 会比对 tag 与 app.json.version）。`);
       break;
     }
     case "sync": {

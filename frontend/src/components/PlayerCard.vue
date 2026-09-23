@@ -185,7 +185,11 @@ function selectFromKeyboard(event: KeyboardEvent) {
           {{ player.gameName }}
           <em v-if="player.isBot" class="bp-player-card__bot">人机</em>
         </strong>
-        <small :title="`#${player.tagLine}`">#{{ player.tagLine || "--" }}</small>
+        <small :title="`#${player.tagLine}`">
+          <span class="bp-player-card__tag">#{{ player.tagLine || "--" }}</span>
+          <!-- 等级是「这个号练了多久」的最快代理指标，和 Tagline 同一行放得下。 -->
+          <span v-if="player.summonerLevel" class="bp-player-card__level" title="召唤师等级">Lv.{{ player.summonerLevel }}</span>
+        </small>
       </div>
       <span
         v-if="player.isPremade || premadeTone !== undefined"
@@ -519,14 +523,34 @@ function selectFromKeyboard(event: KeyboardEvent) {
 }
 
 .bp-player-card__identity small {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 5px;
   margin-top: 1px;
-  overflow: hidden;
   color: var(--text-muted);
   font-size: 10px;
   font-family: ui-monospace, monospace;
+}
+
+/* Tagline 负责吃掉剩余宽度，等级必须完整可见（它只有三四位数字）。 */
+.bp-player-card__tag {
+  overflow: hidden;
+  min-width: 0;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.bp-player-card__level {
+  flex: none;
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--text-secondary);
+  background: var(--surface-muted);
+  font-size: 9px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
 }
 
 .bp-player-card__bot {

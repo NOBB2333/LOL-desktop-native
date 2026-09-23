@@ -2,7 +2,17 @@
 
 对象：`LOL-desktop-native`（Zig 0.16 后端 + Vue 3 前端，Native SDK 0.10.1）
 参照标准：`D:\4_Code\0_Github_Project\vercel-labs_native_Demo`（Native SDK 官方模板）
-本次性质：**已在工作区落地，未提交 git。** 上一轮评估见 [架构评估 2026-09-13](ARCHITECTURE_REVIEW_2026-09-13.md)。
+本次性质：**已落地并提交 git。** 上一轮评估见 [架构评估 2026-09-13](ARCHITECTURE_REVIEW_2026-09-13.md)。
+
+> **版本现状（2026-09-23 复核）**：第 1.1 / 1.2 节的机制已全部可用且 `version:check` 通过。
+> 当时的版本仍是 `2.0.0`，现已改为 **`2.5.0`**。改版本**只有一条命令**：
+>
+> ```bash
+> pnpm run version:set 2.5.0   # 写 app.json 并同步 5 个派生文件
+> pnpm run version:check        # 校验（CI 会跑同一条）
+> ```
+>
+> 发布：提交后打 tag **`v2.5.0`**（必须是三段，CI 会比对 tag 与 `app.json.version`）。
 
 ---
 

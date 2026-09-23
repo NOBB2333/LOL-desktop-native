@@ -2051,6 +2051,7 @@ fn overlayDynamicProfile(target: *std.json.Value, dynamic: std.json.Value) void 
         copyObjectField(target, dynamic, "championName");
     }
     if (jsonInt(dynamic, "profileIconId") > 0) copyObjectField(target, dynamic, "profileIconId");
+    if (jsonInt(dynamic, "summonerLevel") > 0) copyObjectField(target, dynamic, "summonerLevel");
     if (profileHasKnownPosition(dynamic)) {
         if (jsonField(dynamic, "assignedPosition").len > 0) {
             copyObjectField(target, dynamic, "assignedPosition");
@@ -2104,6 +2105,8 @@ fn mergeLobbyProfile(allocator: std.mem.Allocator, base: std.json.Value, dynamic
         if (profileIdentityQuality(merged) < profileIdentityQuality(base)) copyObjectField(&merged, base, "puuid");
         if (!profileHasKnownName(merged) and profileHasKnownName(base)) copyObjectField(&merged, base, "gameName");
         if (jsonField(merged, "tagLine").len == 0) copyObjectField(&merged, base, "tagLine");
+        // 等级缓存 6 小时，本次没取到（比如请求超时）时保留上一份，别把已知等级擦成 null。
+        if (jsonInt(merged, "summonerLevel") <= 0 and jsonInt(base, "summonerLevel") > 0) copyObjectField(&merged, base, "summonerLevel");
         if (jsonInt(merged, "championId") <= 0 and jsonInt(base, "championId") > 0) {
             copyObjectField(&merged, base, "championId");
             copyObjectField(&merged, base, "championName");
@@ -2611,6 +2614,10 @@ const SummonerCandidate = struct {
     game_name: []const u8,
     tag_line: []const u8,
     puuid: []const u8,
+    /// 等级与段位都只从本地 LCU 取，因此**跨区候选拿不到**（见
+    /// `enrichSummonerCandidates`）。拿不到就是 null，不要退化成「无段位」。
+    summoner_level: ?i64 = null,
+    ranked: std.json.Value = .null,
 };
 
 /// 名字是否和查询一致（忽略大小写）。
@@ -2681,6 +2688,34 @@ fn appendAliasCandidates(
         if (duplicate) continue;
         candidates[count.*] = .{ .game_name = game_name, .tag_line = tag_line, .puuid = puuid };
         count.* += 1;
+    }
+}
+
+/// 给候选补上等级与本 / 灵活段位。
+///
+/// 只问本地 LCU：它只服务当前登录大区，所以**跨区候选取不到这两项**，字段会保持
+/// null。这是平台边界不是失败，前端据此显示「—」，不要伪装成「无段位」。
+/// 候选通常只有一个（一个 Riot ID 对应一个账号），所以逐个人肉调用成本可控。
+fn enrichSummonerCandidates(allocator: std.mem.Allocator, client: lcu.Client, candidates: []SummonerCandidate) void {
+    for (candidates) |*candidate| {
+        if (candidate.puuid.len == 0 or isNumericIdentity(candidate.puuid)) continue;
+        var path_buffer: [1280]u8 = undefined;
+        if (std.fmt.bufPrint(&path_buffer, "/lol-ranked/v1/ranked-stats/{s}", .{candidate.puuid})) |path| {
+            if (client.get(path)) |body| {
+                defer std.heap.page_allocator.free(body);
+                if (std.json.parseFromSliceLeaky(std.json.Value, allocator, body, .{})) |parsed| {
+                    candidate.ranked = parsed;
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
+        if (std.fmt.bufPrint(&path_buffer, "/lol-summoner/v2/summoners/puuid/{s}", .{candidate.puuid})) |path| {
+            if (client.get(path)) |body| {
+                defer std.heap.page_allocator.free(body);
+                if (std.json.parseFromSliceLeaky(std.json.Value, allocator, body, .{})) |parsed| {
+                    candidate.summoner_level = summonerLevelFromJson(firstJsonValue(parsed));
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
     }
 }
 
@@ -2769,6 +2804,14 @@ fn searchSummoner(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
                 } else |_| {}
             } else |_| {}
         }
+        // 等级与段位只在这里补一次，两条解析路径共用同一份逻辑。
+        if (count > 0) {
+            if (discoverClient(self, io)) |found| {
+                var client = found;
+                defer client.deinit();
+                enrichSummonerCandidates(allocator, client, candidates[0..count]);
+            } else |_| {}
+        }
     };
 
     var writer = std.Io.Writer.fixed(output);
@@ -2788,6 +2831,17 @@ fn searchSummoner(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
         try jsonString(&writer, candidate.tag_line);
         try writer.writeAll(",\"puuid\":");
         try jsonString(&writer, candidate.puuid);
+        try writer.writeAll(",\"summonerLevel\":");
+        if (candidate.summoner_level) |level| {
+            try writer.print("{d}", .{level});
+        } else {
+            try writer.writeAll("null");
+        }
+        // 同大区才有；跨区候选两项都写 null，前端显示「—」。
+        try writer.writeAll(",\"soloRank\":");
+        try writeRank(&writer, candidate.ranked, "RANKED_SOLO_5x5");
+        try writer.writeAll(",\"flexRank\":");
+        try writeRank(&writer, candidate.ranked, "RANKED_FLEX_SR");
         try writer.writeAll("}");
     }
     try writer.writeAll("]}");
@@ -2814,6 +2868,9 @@ fn cachedMatchesPageForSubject(self: *Runtime, subject: ?[]const u8, offset: usi
 const sgp_user_agent = "LeagueOfLegendsClient/15.0.0.0 (rcp-be-lol-match-history)";
 const player_profile_cache_ttl_seconds: i64 = 20;
 const player_history_cache_ttl_seconds: i64 = 60;
+/// 召唤师等级只随经验增长，掉不下来也几乎不变。整局重连、换局重跑十个人时
+/// 没必要每次都重新问一遍，所以给一个远长于段位/战绩的缓存窗口。
+const player_level_cache_ttl_seconds: i64 = 6 * 60 * 60;
 const player_enrichment_timeout_ms: u32 = 1800;
 
 fn fetchSgpHistoryWithContext(client: lcu.Client, context: JungleSgpContext, target_puuid: []const u8, start: usize, count: usize) ![]u8 {
@@ -5131,6 +5188,14 @@ fn writeNullableInt(writer: *std.Io.Writer, value: std.json.Value, name: []const
     try writer.print("{d}", .{number});
 }
 
+/// 从召唤师对象里取等级。LCU 用缺字段或 0 表示「没拿到」，两种都归成 null，
+/// 免得界面上出现「等级 0」这种明显不对的数字。
+fn summonerLevelFromJson(value: std.json.Value) ?i64 {
+    if (value != .object) return null;
+    const level = jsonInt(value, "summonerLevel");
+    return if (level > 0) level else null;
+}
+
 fn writeRank(writer: *std.Io.Writer, ranked: std.json.Value, queue_type: []const u8) !void {
     const queue = rankQueueValue(ranked, queue_type) orelse return writer.writeAll("null");
     const actual = if (jsonField(queue, "queueType").len > 0) jsonField(queue, "queueType") else queue_type;
@@ -5501,6 +5566,21 @@ fn runPlayerRankRequest(job: *PlayerRankRequestJob) void {
     job.result = job.client.get(path) catch null;
 }
 
+/// 十名玩家的等级。LCU 没有「按 puuid 批量取召唤师」的接口（别名批量接口要
+/// 名字 + 标签，选人阶段敌方根本不暴露），所以和段位一样按人取，但两者互不
+/// 依赖，各自在独立线程上跑，墙钟时间上只多一次往返。
+const PlayerSummonerRequestJob = struct {
+    client: lcu.Client,
+    puuid: []const u8,
+    result: ?[]u8 = null,
+};
+
+fn runPlayerSummonerRequest(job: *PlayerSummonerRequestJob) void {
+    var path_buffer: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/lol-summoner/v2/summoners/puuid/{s}", .{job.puuid}) catch return;
+    job.result = job.client.get(path) catch null;
+}
+
 const PlayerLcuHistoryRequestJob = struct {
     client: lcu.Client,
     puuid: []const u8,
@@ -5642,6 +5722,20 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     const raw_champion_name = if (jsonField(player, "championName").len > 0) jsonField(player, "championName") else jsonField(player, "rawChampionName");
     const champion_name = if (champion_id > 0) catalogChampionName(catalog, champion_id, raw_champion_name) else championDisplayName(raw_champion_name, "已选择");
     const position = if (playerPosition(player).len > 0) playerPosition(player) else "NONE";
+    // 等级：先薅已经到手的那几份 JSON（身份对象是按 puuid 补身份时顺带拿的，
+    // 选人阶段「隐藏名字」的玩家就靠它），再退到落盘缓存，最后才在下面的
+    // 并发块里为没拿到的玩家发一次请求。
+    var summoner_level: ?i64 = summonerLevelFromJson(identity);
+    if (summoner_level == null) summoner_level = summonerLevelFromJson(player);
+    if (summoner_level == null) summoner_level = summonerLevelFromJson(summoner);
+    if (summoner_level == null and puuid.len > 0 and !is_bot and !self.force_profile_refresh) {
+        const level_owned = cachedSnapshot(self, "playerLevel", puuid, player_level_cache_ttl_seconds);
+        defer if (level_owned) |value| std.heap.page_allocator.free(value);
+        if (level_owned) |value| {
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, value, .{}) catch std.json.Value{ .null = {} };
+            summoner_level = summonerLevelFromJson(firstJsonValue(parsed));
+        }
+    }
     // 配置每个玩家都要读一次，解析一次即可，后续过滤复用同一个判定。
     const ranked_only = runtimeRankedOnly(self);
 
@@ -5653,13 +5747,18 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     var history_source: []const u8 = if (history_cached) "sqlite-fresh" else "lcu";
     var sgp_history_owned: ?[]u8 = null;
     defer if (sgp_history_owned) |value| std.heap.page_allocator.free(value);
+    var level_owned: ?[]u8 = null;
+    defer if (level_owned) |value| std.heap.page_allocator.free(value);
     if (enrich and !is_bot and puuid.len > 0 and !isNumericIdentity(puuid)) {
         var rank_job = PlayerRankRequestJob{ .client = enrichment_client, .puuid = puuid };
-        // 段位与战绩互不依赖，共用有上限的网络配额并行请求。
+        var level_job = PlayerSummonerRequestJob{ .client = enrichment_client, .puuid = puuid };
+        // 段位、等级与战绩互不依赖，共用有上限的网络配额并行请求。
         const rank_thread = if (rank_owned == null) std.Thread.spawn(.{}, runPlayerRankRequest, .{&rank_job}) catch null else null;
+        const level_thread = if (summoner_level == null) std.Thread.spawn(.{}, runPlayerSummonerRequest, .{&level_job}) catch null else null;
         if (rank_owned == null) {
             if (rank_thread == null) runPlayerRankRequest(&rank_job);
         }
+        if (summoner_level == null and level_thread == null) runPlayerSummonerRequest(&level_job);
         if (history_owned == null) {
             const fetch_count: usize = if (ranked_only) live_history_ranked_fetch_count else live_history_fetch_count;
             var job = PlayerLcuHistoryRequestJob{ .client = enrichment_client, .puuid = puuid, .end_index = fetch_count - 1 };
@@ -5685,10 +5784,17 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
             };
         }
         if (rank_thread) |thread| thread.join();
+        if (level_thread) |thread| thread.join();
         if (rank_owned == null) {
             rank_owned = rank_job.result;
             if (self.storage) |*store| if (rank_owned) |value| store.put("playerRank", puuid, value) catch {};
         }
+        if (summoner_level == null) if (level_job.result) |value| {
+            level_owned = value;
+            if (self.storage) |*store| store.put("playerLevel", puuid, value) catch {};
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, value, .{}) catch std.json.Value{ .null = {} };
+            summoner_level = summonerLevelFromJson(firstJsonValue(parsed));
+        };
     }
     const ranked = if (rank_owned) |value| std.json.parseFromSliceLeaky(std.json.Value, allocator, value, .{}) catch std.json.Value{ .null = {} } else std.json.Value{ .null = {} };
     const solo = rankQueueValue(ranked, "RANKED_SOLO_5x5");
@@ -5750,6 +5856,13 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     try jsonString(writer, champion_name);
     try writer.print(",\"profileIconId\":{d},\"assignedPosition\":", .{profile_icon_id});
     try jsonString(writer, position);
+    // 等级与头像同属「身份字段」，贴着放。拿不到就写 null，由界面决定怎么显示。
+    try writer.writeAll(",\"summonerLevel\":");
+    if (summoner_level) |level| {
+        try writer.print("{d}", .{level});
+    } else {
+        try writer.writeAll("null");
+    }
     // 战绩隐私：LCU/SGP 的召唤师对象带 `privacy`（`PUBLIC` / `PRIVATE`）。
     // 拿不到身份时写 `null`，「战绩隐藏」标签便不渲染。
     const privacy = if (identity != .null) jsonField(identity, "privacy") else "";
@@ -7394,6 +7507,19 @@ test "部分资料失败保留已成功字段并标记旧数据" {
     try std.testing.expect(jsonBool(merged.object.get("dataStatus").?, "isStale"));
 }
 
+test "等级本次没取到时沿用上一份而不是被擦成 null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const base = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"puuid":"本人","summonerLevel":318,"rankTier":"GOLD","recentMatches":[{"gameId":1}],"dataComplete":true,"unavailableSources":[]}
+    , .{});
+    const partial = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"puuid":"本人","summonerLevel":null,"rankTier":"GOLD","recentMatches":[{"gameId":1}],"dataComplete":true,"unavailableSources":[],"dataStatus":{"source":"lcu","isStale":false}}
+    , .{});
+    const merged = try mergeLobbyProfile(arena.allocator(), base, partial, true);
+    try std.testing.expectEqual(@as(i64, 318), jsonInt(merged, "summonerLevel"));
+}
+
 test "身份补全不会换批次而换局会取消旧任务" {
     var state = Runtime.init();
     cacheLiveLobby(&state, "{\"id\":\"1\",\"phase\":\"ChampSelect\",\"ally\":[{\"puuid\":\"123\"}],\"enemy\":[]}");
@@ -8221,6 +8347,40 @@ test "decrypts ChampSelect obfuscated PUUIDs before exposing player profiles" {
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"puuid\":\"00112233-4455-5677-8899-aabbccddeeff\"") != null);
 }
 
+test "快速快照带上召唤师等级，拿不到时写 null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const participant = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"gameName\":\"老号\",\"summoner\":{\"summonerLevel\":318}}", .{});
+    var output: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    try writeProfile(&writer, participant, "ally", std.json.Value{ .null = {} });
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 318), jsonInt(parsed.value, "summonerLevel"));
+
+    // 字段必须在，只是值为 null：合并逻辑靠「字段存在」来决定能不能被覆盖。
+    const unknown = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"gameName\":\"未知玩家\"}", .{});
+    var blank_output: [4096]u8 = undefined;
+    var blank_writer = std.Io.Writer.fixed(&blank_output);
+    try writeProfile(&blank_writer, unknown, "ally", std.json.Value{ .null = {} });
+    const blank = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, blank_writer.buffered(), .{});
+    defer blank.deinit();
+    try std.testing.expect(blank.value.object.get("summonerLevel").? == .null);
+}
+
+test "从召唤师对象读等级，缺字段或 0 都算没拿到" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const level = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"summonerLevel\":42}", .{});
+    try std.testing.expectEqual(@as(?i64, 42), summonerLevelFromJson(level));
+    const zero = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"summonerLevel\":0}", .{});
+    try std.testing.expectEqual(@as(?i64, null), summonerLevelFromJson(zero));
+    const missing = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{}", .{});
+    try std.testing.expectEqual(@as(?i64, null), summonerLevelFromJson(missing));
+    try std.testing.expectEqual(@as(?i64, null), summonerLevelFromJson(.null));
+}
+
 test "preserves champ-select summoner spells for smite jungler detection" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -8391,6 +8551,14 @@ fn writeProfileWithGroupIndexed(writer: *std.Io.Writer, participant: std.json.Va
     try writer.writeAll(",\"profileIconId\":");
     try writer.print("{d},\"assignedPosition\":", .{profile_icon_id});
     try jsonString(writer, position);
+    // 快速快照也带上等级字段（拿不到就是 null），这样后续与富化结果合并时
+    // 字段始终存在，判定「谁有值」不必再区分「字段缺失」和「值为空」。
+    try writer.writeAll(",\"summonerLevel\":");
+    if (summonerLevelFromJson(participant) orelse summonerLevelFromJson(summoner)) |level| {
+        try writer.print("{d}", .{level});
+    } else {
+        try writer.writeAll("null");
+    }
     try writer.writeAll(",\"summonerSpells\":");
     try writeSummonerSpells(writer, participant);
     try writer.writeAll(",\"rankTier\":\"\",\"rankDivision\":\"\",\"leaguePoints\":0,\"wins\":0,\"losses\":0,\"soloRank\":null,\"flexRank\":null,\"recentMatches\":[],\"topChampions\":[],\"score\":{\"total\":0,\"confidence\":0,\"components\":[]},\"junglePreference\":null,\"encounterCount\":0,\"lastEncounteredAt\":null");

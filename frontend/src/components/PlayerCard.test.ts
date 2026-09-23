@@ -242,4 +242,17 @@ describe("PlayerCard", () => {
     // 路线图还没回来时入口也得在，否则用户点不开抽屉看打野分析。
     expect(mount(PlayerCard, { props: { player: fixtureLobby.ally[1] } }).find("[data-testid='player-card-jungle-link']").exists()).toBe(true);
   });
+
+  // 等级和 Tagline 同一行：这是「这个号练了多久」最快的读数，卡片上直接给。
+  it("身份行显示召唤师等级，缺数据时只留 Tagline", () => {
+    const player = fixtureLobby.ally[0];
+    const wrapper = mount(PlayerCard, { props: { player } });
+    expect(wrapper.get(".bp-player-card__level").text()).toBe(`Lv.${player.summonerLevel}`);
+    expect(wrapper.get(".bp-player-card__tag").text()).toBe(`#${player.tagLine}`);
+
+    // 拿不到等级（后端返回 null）时不渲染 0、也不渲染空 chip。
+    const withoutLevel = mount(PlayerCard, { props: { player: { ...player, summonerLevel: null } } });
+    expect(withoutLevel.find(".bp-player-card__level").exists()).toBe(false);
+    expect(withoutLevel.get(".bp-player-card__tag").text()).toBe(`#${player.tagLine}`);
+  });
 });

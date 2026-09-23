@@ -56,6 +56,13 @@ jobs:
       - name: Lint frontend
         run: pnpm --dir frontend run lint
 
+      # 版本单一源 + 命令面一致性。本地 `pnpm run check:static` 跑的就是这两条，
+      # 放在这里是为了「本地过了 == 云端也过」，而不是云端另有一套更弱的判断。
+      - name: Verify version and command parity
+        run: |
+          node scripts/version.mjs check
+          node scripts/check-bridge-parity.mjs
+
       - name: Test Zig backend
         shell: bash
         run: |
@@ -99,11 +106,12 @@ jobs:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
         run: |
+          # 一致性校验交给仓库脚本（app.json <-> 5 个派生文件 <-> src/ 无硬编码），
+          # 不再由 CI 自己维护一份「只比对 app.json 与 frontend/package.json」的弱化版——
+          # 两边规则不一样时，会出现「本地 check 过了、推上去才挂」。
+          node scripts/version.mjs check
+          if ($LASTEXITCODE -ne 0) { throw "版本不一致：本地跑 pnpm run version:sync 修复后再推" }
           $appVersion = (Get-Content app.json -Raw | ConvertFrom-Json).version
-          $frontendVersion = (Get-Content frontend/package.json -Raw | ConvertFrom-Json).version
-          if (-not $appVersion -or $appVersion -ne $frontendVersion) {
-            throw "Version mismatch: app.json=$appVersion, frontend/package.json=$frontendVersion"
-          }
           if ($env:REF_TYPE -eq 'tag' -and $env:REF_NAME -ne "v$appVersion") {
             throw "Tag $($env:REF_NAME) does not match project version v$appVersion"
           }
