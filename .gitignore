@@ -19,3 +19,7 @@ zig-out/
 
 # Native SDK local artifacts
 .native/
+
+# 界面视觉验证的临时目录（无头 Chrome 的截图 / DOM 转储 / CDP 探针 + 浏览器 profile）。
+# 这些东西只在本地调试时产生，不该进版本库。
+frontend/.verify/

@@ -29,7 +29,7 @@ describe("PlayerTagMetPopover", () => {
 
     const rows = wrapper.findAll("[data-testid='met-row']");
     // 最近一局在前：fixture 里 gameIndex 0 的相遇时间最新。
-    expect(rows[0].find("[data-testid='met-inspect']").text()).toBe("查看 910000");
+    expect(rows[0].find("[data-testid='met-inspect']").text()).toBe("查看 880210");
 
     await rows[0].find("[data-testid='met-inspect']").trigger("click");
     const emitted = wrapper.emitted("inspect");

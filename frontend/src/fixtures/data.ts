@@ -360,11 +360,15 @@ export const fixtureChampions: ChampionOverview[] = champions.map(([id, name, al
 
 const fixtureEncounterPlayers = [...fixtureLobby.ally.slice(1), ...fixtureLobby.enemy];
 export const fixtureEncounters: EncounterRecord[] = Array.from({ length: 3 }, (_, gameIndex) => {
-  const selfWin = gameIndex !== 1;
+  // 必须和 `fixtureMatches` 对齐同一局：同 id、同时间、同胜负。
+  // 否则历史页「最近对局」里那句「这局是跟谁打的」永远 join 不上，
+  // 预览里清一色显示「未记录」——看起来像功能没做，其实是 fixture 各说各话。
+  const game = fixtureMatches[gameIndex];
+  const selfWin = game.result === "胜利";
   return fixtureEncounterPlayers.map((player, playerIndex) => {
     const side = fixtureLobby.ally.some((member) => member.puuid === player.puuid) ? "ally" : "enemy";
     return {
-      gameId: 910000 + gameIndex,
+      gameId: game.gameId,
       queueId: 420,
       queueName: "单双排",
       selfPuuid: fixtureLobby.ally[0].puuid,
@@ -389,7 +393,7 @@ export const fixtureEncounters: EncounterRecord[] = Array.from({ length: 3 }, (_
       deaths: 2 + ((playerIndex + gameIndex) % 5),
       assists: 5 + ((playerIndex * 2 + gameIndex) % 9),
       win: side === "ally" ? selfWin : !selfWin,
-      encounteredAt: new Date(now - (gameIndex * 4 + 1) * 86400000).toISOString(),
+      encounteredAt: game.playedAt,
     };
   });
 }).flat();

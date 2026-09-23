@@ -1,20 +1,23 @@
 <script setup lang="ts">
-import { CalendarDays, ClipboardList, Eye, Search, Shield, TrendingUp, UsersRound } from "@lucide/vue";
-import { NButton, NInput, NSpin, NTag } from "naive-ui";
+import { ArrowUpRight, CalendarDays, ChevronDown, ClipboardList, Eye, Search, Shield, TrendingUp, UsersRound } from "@lucide/vue";
+import { NButton, NInput, NSpin } from "naive-ui";
 import { computed, ref, watch } from "vue";
 import { useQuery } from "@tanstack/vue-query";
+import { useRouter } from "vue-router";
 import AssetIcon from "../components/AssetIcon.vue";
 import MatchTimelinePanel from "../components/MatchTimelinePanel.vue";
 import PageHeader from "../components/PageHeader.vue";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
-import { championImage, relativeTime } from "../utils/format";
+import type { EncounterRecord, MatchSummary } from "../types/domain";
+import { championImage, relativeTime, roleName } from "../utils/format";
 import { queueLabel } from "../utils/queue";
 import { scorePlayerName } from "../matches/localPlayers";
 import { clockOf } from "../matches/timeline";
+import { aggregateRelationships, lastSeenLabel, relationLabel } from "../encounters/relationships";
 
 const app = useAppStore();
-const tab = ref<"bp" | "encounters" | "timeline">("bp");
+const tab = ref<"matches" | "encounters" | "timeline" | "bp">("matches");
 const bp = useQuery({ queryKey: computed(() => ["bp-history", app.mode]), queryFn: backend.bpHistory, enabled: computed(() => app.initialized) });
 const encounters = useQuery({ queryKey: computed(() => ["encounter-history", app.mode]), queryFn: () => backend.encounters(undefined, 100), enabled: computed(() => app.initialized) });
 // 这里只把英雄名映射成 id，走默认区服/分段即可（包一层：vue-query 会把查询上下文当第一个参数）。
@@ -30,12 +33,63 @@ const scoreTone = (ally: number, enemy: number) => ally >= enemy ? "ally" : "ene
  * 所以两边「像不像」的标准不会漂。
  */
 const playerQuery = ref("");
-const visibleEncounters = computed(() => {
-  const list = encounters.data.value ?? [];
+/**
+ * 按玩家聚合的相遇档案。
+ *
+ * 这里原来列的是「每局每人一行」的原始记录：同一个人打了 8 局就出现 8 次，
+ * 既看不出「跟他一共打了多少局」，也没法按交情排序。聚合口径与首页「关系记录」
+ * 共用 `encounters/relationships.ts`，两处不会漂。
+ *
+ * 注意分母：后端相遇记录是从本地保存的战绩现算的，没有终身归档，所以只能说
+ * 「最近 N 局里遇到 X 次」，不能写成「一共」。
+ */
+const aggregates = computed(() => aggregateRelationships(encounters.data.value ?? []));
+const visibleAggregates = computed(() => {
   const query = playerQuery.value.trim();
-  if (!query) return list;
-  return list.filter((record) => scorePlayerName(query, record.gameName, record.tagLine ?? "") !== null);
+  if (!query) return aggregates.value;
+  return aggregates.value.filter((item) => scorePlayerName(query, item.gameName, item.tagLine) !== null);
 });
+/** 排序口径：按相遇次数（聚合模块的默认顺序）或按最近相遇。 */
+const sortMode = ref<"count" | "recent">("count");
+const sortedAggregates = computed(() => {
+  if (sortMode.value === "count") return visibleAggregates.value;
+  return [...visibleAggregates.value].sort((left, right) => Date.parse(right.lastEncounteredAt) - Date.parse(left.lastEncounteredAt));
+});
+/** 展开的那一位：展开后逐局列出相遇细节，这就是「可以看到对应的信息」。 */
+const expandedPuuid = ref("");
+function togglePlayer(puuid: string) {
+  expandedPuuid.value = expandedPuuid.value === puuid ? "" : puuid;
+}
+/**
+ * 原始记录按对局归堆，给「最近对局」页签用。
+ *
+ * 战绩页回答的是「我打得怎么样」，这里额外回答「这局是跟谁打的」——
+ * 这是本地档案独有的信息，也是这一页存在的理由。
+ */
+const encountersByGame = computed(() => {
+  const map = new Map<number, EncounterRecord[]>();
+  for (const record of encounters.data.value ?? []) {
+    if (record.liveSnapshot || !(record.gameId > 0)) continue;
+    const list = map.get(record.gameId);
+    if (list) list.push(record);
+    else map.set(record.gameId, [record]);
+  }
+  return map;
+});
+const metInGame = (gameId: number, side: "ally" | "enemy") =>
+  (encountersByGame.value.get(gameId) ?? []).filter((record) => (side === "ally" ? record.side === "ally" : record.side !== "ally"));
+const router = useRouter();
+/** `名字#标签`；没有标签时退化成只用名字（与战绩页的查询口径一致）。 */
+function riotIdOf(record: { gameName: string; tagLine?: string | null }) {
+  const tag = record.tagLine?.trim();
+  return tag ? `${record.gameName}#${tag}` : record.gameName;
+}
+/** 跳到战绩页看这位玩家的完整数据（战绩页按 `?summoner=名字#标签` 查询）。 */
+function openInMatches(record: { gameName: string; tagLine?: string | null }) {
+  void router.push({ path: "/matches", query: { summoner: riotIdOf(record) } });
+}
+const matchResultTone = (match: MatchSummary) => match.durationMinutes === 0 ? "unfinished" : match.result === "胜利" ? "win" : "loss";
+const matchKda = (match: MatchSummary) => `${match.kills}/${match.deaths}/${match.assists}`;
 
 /**
  * 时间线页签的对局选择器。
@@ -43,15 +97,19 @@ const visibleEncounters = computed(() => {
  * 取的是**本地账号**最近的对局（不传名字就是自己），只在这个页签可见时才请求，
  * 免得历史页一打开就多打一次 LCU。选中的局决定时间线查询的 key。
  */
-const timelineMatches = useQuery({
-  queryKey: computed(() => ["timeline-matches", app.mode]),
+/**
+ * 最近对局列表：「最近对局」与「对局时间线」两个页签共用同一份，
+ * 也只在这两个页签之一可见时才请求，免得历史页一打开就多打一次 LCU。
+ */
+const historyMatches = useQuery({
+  queryKey: computed(() => ["history-matches", app.mode]),
   queryFn: () => backend.matches(undefined, 0, 20),
-  enabled: computed(() => app.initialized && tab.value === "timeline"),
+  enabled: computed(() => app.initialized && (tab.value === "matches" || tab.value === "timeline")),
 });
 const selectedGameId = ref(0);
 // 列表到手后默认选最近一局；用户手动选过就不再覆盖（只在未选时兜底）。
 watch(
-  () => timelineMatches.data.value,
+  () => historyMatches.data.value,
   (list) => {
     if (!list?.length) return;
     if (list.some((match) => match.gameId === selectedGameId.value)) return;
@@ -70,16 +128,19 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
 
 <template>
   <div class="page-shell history-page">
-    <PageHeader title="历史" eyebrow="LOCAL ARCHIVE" meta="把 BP 决策和遇到的玩家沉淀成可检索的本地记录；这里不保存游戏录像">
+    <PageHeader title="历史" eyebrow="LOCAL ARCHIVE" meta="最近的本地对局档案：打过哪些局、都是跟谁打的；这里不保存游戏录像">
       <div class="history-tabs">
-        <button type="button" :class="{ active: tab === 'bp' }" @click="tab = 'bp'">
-          <ClipboardList :size="14" />BP 记录
+        <button type="button" :class="{ active: tab === 'matches' }" @click="tab = 'matches'">
+          <CalendarDays :size="14" />最近对局
         </button>
         <button type="button" :class="{ active: tab === 'encounters' }" @click="tab = 'encounters'">
-          <UsersRound :size="14" />玩家档案
+          <UsersRound :size="14" />遇到的玩家
         </button>
         <button type="button" :class="{ active: tab === 'timeline' }" @click="tab = 'timeline'">
           <TrendingUp :size="14" />对局时间线
+        </button>
+        <button type="button" :class="{ active: tab === 'bp' }" @click="tab = 'bp'">
+          <ClipboardList :size="14" />BP 记录
         </button>
       </div>
     </PageHeader>
@@ -191,13 +252,25 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
         <div>
           <span class="eyebrow">PLAYER ARCHIVE</span>
           <h2>遇到的玩家</h2>
-          <p>按 PUUID 记录最近遇到的队友和对手，点击战绩页可以继续查看完整数据。</p>
+          <p>按玩家聚合最近遇到过的队友与对手；点一行展开逐局细节，或直接去战绩页看他的完整数据。</p>
         </div>
         <div class="history-archive-tools">
           <NInput v-model:value="playerQuery" size="small" clearable placeholder="按名字模糊筛选"><template #prefix><Search :size="14" /></template></NInput>
-          <span class="history-count">{{ visibleEncounters.length }} <small>/ {{ encounters.data.value?.length ?? 0 }} 条</small></span>
+          <div class="history-sort" role="group" aria-label="排序方式">
+            <button type="button" :class="{ active: sortMode === 'count' }" @click="sortMode = 'count'">相遇次数</button>
+            <button type="button" :class="{ active: sortMode === 'recent' }" @click="sortMode = 'recent'">最近相遇</button>
+          </div>
+          <span class="history-count">{{ sortedAggregates.length }} <small>/ {{ aggregates.length }} 人</small></span>
         </div>
       </header>
+
+      <!--
+        分母必须说清楚：本地相遇记录是从保存下来的战绩现算的，没有终身归档。
+        写成「一共打了多少局」就是在撒谎，所以只说「最近 N 局里遇到几次」。
+      -->
+      <p v-if="aggregates.length" class="history-archive-note">
+        分母是最近 {{ aggregates[0]?.windowGames ?? 0 }} 局：本地只保存战绩现算的相遇记录，没有终身归档。
+      </p>
 
       <div v-if="!encounters.data.value?.length" class="history-empty">
         <UsersRound :size="24" />
@@ -205,7 +278,7 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
         <span>对局页获取到十人阵容后，会自动保存玩家摘要。</span>
       </div>
 
-      <div v-else-if="!visibleEncounters.length" class="history-empty">
+      <div v-else-if="!sortedAggregates.length" class="history-empty">
         <Search :size="24" />
         <strong>本地档案里没有匹配的玩家</strong>
         <span>这里只搜你已经遇到过的人，不会去查其他大区的同名账号。</span>
@@ -214,65 +287,76 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
       <div v-else class="encounter-table">
         <div class="encounter-table__head">
           <span>玩家</span>
-          <span>位置</span>
-          <span>英雄</span>
-          <span>结果</span>
-          <span>时间</span>
+          <span>相遇</span>
+          <span>最近英雄</span>
+          <span>我方胜率</span>
+          <span>最近相遇</span>
+          <span />
         </div>
-        <div
-          v-for="record in visibleEncounters"
-          :key="`${record.gameId}-${record.puuid}`"
-          class="encounter-table__row"
-        >
-          <!-- 玩家 -->
-          <div class="encounter-player">
-            <span class="encounter-player__avatar">{{ record.gameName.slice(0, 1) }}</span>
-            <div>
-              <strong>{{ record.gameName }}</strong>
-              <small class="encounter-player__puuid" :title="record.puuid">{{ record.puuid }}</small>
+        <template v-for="aggregate in sortedAggregates" :key="aggregate.puuid">
+          <button type="button" class="encounter-table__row" :class="{ 'is-open': expandedPuuid === aggregate.puuid }" @click="togglePlayer(aggregate.puuid)">
+            <!-- 玩家 -->
+            <div class="encounter-player">
+              <span class="encounter-player__avatar">{{ aggregate.gameName.slice(0, 1) }}</span>
+              <div>
+                <strong>{{ aggregate.gameName }}<em v-if="aggregate.tagLine">#{{ aggregate.tagLine }}</em></strong>
+                <small class="encounter-player__puuid">{{ relationLabel(aggregate) }}</small>
+              </div>
+            </div>
+            <!-- 相遇次数：这是默认排序口径，也是这一页存在的理由 -->
+            <div class="encounter-count"><strong>{{ aggregate.totalGames }}</strong><small>次</small></div>
+            <!-- 最近一次用的英雄 -->
+            <div class="encounter-champion">
+              <AssetIcon kind="champion" :id="championIdFor(aggregate.last.championName, aggregate.last.championId)" :name="aggregate.last.championName || '未记录英雄'" :fallback-url="championImage(championIdFor(aggregate.last.championName, aggregate.last.championId))" size="sm" />
+              <span>{{ aggregate.last.championName || '未记录英雄' }}</span>
+            </div>
+            <!-- 我方视角胜率；没有胜负信息的局不进分母 -->
+            <div class="encounter-rate">
+              <strong>{{ aggregate.decidedGames ? `${Math.round(aggregate.winRate * 100)}%` : '—' }}</strong>
+              <small v-if="aggregate.decidedGames">{{ aggregate.wins }}胜{{ aggregate.decidedGames - aggregate.wins }}负</small>
+            </div>
+            <!-- 时间 -->
+            <time class="encounter-time">{{ lastSeenLabel(aggregate) || relativeTime(aggregate.lastEncounteredAt) }}</time>
+            <ChevronDown :size="14" class="encounter-caret" />
+          </button>
+
+          <!-- 展开 = 逐局细节：每局的英雄、他的 KDA、我方 KDA、胜负与时间 -->
+          <div v-if="expandedPuuid === aggregate.puuid" class="encounter-detail">
+            <div v-for="game in aggregate.games" :key="`${aggregate.puuid}-${game.gameId}`" class="encounter-detail__row">
+              <span class="encounter-detail__side" :data-side="game.side">{{ game.side === 'ally' ? '队友' : '对手' }}</span>
+              <AssetIcon kind="champion" :id="championIdFor(game.championName, game.championId)" :name="game.championName" :fallback-url="championImage(championIdFor(game.championName, game.championId))" size="xs" />
+              <b>{{ game.championName || '未记录英雄' }}</b>
+              <span class="encounter-detail__kda">他 {{ game.kills }}/{{ game.deaths }}/{{ game.assists }}</span>
+              <span class="encounter-detail__self">我 {{ game.selfKills }}/{{ game.selfDeaths }}/{{ game.selfAssists }}</span>
+              <span class="encounter-detail__result" :data-win="game.won === null ? 'unknown' : String(game.won)">{{ game.won === null ? '未知' : game.won ? '胜利' : '失败' }}</span>
+              <time>{{ relativeTime(game.encounteredAt) }}</time>
+            </div>
+            <div class="encounter-detail__foot">
+              <NButton size="tiny" secondary @click.stop="openInMatches(aggregate)"><template #icon><ArrowUpRight :size="12" /></template>在战绩页查看 {{ riotIdOf(aggregate) }}</NButton>
             </div>
           </div>
-          <!-- 位置 -->
-          <div>
-            <NTag size="small" :bordered="false" :type="record.side === 'ally' ? 'info' : 'warning'">
-              {{ record.side === 'ally' ? '我方' : '敌方' }}
-            </NTag>
-          </div>
-          <!-- 英雄 -->
-          <div class="encounter-champion">
-            <AssetIcon kind="champion" :id="championIdFor(record.championName, record.championId)" :name="record.championName || '未记录英雄'" :fallback-url="championImage(championIdFor(record.championName, record.championId))" size="sm" />
-            <span>{{ record.championName || '未记录英雄' }}</span>
-          </div>
-          <!-- 结果 -->
-          <div>
-            <NTag size="small" :bordered="false" :type="record.result === '胜利' ? 'success' : 'error'">
-              {{ record.result ?? '未知' }}
-            </NTag>
-          </div>
-          <!-- 时间 -->
-          <time class="encounter-time">{{ relativeTime(record.encounteredAt) }}</time>
-        </div>
+        </template>
       </div>
     </section>
 
     <!-- 对局时间线 -->
-    <section v-if="tab === 'timeline'" class="history-section">
+    <section v-else-if="tab === 'timeline'" class="history-section">
       <header class="history-section__header">
         <div>
           <span class="eyebrow">MATCH TIMELINE</span>
           <h2>经济曲线与关键事件</h2>
           <p>数据来自本地客户端的逐帧记录：双方经济差、野怪、防御塔与镀层。选一局看走势。</p>
         </div>
-        <span class="history-count">{{ timelineMatches.data.value?.length ?? 0 }} <small>局可选</small></span>
+        <span class="history-count">{{ historyMatches.data.value?.length ?? 0 }} <small>局可选</small></span>
       </header>
 
-      <div v-if="timelineMatches.isPending.value" class="history-empty">
+      <div v-if="historyMatches.isPending.value" class="history-empty">
         <NSpin size="small" />
         <strong>正在读取最近对局</strong>
         <span>本页只列本地账号的战绩。</span>
       </div>
 
-      <div v-else-if="!timelineMatches.data.value?.length" class="history-empty">
+      <div v-else-if="!historyMatches.data.value?.length" class="history-empty">
         <TrendingUp :size="24" />
         <strong>还没有可回看的对局</strong>
         <span>打完一局后，这里会出现它的经济曲线和关键事件。</span>
@@ -281,7 +365,7 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
       <template v-else>
         <div class="timeline-picker" role="tablist" aria-label="选择对局">
           <button
-            v-for="match in timelineMatches.data.value ?? []"
+            v-for="match in historyMatches.data.value ?? []"
             :key="match.gameId"
             type="button"
             class="timeline-picker__item"
@@ -311,6 +395,69 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
 
         <MatchTimelinePanel v-else-if="timelineQuery.data.value" :timeline="timelineQuery.data.value" :champion-name="championNameOf" />
       </template>
+    </section>
+
+    <!--
+      最近对局：本地档案视角。
+      战绩页回答「我打得怎么样」，这里额外回答「这一局是跟谁打的」——同场玩家直接从
+      本地相遇记录里取，不再打一次客户端的接口。
+    -->
+    <section v-else-if="tab === 'matches'" class="history-section">
+      <header class="history-section__header">
+        <div>
+          <span class="eyebrow">RECENT GAMES</span>
+          <h2>最近的对局与同场玩家</h2>
+          <p>对局列表来自本地客户端；每局下面标出本地档案里记到的队友与对手，点名字直接去战绩页看他的完整数据。</p>
+        </div>
+        <span class="history-count">{{ historyMatches.data.value?.length ?? 0 }} <small>局</small></span>
+      </header>
+
+      <div v-if="historyMatches.isPending.value" class="history-empty">
+        <NSpin size="small" />
+        <strong>正在读取最近对局</strong>
+      </div>
+
+      <div v-else-if="!historyMatches.data.value?.length" class="history-empty">
+        <CalendarDays :size="24" />
+        <strong>还没有最近对局</strong>
+        <span>客户端连上并打完一局之后，这里会出现记录。</span>
+      </div>
+
+      <div v-else class="history-recent-list">
+        <article v-for="match in historyMatches.data.value ?? []" :key="match.gameId" class="history-recent" :data-tone="matchResultTone(match)">
+          <header class="history-recent__head">
+            <div class="history-recent__main">
+              <AssetIcon kind="champion" :id="match.championId" :name="match.championName" :fallback-url="championImage(match.championId)" size="sm" />
+              <span>
+                <b>{{ match.championName }}</b>
+                <small>{{ match.queueName }} · {{ roleName(match.position) }} · {{ relativeTime(match.playedAt) }}</small>
+              </span>
+            </div>
+            <div class="history-recent__stats">
+              <strong :data-tone="matchResultTone(match)">{{ matchResultTone(match) === 'win' ? '胜利' : matchResultTone(match) === 'loss' ? '失败' : '未完成' }}</strong>
+              <span>{{ matchKda(match) }}</span>
+              <span>{{ match.durationMinutes ? `${match.durationMinutes} 分钟` : '—' }}</span>
+            </div>
+          </header>
+
+          <div class="history-recent__met">
+            <div class="history-met-side">
+              <span class="history-met-side__label">队友 {{ metInGame(match.gameId, 'ally').length }}</span>
+              <div class="history-met-chips">
+                <button v-for="record in metInGame(match.gameId, 'ally')" :key="`ally-${match.gameId}-${record.puuid}`" type="button" class="history-met-chip" :title="riotIdOf(record)" @click="openInMatches(record)">{{ record.gameName }}</button>
+                <span v-if="!metInGame(match.gameId, 'ally').length" class="history-met-empty">未记录</span>
+              </div>
+            </div>
+            <div class="history-met-side history-met-side--enemy">
+              <span class="history-met-side__label">对手 {{ metInGame(match.gameId, 'enemy').length }}</span>
+              <div class="history-met-chips">
+                <button v-for="record in metInGame(match.gameId, 'enemy')" :key="`enemy-${match.gameId}-${record.puuid}`" type="button" class="history-met-chip" :title="riotIdOf(record)" @click="openInMatches(record)">{{ record.gameName }}</button>
+                <span v-if="!metInGame(match.gameId, 'enemy').length" class="history-met-empty">未记录</span>
+              </div>
+            </div>
+          </div>
+        </article>
+      </div>
     </section>
   </div>
 </template>
@@ -518,13 +665,16 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
 
 /* 遇到玩家 */
 .encounter-table { overflow-x: auto; }
-.encounter-table__head {
+.encounter-table__head,
+.encounter-table__row {
   display: grid;
-  grid-template-columns: minmax(180px, 1.8fr) 90px minmax(130px, 1fr) 70px 110px;
+  grid-template-columns: minmax(180px, 1.8fr) 74px minmax(130px, 1fr) 96px 104px 24px;
   align-items: center;
   gap: 12px;
-  min-width: 640px;
+  min-width: 720px;
   padding: 0 16px;
+}
+.encounter-table__head {
   min-height: 38px;
   border-bottom: 1px solid var(--line);
   background: var(--surface-muted);
@@ -532,20 +682,24 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
   font-size: 11px;
   font-weight: 500;
 }
+/* 行现在是可点的按钮（点开逐局细节），所以要显式抹掉 button 的默认外观。 */
 .encounter-table__row {
-  display: grid;
-  grid-template-columns: minmax(180px, 1.8fr) 90px minmax(130px, 1fr) 70px 110px;
-  align-items: center;
-  gap: 12px;
-  min-width: 640px;
-  padding: 10px 16px;
+  width: 100%;
   min-height: 56px;
+  padding-top: 10px;
+  padding-bottom: 10px;
+  border: 0;
   border-bottom: 1px solid var(--line);
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
   font-size: 12px;
+  text-align: left;
   transition: background 0.1s;
 }
-.encounter-table__row:last-child { border-bottom: 0; }
 .encounter-table__row:hover { background: var(--surface-muted); }
+.encounter-table__row.is-open { background: var(--accent-soft); }
 .encounter-player { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .encounter-player__avatar {
   display: grid;
@@ -562,20 +716,83 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
 }
 .encounter-player > div { min-width: 0; }
 .encounter-player strong { display: block; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.encounter-player strong em { color: var(--text-secondary); font-style: normal; font-weight: 400; }
+/* 这一行原来放 PUUID——对用户没有任何意义；改成关系摘要（队友/对手各几次）。 */
 .encounter-player__puuid {
   display: block;
   margin-top: 2px;
   color: var(--text-muted);
   font-size: 10px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 150px;
+  max-width: 170px;
 }
+.encounter-count { display: flex; align-items: baseline; gap: 2px; }
+.encounter-count strong { font-size: 15px; font-variant-numeric: tabular-nums; }
+.encounter-count small { color: var(--text-secondary); font-size: 10px; }
 .encounter-champion { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .encounter-champion span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.encounter-rate strong { display: block; font-size: 13px; font-variant-numeric: tabular-nums; }
+.encounter-rate small { color: var(--text-secondary); font-size: 10px; }
 .encounter-time { color: var(--text-secondary); font-size: 11px; }
+.encounter-caret { color: var(--text-muted); transition: transform 140ms ease; }
+.encounter-table__row.is-open .encounter-caret { transform: rotate(180deg); }
+/* 展开区：紧跟在那一行下面，读起来仍然属于同一个玩家。 */
+.encounter-detail {
+  display: grid;
+  gap: 6px;
+  padding: 10px 16px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-muted);
+}
+.encounter-detail__row {
+  display: grid;
+  grid-template-columns: 50px 22px minmax(96px, 1fr) 100px 100px 50px 86px;
+  align-items: center;
+  gap: 8px;
+  min-width: 720px;
+  font-size: 11px;
+}
+.encounter-detail__side { padding: 1px 6px; border-radius: 3px; background: var(--surface); color: var(--text-secondary); font-size: 10px; text-align: center; }
+.encounter-detail__side[data-side="ally"] { color: var(--blue); }
+.encounter-detail__side[data-side="enemy"] { color: var(--red); }
+.encounter-detail__kda, .encounter-detail__self { color: var(--text-secondary); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.encounter-detail__result[data-win="true"] { color: var(--blue); }
+.encounter-detail__result[data-win="false"] { color: var(--red); }
+.encounter-detail__result[data-win="unknown"] { color: var(--text-muted); }
+.encounter-detail__row time { color: var(--text-muted); }
+.encounter-detail__foot { display: flex; justify-content: flex-end; }
+
+/* 排序切换：两个小按钮，选中的那个用强调色。 */
+.history-sort { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.history-sort button { padding: 4px 10px; border: 0; color: var(--text-secondary); background: var(--surface); cursor: pointer; font-size: 11px; }
+.history-sort button + button { border-left: 1px solid var(--line); }
+.history-sort button.active { color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.history-archive-note { margin: 0 0 12px; color: var(--text-muted); font-size: 10px; }
+
+/* 「最近对局」：一局一张卡——头部是战绩摘要，下面是本地档案里的同场玩家。 */
+.history-recent-list { display: grid; gap: 10px; }
+.history-recent { border: 1px solid var(--line); border-left: 3px solid var(--line-strong); background: var(--surface); }
+.history-recent[data-tone="win"] { border-left-color: var(--blue); }
+.history-recent[data-tone="loss"] { border-left-color: var(--red); }
+.history-recent[data-tone="unfinished"] { border-left-color: var(--amber); }
+.history-recent__head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 14px; border-bottom: 1px solid var(--line); }
+.history-recent__main { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.history-recent__main b { display: block; font-size: 13px; }
+.history-recent__main small { display: block; margin-top: 2px; color: var(--text-secondary); font-size: 10px; }
+.history-recent__stats { display: flex; align-items: center; gap: 12px; color: var(--text-secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
+.history-recent__stats strong { font-size: 12px; }
+.history-recent__stats strong[data-tone="win"] { color: var(--blue); }
+.history-recent__stats strong[data-tone="loss"] { color: var(--red); }
+.history-recent__stats strong[data-tone="unfinished"] { color: var(--amber); }
+.history-recent__met { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; padding: 10px 14px; }
+.history-met-side { min-width: 0; }
+.history-met-side__label { display: block; margin-bottom: 5px; color: var(--text-muted); font-size: 10px; }
+.history-met-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.history-met-chip { padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--text-primary); background: var(--surface-raised); cursor: pointer; font-size: 10px; transition: border-color 140ms ease, background 140ms ease; }
+.history-met-chip:hover { border-color: var(--accent); background: var(--accent-soft); }
+.history-met-empty { color: var(--text-muted); font-size: 10px; }
 
 /* 时间线的对局选择器：横向滚动的一排小卡片，选中的那局高亮。 */
 .timeline-picker {
