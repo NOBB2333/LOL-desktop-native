@@ -583,8 +583,12 @@ fn stopApp(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
 
 fn automationWatchdog(self: *App, io: std.Io) void {
     while (!self.automation_stop.load(.acquire)) {
-        self.runtime.runAutomationBackground(io);
-        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(250), .awake) catch {};
+        const busy = self.runtime.runAutomationBackground(io);
+        // 空闲时退避到 1s：客户端没起、或者自动化整个关着的时候，250ms 一跳没有
+        // 任何收益。真正有活干（自动化开着且客户端在）时保持 250ms 的响应速度，
+        // 自动接受不会因此变慢。类型写全是因为 `Duration.fromMilliseconds` 收 i64。
+        const interval_ms: i64 = if (busy) 250 else 1000;
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(interval_ms), .awake) catch {};
     }
 }
 

@@ -320,7 +320,7 @@ onBeforeUnmount(() => {
               <Clock3 v-if="account.queueLabel" :size="15" class="topbar-queue" :title="account.queueLabel" />
             </div>
           </header>
-          <div v-if="app.error" class="runtime-error-banner" role="alert"><span>{{ app.error }}</span><button type="button" title="关闭错误提示" aria-label="关闭错误提示" @click="app.dismissError"><X :size="14" /></button></div>
+          <div v-if="app.error" class="runtime-error-banner" role="alert"><span>{{ app.error }}</span><em v-if="app.pendingErrorCount" class="runtime-error-banner__more">还有 {{ app.pendingErrorCount }} 条</em><button type="button" :title="app.pendingErrorCount ? '关闭这条，看下一条' : '关闭错误提示'" :aria-label="app.pendingErrorCount ? '关闭这条，看下一条' : '关闭错误提示'" @click="app.dismissError"><X :size="14" /></button></div>
           <div class="content-scroll"><RouterView /></div>
         </main>
       </div>

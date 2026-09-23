@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fixtureBpHistory, fixtureChampions, fixtureConfig, fixtureEncounters, fixtureLobby, fixtureMatches } from "./data";
+import { createFixtureRoomLobby, fixtureBpHistory, fixtureChampions, fixtureConfig, fixtureEncounters, fixtureLobby, fixtureMatches } from "./data";
 
 describe("fixture data", () => {
   it("contains two complete teams for offline preview", () => {
@@ -29,5 +29,20 @@ describe("fixture data", () => {
   it("ships only valid shortcut placeholders", () => {
     const templates = fixtureConfig.automation.shortcuts.map((shortcut) => shortcut.template);
     expect(templates.join(" ")).not.toContain("{record}");
+  });
+
+  it("models the lobby room snapshot the way the backend emits it", () => {
+    const room = createFixtureRoomLobby(false);
+    // 房间没有局号，id 退回占位值——后端 `liveSessionEnvelopePhaseContext` 同口径。
+    expect(room.id).toBe("lcu-session");
+    expect(room.phase).toBe("Lobby");
+    // 房间里只有本机所在小队，不该凭空造出敌方。
+    expect(room.ally.length).toBeGreaterThan(0);
+    expect(room.ally.length).toBeLessThanOrEqual(5);
+    expect(room.enemy).toHaveLength(0);
+    // 一支队伍就够，硬摆 0 人的敌方阵容会误导人。
+    expect(room.teams).toHaveLength(1);
+    expect(room.teams?.[0].label).toBe("房间成员");
+    expect(room.enemySummary.score).toBeGreaterThan(0);
   });
 });

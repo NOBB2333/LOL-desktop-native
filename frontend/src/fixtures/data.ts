@@ -264,6 +264,27 @@ export function createFixtureLobby(rankedOnly: boolean): LiveLobby {
   return value;
 }
 
+/**
+ * 房间/匹配中（还没进选人）的预览快照。
+ *
+ * 和 champ select 的差别必须照着后端 `liveSessionEnvelopePhaseContext` 的房间分支来：
+ * `id` 退回 `lcu-session`（房间没有局号）、只有本机所在小队（这里取 3 人队）、
+ * `enemy` 为空、`teams` 只有一组「房间成员」。
+ */
+export function createFixtureRoomLobby(rankedOnly: boolean): LiveLobby {
+  const value = createFixtureLobby(rankedOnly);
+  const room = value.ally.slice(0, 3);
+  value.id = "lcu-session";
+  value.phase = "Lobby";
+  value.ally = room;
+  value.enemy = [];
+  value.allySummary = summary("ally", room);
+  // 敌方为空时不能重算摘要：`summary` 空数组会 reduce 到 NaN 并抛错。房间阶段本来
+  // 也不渲染敌方，沿用原值即可。
+  value.teams = [{ id: "room", label: "房间成员", side: "ally", players: room, summary: value.allySummary }];
+  return value;
+}
+
 function matchParticipants(index: number, win: boolean): MatchParticipant[] {
   return champions.map(([championId, championName, , role], slot) => ({
     puuid: `match-${index}-player-${slot}`,
@@ -480,7 +501,7 @@ export const fixtureClaims: ClaimSnapshot = {
 };
 
 export const fixtureConfig: AppConfig = {
-  version: 22,
+  version: 23,
   appearance: { theme: "mint", colorMode: "light", compact: false },
   playerTags: { ...defaultPlayerTagSettings },
   connection: { kind: "local", sshTarget: "", identityFile: "", forwardedPort: 0 },
@@ -509,7 +530,7 @@ export const fixtureConfig: AppConfig = {
       { id: "open-game", label: "打开对局速看", key: "Ctrl+F1", target: "lobby", template: "对局速看：{team} {name}，近10场 {recent_wins}胜{recent_losses}负，KDA {kda}", enabled: true },
     ],
   },
-  providers: { statsProvider: "auto", requestTimeoutSeconds: 6, cacheTtlMinutes: 120, hideUnfinishedMatches: false, rankedOnly: false, clearLobbyAfterGame: true },
+  providers: { statsProvider: "auto", requestTimeoutSeconds: 6, cacheTtlMinutes: 120, hideUnfinishedMatches: false, rankedOnly: false, clearLobbyAfterGame: true, lobbyRoster: true },
   ai: { enabled: false, provider: "deepseek", protocol: "openai", baseUrl: "https://api.deepseek.com", model: "deepseek-v4-flash", apiKey: "", automaticPregameAnalysis: false },
 };
 

@@ -5,6 +5,7 @@ import { invokeNative, listenNative } from "../services/native";
 import { fixtureBootstrap, fixtureConfig } from "../fixtures/data";
 import type { AppBootstrap, AppConfig, ConnectionState, DataMode } from "../types/domain";
 import { migrateAppConfig } from "../utils/config";
+import { pushError, shiftError } from "../utils/errorQueue";
 
 type AutomationAction = { actionType: string; actionId: number; championId: number; executed: boolean; reason: string };
 
@@ -15,7 +16,18 @@ export const useAppStore = defineStore("app", () => {
   const config = ref<AppConfig>(structuredClone(fixtureConfig));
   const initialized = ref(false);
   const busy = ref(false);
-  const error = ref<string | null>(null);
+  /**
+   * 待读的运行时错误。以前只留一条，接连出错时后一条会直接盖掉前一条——
+   * 用户只能看到最新的那句，前面到底出了什么事就查不到了。现在按顺序排队，
+   * 关掉一条才显示下一条；重复内容只留一条，队列有上限。规则在 `utils/errorQueue`。
+   */
+  const errorQueue = ref<string[]>([]);
+  const error = computed(() => errorQueue.value[0] ?? null);
+  const pendingErrorCount = computed(() => Math.max(0, errorQueue.value.length - 1));
+
+  function reportError(message: string) {
+    errorQueue.value = pushError(errorQueue.value, message);
+  }
   const configSaveState = ref<ConfigSaveState>("idle");
   const configSaveError = ref<string | null>(null);
   const shortcutRegistrationError = ref<string | null>(null);
@@ -73,7 +85,7 @@ export const useAppStore = defineStore("app", () => {
       nativeShortcutCleanup = () => { cleanup(); legacyCleanup(); };
     } catch (cause) {
       shortcutRegistrationError.value = `快捷键监听失败：${cause instanceof Error ? cause.message : String(cause)}`;
-      error.value = shortcutRegistrationError.value;
+      if (shortcutRegistrationError.value) reportError(shortcutRegistrationError.value);
     }
   }
 
@@ -85,7 +97,7 @@ export const useAppStore = defineStore("app", () => {
     try {
       await backend.sendShortcut(shortcutId);
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : String(cause);
+      reportError(cause instanceof Error ? cause.message : String(cause));
     }
   }
 
@@ -123,14 +135,14 @@ export const useAppStore = defineStore("app", () => {
         if (nextBootstrap.dataMode === "live") {
           void backend.refreshConnection()
             .then((connection) => updateConnection(connection))
-            .catch((cause) => { error.value = cause instanceof Error ? cause.message : String(cause); });
+            .catch((cause) => { reportError(cause instanceof Error ? cause.message : String(cause)); });
         }
       }
       await registerAssessmentShortcuts();
       persistReady = true;
       initialized.value = true;
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : String(cause);
+      reportError(cause instanceof Error ? cause.message : String(cause));
       persistReady = true;
       initialized.value = true;
     } finally {
@@ -154,11 +166,12 @@ export const useAppStore = defineStore("app", () => {
 
   function reportAutomationError(message: string) {
     automationRuntimeError.value = message;
-    error.value = `自动化执行失败：${message}`;
+    reportError(`自动化执行失败：${message}`);
   }
 
+  /// 关掉当前这条，把队列里的下一条顶上来（还有几条会在按钮上标出来）。
   function dismissError() {
-    error.value = null;
+    errorQueue.value = shiftError(errorQueue.value);
   }
 
   function toggleSidebar() {
@@ -211,9 +224,10 @@ export const useAppStore = defineStore("app", () => {
   }
 
   return {
-    bootstrap, config, initialized, busy, error, mode, connection, sidebarCollapsed,
+    bootstrap, config, initialized, busy, error, pendingErrorCount, mode, connection, sidebarCollapsed,
     configSaveState, configSaveError, shortcutRegistrationError, automationStatus, automationRuntimeError, lastSavedAt,
     initialize, setMode, updateConnection, reportAutomationActions, reportAutomationError,
+    reportError,
     dispatchShortcut, openGameView,
     toggleSidebar, dismissError, persistConfig, retryConfigSave, applyAppearance,
   };

@@ -23,6 +23,25 @@ function scrollToSection(id: string) {
 function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
   app.config.playerTags = { ...normalizePlayerTagSettings(app.config.playerTags), [key]: value };
 }
+
+/**
+ * 数字输入框的 min/max 只是给浏览器上下箭头用的提示：手打 999 照样会存进去，
+ * 而后端取用时是**另有一套**收口（超时 1~30 秒、缓存 1 分钟~7 天）。两边不一致
+ * 就会出现「界面上写着 999 秒、实际按 30 秒跑」。这里在失焦/回车时按同一区间归一，
+ * 顺手把清空输入框产生的空字符串也变成下界。
+ */
+function clampNumber(next: unknown, min: number, max: number) {
+  const raw = Number(next);
+  return Number.isFinite(raw) ? Math.min(max, Math.max(min, Math.round(raw))) : min;
+}
+
+function clampNumericSetting(key: "requestTimeoutSeconds" | "cacheTtlMinutes", min: number, max: number) {
+  app.config.providers[key] = clampNumber(app.config.providers[key], min, max);
+}
+
+function clampForwardedPort() {
+  app.config.connection.forwardedPort = clampNumber(app.config.connection.forwardedPort, 0, 65535);
+}
 </script>
 
 <template>
@@ -101,7 +120,7 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
               <small>远端请求超时后继续使用 SQLite 旧快照</small>
             </div>
             <div class="settings-row__control">
-              <input v-model.number="app.config.providers.requestTimeoutSeconds" class="settings-input" type="number" min="1" max="30" />
+              <input v-model.number="app.config.providers.requestTimeoutSeconds" class="settings-input" type="number" min="1" max="30" @change="clampNumericSetting('requestTimeoutSeconds', 1, 30)" />
               <span class="settings-unit">秒</span>
             </div>
           </label>
@@ -111,7 +130,7 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
               <small>到期后后台重新同步，不阻塞已缓存页面</small>
             </div>
             <div class="settings-row__control">
-              <input v-model.number="app.config.providers.cacheTtlMinutes" class="settings-input" type="number" min="1" />
+              <input v-model.number="app.config.providers.cacheTtlMinutes" class="settings-input" type="number" min="1" max="10080" @change="clampNumericSetting('cacheTtlMinutes', 1, 10080)" />
               <span class="settings-unit">分钟</span>
             </div>
           </label>
@@ -140,6 +159,15 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
             </div>
             <div class="settings-row__control">
               <NSwitch v-model:value="app.config.providers.clearLobbyAfterGame" />
+            </div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <strong>房间里也统计队友</strong>
+              <small>还在组队房间（没进选人）时就读出队友的等级、段位、近期战绩与标签；房间最多 5 人，关掉可以少发几次请求</small>
+            </div>
+            <div class="settings-row__control">
+              <NSwitch v-model:value="app.config.providers.lobbyRoster" aria-label="房间里也统计队友" />
             </div>
           </div>
         </div>
@@ -194,7 +222,7 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
           <div class="settings-row settings-row--top">
             <div class="settings-row__label">
               <strong>主题</strong>
-              <small>颜色层级影响胜负、阵营和风险扫描</small>
+              <small>强调色与阵营配色，和下面的深浅色是两个独立维度，可以自由组合</small>
             </div>
             <div class="settings-row__control">
               <div class="theme-picker">
@@ -216,7 +244,7 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
           <div class="settings-row">
             <div class="settings-row__label">
               <strong>深色模式</strong>
-              <small>适合夜间长时间查看对局</small>
+              <small>只切换背景深浅，对当前主题同样生效；适合夜间长时间查看对局</small>
             </div>
             <div class="settings-row__control">
               <NSwitch v-model:value="app.config.appearance.colorMode" checked-value="dark" unchecked-value="light" />
@@ -298,33 +326,37 @@ function setTagSetting(key: keyof PlayerTagSettings, value: boolean) {
               <NSelect v-model:value="app.config.connection.kind" :options="[{ label: 'Windows 本机', value: 'local' }, { label: 'SSH 转发', value: 'ssh' }]" />
             </div>
           </label>
-          <label class="settings-row" :class="{ 'settings-row--disabled': app.config.connection.kind !== 'ssh' }">
-            <div class="settings-row__label">
-              <strong>SSH 目标</strong>
-              <small>例如 hl-windows</small>
-            </div>
-            <div class="settings-row__control">
-              <NInput v-model:value="app.config.connection.sshTarget" placeholder="hl-windows" :disabled="app.config.connection.kind !== 'ssh'" />
-            </div>
-          </label>
-          <label class="settings-row" :class="{ 'settings-row--disabled': app.config.connection.kind !== 'ssh' }">
-            <div class="settings-row__label">
-              <strong>身份文件</strong>
-              <small>Mac 侧 SSH 私钥路径</small>
-            </div>
-            <div class="settings-row__control">
-              <NInput v-model:value="app.config.connection.identityFile" placeholder="~/.ssh/windows_hl_connect" :disabled="app.config.connection.kind !== 'ssh'" />
-            </div>
-          </label>
-          <label class="settings-row" :class="{ 'settings-row--disabled': app.config.connection.kind !== 'ssh' }">
-            <div class="settings-row__label">
-              <strong>转发端口</strong>
-              <small>填 0 自动探测 29999–30049；也兼容外部 SSH 脚本指定端口</small>
-            </div>
-            <div class="settings-row__control">
-              <input v-model.number="app.config.connection.forwardedPort" class="settings-input" type="number" min="0" max="65535" :disabled="app.config.connection.kind !== 'ssh'" />
-            </div>
-          </label>
+          <!-- SSH 那三项只在本机以外的连接方式下才有意义。以前一律渲染、只是变灰，
+               本机用户得看着三行死字段；现在不选 SSH 就直接收起来。 -->
+          <template v-if="app.config.connection.kind === 'ssh'">
+            <label class="settings-row">
+              <div class="settings-row__label">
+                <strong>SSH 目标</strong>
+                <small>例如 hl-windows</small>
+              </div>
+              <div class="settings-row__control">
+                <NInput v-model:value="app.config.connection.sshTarget" placeholder="hl-windows" />
+              </div>
+            </label>
+            <label class="settings-row">
+              <div class="settings-row__label">
+                <strong>身份文件</strong>
+                <small>Mac 侧 SSH 私钥路径</small>
+              </div>
+              <div class="settings-row__control">
+                <NInput v-model:value="app.config.connection.identityFile" placeholder="~/.ssh/windows_hl_connect" />
+              </div>
+            </label>
+            <label class="settings-row">
+              <div class="settings-row__label">
+                <strong>转发端口</strong>
+                <small>填 0 自动探测 29999–30049；也兼容外部 SSH 脚本指定端口</small>
+              </div>
+              <div class="settings-row__control">
+                <input v-model.number="app.config.connection.forwardedPort" class="settings-input" type="number" min="0" max="65535" @change="clampForwardedPort" />
+              </div>
+            </label>
+          </template>
         </div>
       </section>
 

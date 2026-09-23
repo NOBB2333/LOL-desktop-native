@@ -597,7 +597,16 @@ export interface AppConfig {
     shortcutRecentGameCount: number;
     shortcuts: ShortcutDefinition[];
   };
-  providers: { statsProvider: string; requestTimeoutSeconds: number; cacheTtlMinutes: number; hideUnfinishedMatches: boolean; rankedOnly: boolean; clearLobbyAfterGame: boolean };
+  providers: {
+    statsProvider: string;
+    requestTimeoutSeconds: number;
+    cacheTtlMinutes: number;
+    hideUnfinishedMatches: boolean;
+    rankedOnly: boolean;
+    clearLobbyAfterGame: boolean;
+    /** 房间/匹配中（还没进选人）也拉队友资料，对齐 AK 的 `queryInLobbyPhase`。 */
+    lobbyRoster: boolean;
+  };
   ai: {
     enabled: boolean;
     provider: string;

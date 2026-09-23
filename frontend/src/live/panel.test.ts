@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isCurrentLiveSnapshot, isVisibleGamePhase, shouldAutoHideLivePanel, shouldResetClearedLivePanel } from "./panel";
+import { isCurrentLiveSnapshot, isRoomGamePhase, isVisibleGamePhase, shouldAutoHideLivePanel, shouldResetClearedLivePanel } from "./panel";
 
 describe("live panel visibility", () => {
   it.each(["PreEndOfGame", "WaitingForStats", "EndOfGame"])("keeps %s visible as part of the game flow", (phase) => {
@@ -9,6 +9,19 @@ describe("live panel visibility", () => {
 
   it.each(["Lobby", "None", "Matchmaking", "ReadyCheck"])("hides the retained panel after entering %s", (phase) => {
     expect(shouldAutoHideLivePanel({ enabled: true, mode: "live", connectionStatus: "connected", connectionPhase: phase, snapshotPhase: "EndOfGame" })).toBe(true);
+  });
+
+  it("keeps the room panel visible only when lobby roster is enabled", () => {
+    // 房间阶段本身不是「可见阶段」，只有开了「房间里也统计队友」才算——
+    // 关掉时行为和以前完全一致（面板收起）。
+    expect(isRoomGamePhase("Lobby")).toBe(true);
+    expect(isRoomGamePhase("Matchmaking")).toBe(true);
+    expect(isRoomGamePhase("ChampSelect")).toBe(false);
+    expect(isVisibleGamePhase("Lobby")).toBe(false);
+    expect(isVisibleGamePhase("Lobby", true)).toBe(true);
+    expect(isVisibleGamePhase("Matchmaking", true)).toBe(true);
+    expect(shouldAutoHideLivePanel({ enabled: true, mode: "live", connectionStatus: "connected", connectionPhase: "Lobby", snapshotPhase: "Lobby", roomRoster: true })).toBe(false);
+    expect(shouldAutoHideLivePanel({ enabled: true, mode: "live", connectionStatus: "connected", connectionPhase: "Lobby", snapshotPhase: "Lobby", roomRoster: false })).toBe(true);
   });
 
   it("does not auto-hide when the setting is disabled", () => {

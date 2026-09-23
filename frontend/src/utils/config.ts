@@ -1,7 +1,7 @@
 import type { AppConfig, ShortcutDefinition } from "../types/domain";
 import { normalizePlayerTagSettings } from "../tags/settings";
 
-export const CURRENT_CONFIG_VERSION = 22;
+export const CURRENT_CONFIG_VERSION = 23;
 export const defaultOpenGameShortcutKey = "Ctrl+F1";
 
 /** 大乱斗换人前的等待秒数（对齐 AK `benchSwapAccumulatedDelaySeconds` = 2.9s）。 */
@@ -152,6 +152,14 @@ export function migrateAppConfig(config: AppConfig) {
     }
     if (!Number.isFinite(config.automation.aramSwapDelaySeconds)) {
       config.automation.aramSwapDelaySeconds = defaultAramSwapDelaySeconds;
+      changed = true;
+    }
+  }
+  if (config.version < 23) {
+    // v23：房间/匹配中也出队友资料统计（对齐 AK 的 `queryInLobbyPhase`）。
+    // 默认开——房间里就 1~5 个人，代价很小；缺字段按开处理，不打扰老配置。
+    if (typeof config.providers.lobbyRoster !== "boolean") {
+      config.providers.lobbyRoster = true;
       changed = true;
     }
   }

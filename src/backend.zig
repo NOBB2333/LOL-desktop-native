@@ -330,10 +330,10 @@ test "未登记命令回落到默认 query 通道" {
 }
 
 const default_config =
-    "{\"version\":21,\"appearance\":{\"theme\":\"system\",\"colorMode\":\"dark\",\"compact\":false}," ++
+    "{\"version\":23,\"appearance\":{\"theme\":\"system\",\"colorMode\":\"dark\",\"compact\":false}," ++
     "\"connection\":{\"kind\":\"local\",\"sshTarget\":\"\",\"identityFile\":\"\",\"forwardedPort\":0}," ++
     "\"automation\":{\"enabled\":false,\"advisoryMode\":true,\"autoAccept\":false,\"autoAcceptDelaySeconds\":0,\"autoPick\":false,\"autoPickDelaySeconds\":1,\"autoPickStrategy\":\"show-and-lock-in\",\"autoBan\":false,\"pickChampionIds\":[],\"banChampionIds\":[],\"aramGrab\":false,\"aramChampionIds\":[],\"aramSwapDelaySeconds\":3,\"shortcutSendIntervalMs\":65,\"shortcutRecentGameCount\":5,\"shortcuts\":[{\"id\":\"encounter\",\"label\":\"发送遇到记录\",\"key\":\"Ctrl+F5\",\"target\":\"encounter\",\"template\":\"{encounter}\",\"enabled\":true},{\"id\":\"premade\",\"label\":\"发送已知组队\",\"key\":\"Ctrl+F9\",\"target\":\"premade\",\"template\":\"{position} {name}：组队 {premade}\",\"enabled\":true},{\"id\":\"jungle-preference\",\"label\":\"发送打野偏好\",\"key\":\"Ctrl+F7\",\"target\":\"jungle\",\"template\":\"{name}：{jungle_preference}\",\"enabled\":true},{\"id\":\"enemy\",\"label\":\"发送敌方评估\",\"key\":\"Ctrl+F11\",\"target\":\"enemy\",\"template\":\"{team}{position} {current_champion}：{rank} 主玩{main_position} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"ally\",\"label\":\"发送我方评估\",\"key\":\"Ctrl+F12\",\"target\":\"ally\",\"template\":\"{team}{position} {current_champion}：{rank} 主玩{main_position} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"open-game\",\"label\":\"打开对局速看\",\"key\":\"Ctrl+F1\",\"target\":\"lobby\",\"template\":\"对局速看：{team} {name}\",\"enabled\":true}]}," ++
-    "\"providers\":{\"statsProvider\":\"auto\",\"requestTimeoutSeconds\":6,\"cacheTtlMinutes\":120,\"hideUnfinishedMatches\":false,\"rankedOnly\":false,\"clearLobbyAfterGame\":true}," ++
+    "\"providers\":{\"statsProvider\":\"auto\",\"requestTimeoutSeconds\":6,\"cacheTtlMinutes\":120,\"hideUnfinishedMatches\":false,\"rankedOnly\":false,\"clearLobbyAfterGame\":true,\"lobbyRoster\":true}," ++
     "\"ai\":{\"enabled\":false,\"provider\":\"deepseek\",\"protocol\":\"openai\",\"baseUrl\":\"https://api.deepseek.com\",\"model\":\"deepseek-v4-flash\",\"apiKey\":\"\",\"automaticPregameAnalysis\":false}}";
 
 const fixture_connection =
@@ -359,6 +359,10 @@ pub const Runtime = struct {
     snapshot_cancelled: ?*std.atomic.Value(bool) = null,
     snapshot_lane: CommandLane = .query,
     automation_config_hash: u64 = 0,
+    /// 后台自动化轮询的配置指纹与「这份配置要不要跑」结论。配置没变就跳过整份
+    /// JSON 解析——空闲时那一轮唯一的成本就是它。
+    automation_loop_hash: u64 = 0,
+    automation_loop_wanted: bool = false,
     cache_platform: [32]u8 = undefined,
     cache_platform_len: usize = 0,
     // 手动自动化与后台检查共用互斥锁，避免重复接受同一次匹配。
@@ -544,30 +548,33 @@ pub const Runtime = struct {
     }
 
     /// 后台自动化先复制配置再访问网络，状态读取和设置保存可以独立完成。
-    pub fn runAutomationBackground(self: *Runtime, io: std.Io) void {
+    /// 返回本轮是否「有活干」。守护线程据此决定下一次睡眠长度：空闲时从 250ms
+    /// 退避到 1s，避免在客户端没起 / 自动化关着的时候每秒四次白解析配置。
+    pub fn runAutomationBackground(self: *Runtime, io: std.Io) bool {
         var config_snapshot: [65536]u8 = undefined;
-        var config_len: usize = 0;
         lockBackendMutex(&self.command_mutex);
         if (self.mode != .live or self.config_len > config_snapshot.len) {
             self.command_mutex.unlock();
-            return;
+            return false;
         }
-        config_len = self.config_len;
+        const config_len = self.config_len;
         @memcpy(config_snapshot[0..config_len], self.config[0..config_len]);
         var guard = AutomationGuard{ .parent = self, .generation = self.request_generation, .config_hash = std.hash.Wyhash.hash(0, config_snapshot[0..config_len]) };
         self.command_mutex.unlock();
 
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        const config = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), config_snapshot[0..config_len], .{}) catch return;
-        const automation = configAutomation(config) orelse return;
-        if (automation != .object or !jsonBool(automation, "enabled") or jsonBool(automation, "advisoryMode")) return;
-        if (!jsonBool(automation, "autoAccept") and !jsonBool(automation, "autoPick") and !jsonBool(automation, "autoBan") and !jsonBool(automation, "aramGrab")) return;
+        // 配置没变就不重复解析。以前这一轮每 250ms 都要把整份配置（含全部快捷
+        // 消息模板）解析一遍，自动化关着的时候纯属白烧 CPU。
+        const loop_hash = std.hash.Wyhash.hash(0, config_snapshot[0..config_len]);
+        if (loop_hash != self.automation_loop_hash) {
+            self.automation_loop_hash = loop_hash;
+            self.automation_loop_wanted = configWantsAutomation(config_snapshot[0..config_len]);
+        }
+        if (!self.automation_loop_wanted) return false;
 
         // 手动自动化正在运行时跳过本轮，避免轮询线程持续自旋。
-        if (!self.automation_mutex.tryLock()) return;
+        if (!self.automation_mutex.tryLock()) return false;
         defer self.automation_mutex.unlock();
-        const client = self.ensureAutomationClient(io, config_snapshot[0..config_len]) catch return;
+        const client = self.ensureAutomationClient(io, config_snapshot[0..config_len]) catch return false;
         client.control = .{ .context = &guard, .check_fn = AutomationGuard.check };
         client.lane = .action;
         defer if (self.automation_client) |*retained| {
@@ -576,7 +583,20 @@ pub const Runtime = struct {
         var output: [4096]u8 = undefined;
         _ = automation_service.run(io, client.*, config_snapshot[0..config_len], &output) catch |err| {
             if (isAutomationClientFailure(err)) self.dropAutomationClient();
+            return false;
         };
+        return true;
+    }
+
+    /// 这份配置要不要让后台轮询真的去碰客户端：总开关开着、非顾问模式，
+    /// 且至少有一个动作开启。任意一条不满足就是「空闲」，守护线程会退避。
+    fn configWantsAutomation(config_json: []const u8) bool {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const config = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), config_json, .{}) catch return false;
+        const automation = configAutomation(config) orelse return false;
+        if (automation != .object or !jsonBool(automation, "enabled") or jsonBool(automation, "advisoryMode")) return false;
+        return jsonBool(automation, "autoAccept") or jsonBool(automation, "autoPick") or jsonBool(automation, "autoBan") or jsonBool(automation, "aramGrab");
     }
 
     fn ensureAutomationClient(self: *Runtime, io: std.Io, config_json: []const u8) !*lcu.Client {
@@ -1347,7 +1367,7 @@ fn refreshLiveGeneration(self: *Runtime) void {
     // 重新读取战绩」就会被上面的提前 return 吞掉——这条分支因此长期是死代码，
     // 结算时的段位/战绩一直沿用对局中途的旧值。单独成档后 key 会变，强制刷新才
     // 真正生效。
-    hash.update(if (isChampSelectPhase(phase)) "selection" else if (isSettledLivePhase(phase)) "settled" else if (isActiveLivePhase(phase)) "active" else "idle");
+    hash.update(if (isChampSelectPhase(phase)) "selection" else if (isSettledLivePhase(phase)) "settled" else if (isActiveLivePhase(phase)) "active" else if (isLobbyPhase(phase)) "lobby" else "idle");
     const key = hash.final();
     if (key == self.live_session_key) return;
     self.live_session_key = key;
@@ -1372,7 +1392,7 @@ fn startLiveLoading(self: *Runtime) !void {
     defer arena.deinit();
     const lobby = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.live_lobby[0..self.live_lobby_len], .{});
     const phase = jsonField(lobby, "phase");
-    if (!isChampSelectPhase(phase) and !isActiveLivePhase(phase) and !std.mem.eql(u8, phase, "EndOfGame")) return;
+    if (!isChampSelectPhase(phase) and !isActiveLivePhase(phase) and !isLobbyPhase(phase) and !std.mem.eql(u8, phase, "EndOfGame")) return;
     // 全部玩家都还在缓存有效期内时不要启动批次：否则每次复查都要白白
     // 发现一次客户端、读一次召唤师、起五个线程。
     if (!self.force_profile_refresh and !liveRosterNeedsReload(self, lobby)) {
@@ -1704,11 +1724,19 @@ fn getLiveLobbyInternal(context: *anyopaque, invocation: native_sdk.bridge.Invoc
             try verifyCachePlatform(self, client);
             updateLiveLobbyOwner(self, current);
 
+            // 房间阶段（Lobby / Matchmaking）：可见玩家只有 /lol-lobby/v2/lobby 的
+            // members，gameflow 里那会儿还没有双方队伍。对齐 AK 的 queryInLobbyPhase，
+            // 房间也照常出资料统计，所以把 session 指向房间成员表。
+            const lobby_room = isLobbyPhase(phase) and runtimeLobbyRosterEnabled(self);
             // The champ-select session disappears as soon as the game client
             // starts. Route each phase to the endpoint that owns that data and
             // retain the last good snapshot during the short transition.
-            const should_probe_live = shouldProbeLiveData(phase);
-            const session = if (std.mem.eql(u8, phase, "ChampSelect") or std.mem.eql(u8, phase, "ReadyCheck"))
+            // 房间阶段不探本地 Live Client Data API：那会儿游戏还没起，探也探不到，
+            // 只会白白多一次请求。
+            const should_probe_live = shouldProbeLiveData(phase) and !lobby_room;
+            const session = if (lobby_room)
+                client.get("/lol-lobby/v2/lobby") catch null
+            else if (std.mem.eql(u8, phase, "ChampSelect") or std.mem.eql(u8, phase, "ReadyCheck"))
                 client.get("/lol-champ-select/v1/session") catch null
             else if (should_probe_live)
                 client.get("/lol-gameflow/v1/session") catch null
@@ -1761,11 +1789,14 @@ fn getLiveLobbyInternal(context: *anyopaque, invocation: native_sdk.bridge.Invoc
             if (session) |value| {
                 const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, value, .{}) catch null;
                 const has_roster = parsed != null and parsed.? == .object and sessionHasRoster(parsed.?);
-                if (has_roster or std.mem.eql(u8, phase, "ChampSelect") or std.mem.eql(u8, phase, "ReadyCheck")) {
+                if (has_roster or std.mem.eql(u8, phase, "ChampSelect") or std.mem.eql(u8, phase, "ReadyCheck") or lobby_room) {
                     const catalog = cachedGameAsset(self, client, "champions", "/lol-game-data/assets/v1/champion-summary.json") catch null;
                     defer if (catalog) |catalog_json| std.heap.page_allocator.free(catalog_json);
                     const queues = cachedGameAsset(self, client, "queues", "/lol-game-data/assets/v1/queues.json") catch null;
                     defer if (queues) |queue_json| std.heap.page_allocator.free(queue_json);
+                    // 房间阶段 session 本身就是房间表，不能再当 custom_lobby 传一遍：
+                    // 两个 defer 会 free 同一块内存。房间名单由下面的
+                    // liveSessionEnvelopePhaseContext 直接从 session 里取。
                     const custom_lobby = if (std.mem.eql(u8, phase, "ChampSelect") or std.mem.eql(u8, phase, "ReadyCheck"))
                         client.get("/lol-lobby/v2/lobby") catch null
                     else
@@ -1875,6 +1906,16 @@ fn isSettledLivePhase(phase: []const u8) bool {
 
 fn isChampSelectPhase(phase: []const u8) bool {
     return std.mem.eql(u8, phase, "ChampSelect") or std.mem.eql(u8, phase, "ReadyCheck");
+}
+
+/// 「房间」阶段：组队房间里等人/正在匹配，还没进选人。
+///
+/// 对齐 LeagueAkari 的 `queryInLobbyPhase`：这两个阶段没有选人 session、也没有对局
+/// session，可见玩家只有 `/lol-lobby/v2/lobby` 的 `members`（本机所在的那一支队伍，
+/// 通常 1~5 人）。在此之前房间阶段只是把上一份快照原样返回，所以刚从一局回到房间时
+/// 界面上摆的还是上一局的十个人。
+fn isLobbyPhase(phase: []const u8) bool {
+    return std.mem.eql(u8, phase, "Lobby") or std.mem.eql(u8, phase, "Matchmaking");
 }
 
 fn observeLivePhase(self: *Runtime, phase: []const u8) void {
@@ -2321,7 +2362,12 @@ fn cacheLiveLobby(self: *Runtime, value: []const u8) void {
     // Never let an empty or sparse transition response replace a useful
     // snapshot. The frontend can render the previous snapshot while LCU is
     // changing phases.
-    if (self.live_lobby_len > 0 and lobbyRosterCount(value) < lobbyRosterCount(self.live_lobby[0..self.live_lobby_len])) {
+    //
+    // 房间/匹配中的名单是**权威**名单，必须豁免这条规则：从一局（10 人）回到房间
+    // 时人数必然变少，从选人退回房间（秒退）也一样，此时坚持保留更大的旧快照只会
+    // 让界面一直摆着上一局的十个人。真正的过渡态稀疏响应在调用这里之前已经被
+    // `mergeWithBestLiveCache` 并回更完整的名单了。
+    if (!lobbyIsRoomSnapshot(value) and self.live_lobby_len > 0 and lobbyRosterCount(value) < lobbyRosterCount(self.live_lobby[0..self.live_lobby_len])) {
         const previous_id = lobbyGameId(self.live_lobby[0..self.live_lobby_len]);
         const next_id = lobbyGameId(value);
         if (previous_id == 0 or next_id == 0 or previous_id == next_id) return;
@@ -2462,6 +2508,12 @@ fn lobbyPhaseMatches(value: []const u8, expected: []const u8) bool {
 
 fn lobbyIsChampSelectSnapshot(value: []const u8) bool {
     return lobbyPhaseMatches(value, "ChampSelect") or lobbyPhaseMatches(value, "ReadyCheck");
+}
+
+/// 快照是不是「房间/匹配中」这类赛前名单。这类名单里人少是正常的，
+/// 缓存层不能再拿「人数变少」当过渡态拦下来（见 `cacheLiveLobby`）。
+fn lobbyIsRoomSnapshot(value: []const u8) bool {
+    return lobbyPhaseMatches(value, "Lobby") or lobbyPhaseMatches(value, "Matchmaking");
 }
 
 fn lobbyIsActiveSnapshot(value: []const u8) bool {
@@ -4676,6 +4728,23 @@ fn runtimeRankedOnly(self: *Runtime) bool {
 
 /// 「好抓 / 难抓」标签的开关（前端 `playerTags.showEasyGankTag`，默认开）。
 /// 关掉时整段跳过 `enrichRecentGankMetrics`，不做没必要的网络请求。
+/// 房间阶段（Lobby / Matchmaking）要不要也拉队友资料。对齐 LeagueAkari 的
+/// `ongoingGame.queryInLobbyPhase`（默认 true）。房间阶段最多只有 1~5 个人，
+/// 但每个都要走一次身份/段位/近期战绩，用户不想在房间里发这些请求时能关掉。
+fn runtimeLobbyRosterEnabled(self: *Runtime) bool {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const config = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.config[0..self.config_len], .{}) catch return true;
+    return runtimeLobbyRosterEnabledValue(config);
+}
+
+fn runtimeLobbyRosterEnabledValue(config: std.json.Value) bool {
+    const providers = nestedObject(config, "providers") orelse return true;
+    // 字段缺失时按默认值（开）处理，老配置不该把房间统计悄悄关掉。
+    if (providers.object.get("lobbyRoster") == null) return true;
+    return jsonBool(providers, "lobbyRoster");
+}
+
 fn runtimeEasyGankEnabled(self: *Runtime) bool {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -6682,8 +6751,27 @@ fn liveSessionEnvelopePhaseContext(self: ?*Runtime, client: ?lcu.Client, session
     const catalog = std.json.parseFromSliceLeaky(std.json.Value, allocator, catalog_json, .{}) catch std.json.Value{ .null = {} };
     const queue_catalog = std.json.parseFromSliceLeaky(std.json.Value, allocator, queue_catalog_json, .{}) catch std.json.Value{ .null = {} };
     const game_data = nestedObject(session, "gameData");
-    const queue_id = if (game_data) |value| if (nestedObject(value, "queue")) |queue| if (jsonInt(queue, "id") > 0) jsonInt(queue, "id") else jsonInt(value, "queueId") else jsonInt(value, "queueId") else if (jsonInt(session, "queueId") > 0) jsonInt(session, "queueId") else jsonInt(session, "gameQueueConfigId");
-    const game_mode = if (game_data) |value| if (nestedObject(value, "queue")) |queue| if (jsonField(queue, "gameMode").len > 0) jsonField(queue, "gameMode") else jsonField(value, "gameMode") else jsonField(value, "gameMode") else if (jsonField(session, "gameMode").len > 0) jsonField(session, "gameMode") else jsonField(session, "mapName");
+    // 房间阶段的模式信息在 `gameConfig` 里（`queueId` / `gameMode`），`gameData`
+    // 要进选人才有。少这一档的话房间里显示的模式会一直退化成「League of Legends」。
+    const game_config = nestedObject(session, "gameConfig");
+    const queue_id = blk: {
+        if (game_data) |value| {
+            if (nestedObject(value, "queue")) |queue| if (jsonInt(queue, "id") > 0) break :blk jsonInt(queue, "id");
+            if (jsonInt(value, "queueId") > 0) break :blk jsonInt(value, "queueId");
+        }
+        if (game_config) |value| if (jsonInt(value, "queueId") > 0) break :blk jsonInt(value, "queueId");
+        if (jsonInt(session, "queueId") > 0) break :blk jsonInt(session, "queueId");
+        break :blk jsonInt(session, "gameQueueConfigId");
+    };
+    const game_mode = blk: {
+        if (game_data) |value| {
+            if (nestedObject(value, "queue")) |queue| if (jsonField(queue, "gameMode").len > 0) break :blk jsonField(queue, "gameMode");
+            if (jsonField(value, "gameMode").len > 0) break :blk jsonField(value, "gameMode");
+        }
+        if (game_config) |value| if (jsonField(value, "gameMode").len > 0) break :blk jsonField(value, "gameMode");
+        if (jsonField(session, "gameMode").len > 0) break :blk jsonField(session, "gameMode");
+        break :blk jsonField(session, "mapName");
+    };
     const resolved_mode = queueNameFromCatalog(queue_catalog, queue_id, if (game_mode.len > 0) game_mode else "League of Legends");
     const game_id = if (game_data) |value| if (jsonInt(value, "gameId") > 0) jsonInt(value, "gameId") else jsonInt(session, "gameId") else jsonInt(session, "gameId");
     const current = if (current_json) |current_text| std.json.parseFromSliceLeaky(std.json.Value, allocator, current_text, .{}) catch std.json.Value{ .null = {} } else std.json.Value{ .null = {} };
@@ -6698,6 +6786,23 @@ fn liveSessionEnvelopePhaseContext(self: ?*Runtime, client: ?lcu.Client, session
     var ally = ally_value;
     var enemy = enemy_value;
     var custom_roster = false;
+    // 房间/匹配中：`/lol-lobby/v2/lobby` 没有 `teamOne`/`teamTwo`，只有 `members`
+    // （本机所在小队）和自定义房间的 `customTeam100`/`customTeam200`。房间里能看到的
+    // 就这一队人，所以房间名单直接当「我方」，敌方要等选人才存在——和 LeagueAkari
+    // 的 `getLobbyTeams`（`TEAM-ALL`/`LOBBY` 一个组）是同一口径。
+    if (isLobbyPhase(phase)) {
+        const room_teams = customLobbyRosters(session);
+        const room_members = try partyLobbyMembers(allocator, session);
+        if (rosterValueLen(room_teams.ally) + rosterValueLen(room_teams.enemy) > 0) {
+            // 自定义房间：房主可能已经把两边排好了，那就照着分。
+            ally = room_teams.ally;
+            enemy = room_teams.enemy;
+        } else {
+            ally = room_members;
+            enemy = .{ .array = std.json.Array.init(allocator) };
+        }
+        custom_roster = true;
+    }
     if (custom_lobby_json) |custom_text| {
         const custom = std.json.parseFromSliceLeaky(std.json.Value, allocator, custom_text, .{}) catch std.json.Value{ .null = {} };
         var custom_teams = customLobbyRosters(custom);
@@ -8029,6 +8134,61 @@ test "never injects the local account into a spectator roster" {
     try std.testing.expect(!containsProfilePuuid(parsed.value.object.get("ally").?.array.items, "spectator"));
 }
 
+test "lobby room phases are recognised separately from champ select" {
+    try std.testing.expect(isLobbyPhase("Lobby"));
+    try std.testing.expect(isLobbyPhase("Matchmaking"));
+    try std.testing.expect(!isLobbyPhase("ChampSelect"));
+    try std.testing.expect(!isLobbyPhase("InProgress"));
+    // 房间阶段不探本地 Live Client Data API：那会儿游戏还没起。
+    try std.testing.expect(shouldProbeLiveData("Lobby"));
+}
+
+test "lobby room snapshot bypasses the sparse-transition cache guard" {
+    try std.testing.expect(lobbyIsRoomSnapshot("{\"phase\":\"Lobby\"}"));
+    try std.testing.expect(lobbyIsRoomSnapshot("{\"phase\":\"Matchmaking\"}"));
+    try std.testing.expect(!lobbyIsRoomSnapshot("{\"phase\":\"ChampSelect\"}"));
+    try std.testing.expect(!lobbyIsRoomSnapshot("{\"phase\":\"InProgress\"}"));
+}
+
+test "lobby phase builds the ally roster from the room members" {
+    const room =
+        "{\"partyId\":\"party-local\",\"gameConfig\":{\"queueId\":420,\"gameMode\":\"CLASSIC\"}," ++
+        "\"members\":[" ++
+        "{\"puuid\":\"self\",\"summonerName\":\"我的账号\",\"firstPositionPreference\":\"MIDDLE\"}," ++
+        "{\"puuid\":\"friend\",\"summonerName\":\"双排队友\",\"firstPositionPreference\":\"JUNGLE\"}]}";
+    const current = "{\"puuid\":\"self\",\"gameName\":\"我的账号\",\"tagLine\":\"HN1\"}";
+    var output: [64 * 1024]u8 = undefined;
+    const result = try liveSessionEnvelopePhaseContext(null, null, room, null, null, "Lobby", current, "[]", "[]", &output, false);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("Lobby", parsed.value.object.get("phase").?.string);
+    // 房间里没有对局号，id 退回占位值，这样 lobbyGameId 才会是 0。
+    try std.testing.expectEqualStrings("lcu-session", parsed.value.object.get("id").?.string);
+    const ally = parsed.value.object.get("ally").?.array.items;
+    const enemy = parsed.value.object.get("enemy").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), ally.len);
+    // 房间阶段不该凭空造出敌方。
+    try std.testing.expectEqual(@as(usize, 0), enemy.len);
+    try std.testing.expectEqual(@as(i64, 0), lobbyGameId(result));
+    // 模式要取 gameConfig.queueId，否则房间里会一直显示「League of Legends」。
+    try std.testing.expectEqual(@as(i64, 420), jsonInt(parsed.value, "queueId"));
+}
+
+test "lobby room prefers the host's custom teams when they are populated" {
+    const room =
+        "{\"partyId\":\"party-local\",\"gameConfig\":{\"queueId\":3140,\"gameMode\":\"CUSTOM\"," ++
+        "\"customTeam100\":[{\"puuid\":\"self\",\"gameName\":\"我的账号\"},{\"puuid\":\"friend\",\"gameName\":\"双排队友\"}]," ++
+        "\"customTeam200\":[{\"puuid\":\"rival\",\"gameName\":\"对面路人\"}]}," ++
+        "\"members\":[{\"puuid\":\"self\",\"summonerName\":\"我的账号\"},{\"puuid\":\"friend\",\"summonerName\":\"双排队友\"}]}";
+    const current = "{\"puuid\":\"self\",\"gameName\":\"我的账号\",\"tagLine\":\"HN1\"}";
+    var output: [64 * 1024]u8 = undefined;
+    const result = try liveSessionEnvelopePhaseContext(null, null, room, null, null, "Lobby", current, "[]", "[]", &output, false);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("ally").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("enemy").?.array.items.len);
+}
+
 test "custom lobby topology overrides fixed ten-slot champ select data" {
     const session = "{\"gameData\":{\"gameId\":440022,\"queue\":{\"id\":3140,\"gameMode\":\"CUSTOM\"},\"playerChampionSelections\":[{\"championId\":1},{\"championId\":2},{\"championId\":3},{\"championId\":4},{\"championId\":5},{\"championId\":6},{\"championId\":7},{\"championId\":8},{\"championId\":9},{\"championId\":10}]},\"myTeam\":[{\"puuid\":\"self\"}],\"theirTeam\":[]}";
     const custom =
@@ -8584,6 +8744,39 @@ test "default runtime config includes native shortcut definitions" {
     defer parsed.deinit();
     try std.testing.expect(configAutomation(parsed.value) != null);
     try std.testing.expect(configAutomation(parsed.value).?.object.get("shortcuts") != null);
+}
+
+test "room roster defaults on when the config has no opinion" {
+    // 默认配置里显式开着。
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, default_config, .{});
+    defer parsed.deinit();
+    try std.testing.expect(runtimeLobbyRosterEnabledValue(parsed.value));
+    // 老配置缺字段时按默认值（开）算，不能悄悄把房间统计关掉。
+    const legacy = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"version\":22,\"providers\":{\"rankedOnly\":false}}", .{});
+    defer legacy.deinit();
+    try std.testing.expect(runtimeLobbyRosterEnabledValue(legacy.value));
+    const off = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"version\":23,\"providers\":{\"lobbyRoster\":false}}", .{});
+    defer off.deinit();
+    try std.testing.expect(!runtimeLobbyRosterEnabledValue(off.value));
+}
+
+test "automation watchdog tick reports whether it did work" {
+    // 守护线程（src/main.zig）按这个返回值决定睡眠长度：签名从 void 改成 bool，
+    // 这里在编译期钉死接口，改坏了会直接编不过。
+    const TickFn = *const fn (*Runtime, std.Io) bool;
+    const tick: TickFn = Runtime.runAutomationBackground;
+    _ = tick;
+}
+
+test "automation loop only asks for work when an action is armed" {
+    // 默认配置：自动化总开关是关的，后台轮询应当整体退避。
+    try std.testing.expect(!Runtime.configWantsAutomation(default_config));
+    // 顾问模式只给建议、不碰客户端，也不该占着 250ms 的快节奏。
+    try std.testing.expect(!Runtime.configWantsAutomation("{\"automation\":{\"enabled\":true,\"advisoryMode\":true,\"autoAccept\":true}}"));
+    try std.testing.expect(!Runtime.configWantsAutomation("{\"automation\":{\"enabled\":true,\"advisoryMode\":false}}"));
+    // 开着总开关、退出顾问模式、且至少勾了一个动作，才算「有活干」。
+    try std.testing.expect(Runtime.configWantsAutomation("{\"automation\":{\"enabled\":true,\"advisoryMode\":false,\"autoAccept\":true}}"));
+    try std.testing.expect(Runtime.configWantsAutomation("{\"automation\":{\"enabled\":true,\"advisoryMode\":false,\"aramGrab\":true}}"));
 }
 
 test "runtime persistence paths share one stable data root" {

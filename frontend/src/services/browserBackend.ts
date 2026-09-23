@@ -13,6 +13,7 @@ import { isNative } from "./native";
 import {
   createFixtureJunglePath,
   createFixtureLobby,
+  createFixtureRoomLobby,
   createFixtureMatchTimeline,
   fixtureBootstrap,
   fixtureBpHistory,
@@ -123,7 +124,11 @@ function archiveBrowserFriends(ids: string[]): void {
 }
 
 function lobbyFixture(): LiveLobby {
-  const lobby = createFixtureLobby(browserState.config.providers.rankedOnly);
+  // 房间/匹配中的界面在预览里默认看不到（fixture 快照固定在选人阶段），
+  // 加 `?phase=room` 就能把它调出来看。只影响 fixture 分支，真机走原生桥。
+  const lobby = typeof location !== "undefined" && new URLSearchParams(location.search).get("phase") === "room"
+    ? createFixtureRoomLobby(browserState.config.providers.rankedOnly)
+    : createFixtureLobby(browserState.config.providers.rankedOnly);
   lobby.isFixture = true;
   return lobby;
 }

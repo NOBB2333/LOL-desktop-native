@@ -23,9 +23,24 @@ const activeGamePhases = new Set([
   "watching",
 ]);
 
+/**
+ * 房间/匹配中：还没进选人，能看到的只有本机所在小队（`/lol-lobby/v2/lobby` 的
+ * `members`）。对齐 LeagueAkari 的 `queryInLobbyPhase`——它默认也是「房间照查」。
+ */
+const roomGamePhases = new Set(["lobby", "matchmaking"]);
+
 const normalizedPhase = (phase?: string | null) => phase?.trim().toLocaleLowerCase() ?? "";
 
-export function isVisibleGamePhase(phase?: string | null) {
+export function isRoomGamePhase(phase?: string | null) {
+  return roomGamePhases.has(normalizedPhase(phase));
+}
+
+/**
+ * `roomRoster` = `providers.lobbyRoster`。房间/匹配中只有在开了这个开关时才算
+ * 「可见阶段」——关掉时房间就是普通等待界面，对局面板该收就收，和以前一致。
+ */
+export function isVisibleGamePhase(phase?: string | null, roomRoster = false) {
+  if (isRoomGamePhase(phase)) return roomRoster;
   return visibleGamePhases.has(normalizedPhase(phase));
 }
 
@@ -70,6 +85,8 @@ export function shouldAutoHideLivePanel(options: {
   connectionPhase?: string | null;
   snapshotPhase?: string | null;
   snapshotIsCurrent?: boolean;
+  /** `providers.lobbyRoster`：房间里也统计队友时，房间阶段不该收面板。 */
+  roomRoster?: boolean;
 }) {
   if (!options.enabled || options.mode !== "live") return false;
   // The game client can make LCU briefly report disconnected/Lobby while the
@@ -77,8 +94,8 @@ export function shouldAutoHideLivePanel(options: {
   // snapshot; terminal snapshots still follow clearLobbyAfterGame below.
   if (isActiveGamePhase(options.snapshotPhase)) return false;
   if (options.connectionStatus === "connected" && options.connectionPhase?.trim()) {
-    return !isVisibleGamePhase(options.connectionPhase);
+    return !isVisibleGamePhase(options.connectionPhase, options.roomRoster);
   }
   if (["disconnected", "error"].includes(options.connectionStatus)) return true;
-  return !isVisibleGamePhase(options.snapshotPhase);
+  return !isVisibleGamePhase(options.snapshotPhase, options.roomRoster);
 }
