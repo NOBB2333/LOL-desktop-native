@@ -18,6 +18,8 @@ const live_loading = @import("backend/live_loading.zig");
 const events_ipc = @import("backend/events_ipc.zig");
 const player_tags_ipc = @import("backend/player_tags_ipc.zig");
 const friends_ipc = @import("backend/friends_ipc.zig");
+const match_timeline = @import("backend/timeline.zig");
+const launcher_ipc = @import("backend/launcher_ipc.zig");
 const assets_ipc = @import("backend/assets_ipc.zig");
 const claim_ipc = @import("backend/claim_ipc.zig");
 const gameflow_ipc = @import("backend/gameflow_ipc.zig");
@@ -271,6 +273,7 @@ pub const command_table = [_]CommandSpec{
     .{ .name = "lol.get_match_history", .lane = .query },
     .{ .name = "lol.get_match_detail", .lane = .query },
     .{ .name = "lol.get_jungle_path", .lane = .query },
+    .{ .name = "lol.get_match_timeline", .lane = .query },
     .{ .name = "lol.search_summoner", .lane = .query },
     .{ .name = "lol.get_champions", .lane = .query },
     .{ .name = "lol.get_asset", .lane = .query },
@@ -278,6 +281,8 @@ pub const command_table = [_]CommandSpec{
     .{ .name = "lol.get_friends", .lane = .query },
     .{ .name = "lol.get_friend_last_game", .lane = .query },
     .{ .name = "lol.delete_friend", .lane = .action },
+    .{ .name = "lol.get_deleted_friends", .lane = .query },
+    .{ .name = "lol.restore_friend", .lane = .action },
     .{ .name = "lol.get_bp_history", .lane = .query },
     .{ .name = "lol.save_match_export", .lane = .query },
     .{ .name = "lol.send_shortcut", .lane = .action },
@@ -298,6 +303,9 @@ pub const command_table = [_]CommandSpec{
     .{ .name = "lol.gameflow_action", .lane = .action },
     .{ .name = "lol.delete_friends", .lane = .action },
     .{ .name = "lol.spectate", .lane = .action },
+    // 一键启动：探测是只读的，启动会拉进程，分成两条通道。
+    .{ .name = "lol.get_client_installations", .lane = .query },
+    .{ .name = "lol.launch_client", .lane = .action },
 };
 
 pub const command_names = blk: {
@@ -324,7 +332,7 @@ test "未登记命令回落到默认 query 通道" {
 const default_config =
     "{\"version\":21,\"appearance\":{\"theme\":\"system\",\"colorMode\":\"dark\",\"compact\":false}," ++
     "\"connection\":{\"kind\":\"local\",\"sshTarget\":\"\",\"identityFile\":\"\",\"forwardedPort\":0}," ++
-    "\"automation\":{\"enabled\":false,\"advisoryMode\":true,\"autoAccept\":false,\"autoAcceptDelaySeconds\":0,\"autoPick\":false,\"autoPickDelaySeconds\":1,\"autoPickStrategy\":\"show-and-lock-in\",\"autoBan\":false,\"pickChampionIds\":[],\"banChampionIds\":[],\"shortcutSendIntervalMs\":65,\"shortcutRecentGameCount\":5,\"shortcuts\":[{\"id\":\"encounter\",\"label\":\"发送遇到记录\",\"key\":\"Ctrl+F5\",\"target\":\"encounter\",\"template\":\"{encounter}\",\"enabled\":true},{\"id\":\"premade\",\"label\":\"发送已知组队\",\"key\":\"Ctrl+F9\",\"target\":\"premade\",\"template\":\"{position} {name}：组队 {premade}\",\"enabled\":true},{\"id\":\"jungle-preference\",\"label\":\"发送打野偏好\",\"key\":\"Ctrl+F7\",\"target\":\"jungle\",\"template\":\"{name}：{jungle_preference}\",\"enabled\":true},{\"id\":\"enemy\",\"label\":\"发送敌方评估\",\"key\":\"Ctrl+F11\",\"target\":\"enemy\",\"template\":\"{team}{position} {current_champion}：{rank} 主玩{main_position} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"ally\",\"label\":\"发送我方评估\",\"key\":\"Ctrl+F12\",\"target\":\"ally\",\"template\":\"{team}{position} {current_champion}：{rank} 主玩{main_position} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"open-game\",\"label\":\"打开对局速看\",\"key\":\"Ctrl+F1\",\"target\":\"lobby\",\"template\":\"对局速看：{team} {name}\",\"enabled\":true}]}," ++
+    "\"automation\":{\"enabled\":false,\"advisoryMode\":true,\"autoAccept\":false,\"autoAcceptDelaySeconds\":0,\"autoPick\":false,\"autoPickDelaySeconds\":1,\"autoPickStrategy\":\"show-and-lock-in\",\"autoBan\":false,\"pickChampionIds\":[],\"banChampionIds\":[],\"aramGrab\":false,\"aramChampionIds\":[],\"aramSwapDelaySeconds\":3,\"shortcutSendIntervalMs\":65,\"shortcutRecentGameCount\":5,\"shortcuts\":[{\"id\":\"encounter\",\"label\":\"发送遇到记录\",\"key\":\"Ctrl+F5\",\"target\":\"encounter\",\"template\":\"{encounter}\",\"enabled\":true},{\"id\":\"premade\",\"label\":\"发送已知组队\",\"key\":\"Ctrl+F9\",\"target\":\"premade\",\"template\":\"{position} {name}：组队 {premade}\",\"enabled\":true},{\"id\":\"jungle-preference\",\"label\":\"发送打野偏好\",\"key\":\"Ctrl+F7\",\"target\":\"jungle\",\"template\":\"{name}：{jungle_preference}\",\"enabled\":true},{\"id\":\"enemy\",\"label\":\"发送敌方评估\",\"key\":\"Ctrl+F11\",\"target\":\"enemy\",\"template\":\"{team}{position} {current_champion}：{rank} 主玩{main_position} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"ally\",\"label\":\"发送我方评估\",\"key\":\"Ctrl+F12\",\"target\":\"ally\",\"template\":\"{team}{position} {current_champion}：{rank} 主玩{main_position} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"open-game\",\"label\":\"打开对局速看\",\"key\":\"Ctrl+F1\",\"target\":\"lobby\",\"template\":\"对局速看：{team} {name}\",\"enabled\":true}]}," ++
     "\"providers\":{\"statsProvider\":\"auto\",\"requestTimeoutSeconds\":6,\"cacheTtlMinutes\":120,\"hideUnfinishedMatches\":false,\"rankedOnly\":false,\"clearLobbyAfterGame\":true}," ++
     "\"ai\":{\"enabled\":false,\"provider\":\"deepseek\",\"protocol\":\"openai\",\"baseUrl\":\"https://api.deepseek.com\",\"model\":\"deepseek-v4-flash\",\"apiKey\":\"\",\"automaticPregameAnalysis\":false}}";
 
@@ -554,7 +562,7 @@ pub const Runtime = struct {
         const config = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), config_snapshot[0..config_len], .{}) catch return;
         const automation = configAutomation(config) orelse return;
         if (automation != .object or !jsonBool(automation, "enabled") or jsonBool(automation, "advisoryMode")) return;
-        if (!jsonBool(automation, "autoAccept") and !jsonBool(automation, "autoPick") and !jsonBool(automation, "autoBan")) return;
+        if (!jsonBool(automation, "autoAccept") and !jsonBool(automation, "autoPick") and !jsonBool(automation, "autoBan") and !jsonBool(automation, "aramGrab")) return;
 
         // 手动自动化正在运行时跳过本轮，避免轮询线程持续自旋。
         if (!self.automation_mutex.tryLock()) return;
@@ -640,6 +648,7 @@ pub const Runtime = struct {
             .{ .name = "lol.get_match_history", .context = self, .invoke_fn = getMatches },
             .{ .name = "lol.get_match_detail", .context = self, .invoke_fn = getMatchDetail },
             .{ .name = "lol.get_jungle_path", .context = self, .invoke_fn = getJunglePath },
+            .{ .name = "lol.get_match_timeline", .context = self, .invoke_fn = match_timeline.getMatchTimeline },
             .{ .name = "lol.search_summoner", .context = self, .invoke_fn = searchSummoner },
             .{ .name = "lol.get_champions", .context = self, .invoke_fn = assets_ipc.getChampions },
             .{ .name = "lol.get_asset", .context = self, .invoke_fn = assets_ipc.getAsset },
@@ -647,6 +656,8 @@ pub const Runtime = struct {
             .{ .name = "lol.get_friends", .context = self, .invoke_fn = friends_ipc.getFriends },
             .{ .name = "lol.get_friend_last_game", .context = self, .invoke_fn = friends_ipc.getFriendLastGame },
             .{ .name = "lol.delete_friend", .context = self, .invoke_fn = friends_ipc.deleteFriend },
+            .{ .name = "lol.get_deleted_friends", .context = self, .invoke_fn = friends_ipc.getDeletedFriends },
+            .{ .name = "lol.restore_friend", .context = self, .invoke_fn = friends_ipc.restoreFriend },
             .{ .name = "lol.get_bp_history", .context = self, .invoke_fn = getBpHistory },
             .{ .name = "lol.save_match_export", .context = self, .invoke_fn = saveMatchExport },
             .{ .name = "lol.send_shortcut", .context = self, .invoke_fn = sendShortcut },
@@ -664,6 +675,8 @@ pub const Runtime = struct {
             .{ .name = "lol.gameflow_action", .context = self, .invoke_fn = gameflow_ipc.action },
             .{ .name = "lol.delete_friends", .context = self, .invoke_fn = friends_ipc.deleteFriends },
             .{ .name = "lol.spectate", .context = self, .invoke_fn = friends_ipc.spectate },
+            .{ .name = "lol.get_client_installations", .context = self, .invoke_fn = launcher_ipc.getClientInstallations },
+            .{ .name = "lol.launch_client", .context = self, .invoke_fn = launcher_ipc.launchClient },
         };
     }
 };
@@ -5996,7 +6009,11 @@ fn firstJsonValue(value: std.json.Value) std.json.Value {
     return if (value == .array and value.array.items.len > 0) value.array.items[0] else value;
 }
 
-fn percentEncodeQuery(value: []const u8, output: []u8) ![]const u8 {
+/// 把查询参数按 RFC 3986 的非保留字符集转义（`#` → `%23`、空格 → `%20`）。
+///
+/// 之所以把整段 subject 一起编码，是因为 LCU 的 `summoners?name=` 要的是
+/// `名字#标签` 这种**带 `#` 的整体**，`#` 必须转义，否则会被当成分片标识截断。
+pub fn percentEncodeQuery(value: []const u8, output: []u8) ![]const u8 {
     const digits = "0123456789ABCDEF";
     var cursor: usize = 0;
     for (value) |byte| {

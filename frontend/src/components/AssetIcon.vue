@@ -8,35 +8,57 @@ const props = withDefaults(defineProps<{
   name?: string;
   fallbackUrl?: string;
   size?: "xs" | "sm" | "md" | "lg" | "xl";
-}>(), { name: "", fallbackUrl: "", size: "md" });
+  /**
+   * 圆形裁切。
+   *
+   * 召唤师头像本身是圆的，方框裁切会把边框切掉一块、看起来「不像那个人」；
+   * 英雄/装备/符文都是方形图，不能跟着变圆。
+   */
+  round?: boolean;
+}>(), { name: "", fallbackUrl: "", size: "md", round: false });
 
-const source = ref("");
-const failed = ref(false);
+const nativeSource = ref("");
+/** 已经加载失败的候选地址。**是列表不是布尔**：一个挂了不能把另一个也判死。 */
+const broken = ref<string[]>([]);
 const initials = computed(() => props.name.trim().slice(0, 1) || "?");
+
+/**
+ * 候选顺序：原生取到的字节（LCU 本地、版本最准）在前，调用方给的远程地址兜底。
+ *
+ * 这里刻意做成「取第一个还没挂的」而不是「取第一个」：远程地址是先到的那一个
+ * （同步就能用），原生结果晚几十毫秒才回来；如果远程那张先报错，旧的写法会把整个
+ * 图标判死，之后原生明明取到了也不显示——那正是「头像时好时坏」的来源。
+ */
+const source = computed(() => {
+  const candidates = [nativeSource.value, props.fallbackUrl];
+  for (const candidate of candidates) {
+    if (candidate && !broken.value.includes(candidate)) return candidate;
+  }
+  return "";
+});
 
 watchEffect((onCleanup) => {
   let active = true;
-  failed.value = false;
-  source.value = props.fallbackUrl.startsWith("lcu://") ? "" : props.fallbackUrl;
-  if (isTauri() && props.id > 0) {
-    void backend.asset(props.kind, props.id).then((asset) => {
-      if (active) {
-        failed.value = false;
-        // Keep the local/fixture fallback when the native host has no asset
-        // provider yet; an empty bridge payload should not erase a valid URL.
-        source.value = asset.dataUrl || source.value;
-      }
-    }).catch(() => {
-      if (active && !source.value) failed.value = true;
-    });
-  }
   onCleanup(() => { active = false; });
+  broken.value = [];
+  nativeSource.value = "";
+  if (!isTauri() || props.id <= 0) return;
+  void backend.asset(props.kind, props.id).then((asset) => {
+    // 空载荷不该抹掉调用方已经给好的 URL。
+    if (active && asset.dataUrl) nativeSource.value = asset.dataUrl;
+  }).catch(() => {
+    // 拿不到就留在远程兜底上，这里不标记失败。
+  });
 });
+
+function onError() {
+  if (source.value && !broken.value.includes(source.value)) broken.value = [...broken.value, source.value];
+}
 </script>
 
 <template>
-  <span class="asset-icon" :class="`asset-icon--${size}`" :title="name" :aria-label="name || undefined" :role="name ? 'img' : undefined">
-    <img v-if="source && !failed" :src="source" alt="" @error="failed = true" />
+  <span class="asset-icon" :class="[`asset-icon--${size}`, { 'asset-icon--round': round }]" :title="name" :aria-label="name || undefined" :role="name ? 'img' : undefined">
+    <img v-if="source" :src="source" alt="" @error="onError" />
     <span v-else class="asset-icon__fallback">{{ initials }}</span>
   </span>
 </template>
@@ -59,6 +81,8 @@ watchEffect((onCleanup) => {
 .asset-icon--md { width: 34px; height: 34px; font-size: 12px; }
 .asset-icon--lg { width: 44px; height: 44px; font-size: 14px; }
 .asset-icon--xl { width: 58px; height: 58px; font-size: 16px; }
+/* 召唤师头像用整圆：客户端里就是这么显示的，方角会让人认不出是谁。 */
+.asset-icon--round { border-radius: 50%; }
 
 .asset-icon img {
   width: 100%;

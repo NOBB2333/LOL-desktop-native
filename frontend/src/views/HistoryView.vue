@@ -1,18 +1,20 @@
 <script setup lang="ts">
-import { CalendarDays, ClipboardList, Eye, Search, Shield, UsersRound } from "@lucide/vue";
-import { NButton, NInput, NTag } from "naive-ui";
-import { computed, ref } from "vue";
+import { CalendarDays, ClipboardList, Eye, Search, Shield, TrendingUp, UsersRound } from "@lucide/vue";
+import { NButton, NInput, NSpin, NTag } from "naive-ui";
+import { computed, ref, watch } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 import AssetIcon from "../components/AssetIcon.vue";
+import MatchTimelinePanel from "../components/MatchTimelinePanel.vue";
 import PageHeader from "../components/PageHeader.vue";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import { championImage, relativeTime } from "../utils/format";
 import { queueLabel } from "../utils/queue";
 import { scorePlayerName } from "../matches/localPlayers";
+import { clockOf } from "../matches/timeline";
 
 const app = useAppStore();
-const tab = ref<"bp" | "encounters">("bp");
+const tab = ref<"bp" | "encounters" | "timeline">("bp");
 const bp = useQuery({ queryKey: computed(() => ["bp-history", app.mode]), queryFn: backend.bpHistory, enabled: computed(() => app.initialized) });
 const encounters = useQuery({ queryKey: computed(() => ["encounter-history", app.mode]), queryFn: () => backend.encounters(undefined, 100), enabled: computed(() => app.initialized) });
 // 这里只把英雄名映射成 id，走默认区服/分段即可（包一层：vue-query 会把查询上下文当第一个参数）。
@@ -34,6 +36,36 @@ const visibleEncounters = computed(() => {
   if (!query) return list;
   return list.filter((record) => scorePlayerName(query, record.gameName, record.tagLine ?? "") !== null);
 });
+
+/**
+ * 时间线页签的对局选择器。
+ *
+ * 取的是**本地账号**最近的对局（不传名字就是自己），只在这个页签可见时才请求，
+ * 免得历史页一打开就多打一次 LCU。选中的局决定时间线查询的 key。
+ */
+const timelineMatches = useQuery({
+  queryKey: computed(() => ["timeline-matches", app.mode]),
+  queryFn: () => backend.matches(undefined, 0, 20),
+  enabled: computed(() => app.initialized && tab.value === "timeline"),
+});
+const selectedGameId = ref(0);
+// 列表到手后默认选最近一局；用户手动选过就不再覆盖（只在未选时兜底）。
+watch(
+  () => timelineMatches.data.value,
+  (list) => {
+    if (!list?.length) return;
+    if (list.some((match) => match.gameId === selectedGameId.value)) return;
+    selectedGameId.value = list[0].gameId;
+  },
+  { immediate: true },
+);
+const timelineQuery = useQuery({
+  queryKey: computed(() => ["match-timeline", app.mode, selectedGameId.value]),
+  queryFn: () => backend.matchTimeline(selectedGameId.value, app.connection.puuid ?? ""),
+  enabled: computed(() => tab.value === "timeline" && selectedGameId.value > 0),
+});
+const championNameById = computed(() => new Map((champions.data.value ?? []).map((champion) => [champion.id, champion.name])));
+const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄 #${id}`;
 </script>
 
 <template>
@@ -45,6 +77,9 @@ const visibleEncounters = computed(() => {
         </button>
         <button type="button" :class="{ active: tab === 'encounters' }" @click="tab = 'encounters'">
           <UsersRound :size="14" />玩家档案
+        </button>
+        <button type="button" :class="{ active: tab === 'timeline' }" @click="tab = 'timeline'">
+          <TrendingUp :size="14" />对局时间线
         </button>
       </div>
     </PageHeader>
@@ -149,8 +184,9 @@ const visibleEncounters = computed(() => {
       </div>
     </section>
 
-    <!-- 玩家档案 -->
-    <section v-else class="history-section">
+    <!-- 玩家档案。注意这里必须是 v-else-if：页签有三个，用 v-else 会和
+         「对局时间线」同时渲染，两个区块一起出现。 -->
+    <section v-else-if="tab === 'encounters'" class="history-section">
       <header class="history-section__header">
         <div>
           <span class="eyebrow">PLAYER ARCHIVE</span>
@@ -217,6 +253,64 @@ const visibleEncounters = computed(() => {
           <time class="encounter-time">{{ relativeTime(record.encounteredAt) }}</time>
         </div>
       </div>
+    </section>
+
+    <!-- 对局时间线 -->
+    <section v-if="tab === 'timeline'" class="history-section">
+      <header class="history-section__header">
+        <div>
+          <span class="eyebrow">MATCH TIMELINE</span>
+          <h2>经济曲线与关键事件</h2>
+          <p>数据来自本地客户端的逐帧记录：双方经济差、野怪、防御塔与镀层。选一局看走势。</p>
+        </div>
+        <span class="history-count">{{ timelineMatches.data.value?.length ?? 0 }} <small>局可选</small></span>
+      </header>
+
+      <div v-if="timelineMatches.isPending.value" class="history-empty">
+        <NSpin size="small" />
+        <strong>正在读取最近对局</strong>
+        <span>本页只列本地账号的战绩。</span>
+      </div>
+
+      <div v-else-if="!timelineMatches.data.value?.length" class="history-empty">
+        <TrendingUp :size="24" />
+        <strong>还没有可回看的对局</strong>
+        <span>打完一局后，这里会出现它的经济曲线和关键事件。</span>
+      </div>
+
+      <template v-else>
+        <div class="timeline-picker" role="tablist" aria-label="选择对局">
+          <button
+            v-for="match in timelineMatches.data.value ?? []"
+            :key="match.gameId"
+            type="button"
+            class="timeline-picker__item"
+            :class="{ active: match.gameId === selectedGameId }"
+            :data-result="match.result === '胜利' ? 'win' : 'loss'"
+            @click="selectedGameId = match.gameId"
+          >
+            <AssetIcon kind="champion" :id="match.championId" :name="match.championName" :fallback-url="championImage(match.championId)" size="xs" />
+            <span class="timeline-picker__body">
+              <strong>{{ match.championName || '未知英雄' }}</strong>
+              <small>{{ match.kda }} · {{ clockOf((match.durationMinutes || 0) * 60) }}</small>
+            </span>
+          </button>
+        </div>
+
+        <div v-if="timelineQuery.isPending.value" class="history-empty">
+          <NSpin size="small" />
+          <strong>正在解析逐帧数据</strong>
+          <span>首次读取一局需要向客户端取一次明细，之后会走本地缓存。</span>
+        </div>
+
+        <div v-else-if="timelineQuery.isError.value" class="history-empty">
+          <TrendingUp :size="24" />
+          <strong>这一局没有逐帧数据</strong>
+          <span>自定义对局、重开局或客户端尚未缓存明细时会拿不到。换一局试试。</span>
+        </div>
+
+        <MatchTimelinePanel v-else-if="timelineQuery.data.value" :timeline="timelineQuery.data.value" :champion-name="championNameOf" />
+      </template>
     </section>
   </div>
 </template>
@@ -482,6 +576,36 @@ const visibleEncounters = computed(() => {
 .encounter-champion { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .encounter-champion span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .encounter-time { color: var(--text-secondary); font-size: 11px; }
+
+/* 时间线的对局选择器：横向滚动的一排小卡片，选中的那局高亮。 */
+.timeline-picker {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+  padding-bottom: 4px;
+  overflow-x: auto;
+}
+.timeline-picker__item {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text-primary);
+  cursor: pointer;
+  text-align: left;
+}
+.timeline-picker__item[data-result="win"] { border-left-color: var(--blue); }
+.timeline-picker__item[data-result="loss"] { border-left-color: var(--red); }
+.timeline-picker__item:hover { background: var(--surface-muted); }
+.timeline-picker__item.active { border-color: var(--accent); background: var(--accent-soft); }
+.timeline-picker__body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.timeline-picker__body strong { font-size: 12px; white-space: nowrap; }
+.timeline-picker__body small { color: var(--text-secondary); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 @media (max-width: 900px) {
   .bp-card__body { grid-template-columns: 1fr; }

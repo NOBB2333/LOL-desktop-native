@@ -49,7 +49,7 @@ async function runAutomation() {
   }
 }
 
-type AutoActionKey = "autoAccept" | "autoPick" | "autoBan";
+type AutoActionKey = "autoAccept" | "autoPick" | "autoBan" | "aramGrab";
 
 function setAdvisoryMode(enabled: boolean) {
   app.config.automation.advisoryMode = enabled;
@@ -57,6 +57,7 @@ function setAdvisoryMode(enabled: boolean) {
   app.config.automation.autoAccept = false;
   app.config.automation.autoPick = false;
   app.config.automation.autoBan = false;
+  app.config.automation.aramGrab = false;
 }
 
 function setAutoAction(key: AutoActionKey, enabled: boolean) {
@@ -135,8 +136,8 @@ function handleShortcutRecording(event: KeyboardEvent) {
 }
 onMounted(() => window.addEventListener("keydown", handleShortcutRecording, true));
 onBeforeUnmount(() => { window.removeEventListener("keydown", handleShortcutRecording, true); if (recordingShortcutId.value) void backend.setShortcutCapture(false); });
-function removeChampion(target: "pick" | "ban", id: number) {
-  const key = target === "pick" ? "pickChampionIds" : "banChampionIds";
+function removeChampion(target: "pick" | "ban" | "aram", id: number) {
+  const key = target === "pick" ? "pickChampionIds" : target === "ban" ? "banChampionIds" : "aramChampionIds";
   app.config.automation[key] = app.config.automation[key].filter((value) => value !== id);
 }
 const targetOptions = shortcutTargetOptions;
@@ -238,6 +239,32 @@ const targetLabel = (target: ShortcutTarget) => shortcutTargetLabel(target);
               </div>
               <NSwitch :value="app.config.automation.autoBan" :disabled="!app.config.automation.enabled" @update:value="setAutoAction('autoBan', $event)" />
             </div>
+            <!--
+              大乱斗抢英雄走的是**替补席换人**，和上面三条不是一回事：大乱斗进选人时
+              英雄已经随机分好，没有 pick/ban action 可提交。极地大乱斗与海克斯大乱斗
+              共用这一份候选与这一个开关（两者的选人机制相同）。
+            -->
+            <div class="auto-row">
+              <div class="auto-row__label">
+                <strong>大乱斗抢英雄</strong>
+                <p>极地 / 海克斯大乱斗：从替补席换出候选里优先级更高的英雄</p>
+              </div>
+              <NSwitch :value="app.config.automation.aramGrab" :disabled="!app.config.automation.enabled" @update:value="setAutoAction('aramGrab', $event)" />
+            </div>
+            <div class="auto-row auto-row--sub">
+              <div class="auto-row__label">
+                <strong>抢人延迟</strong>
+                <p>从在替补席上看到目标算起；留几秒给手动换人，0 秒表示立刻换</p>
+              </div>
+              <div class="auto-delay-wrap">
+                <NInputNumber
+                  v-model:value="app.config.automation.aramSwapDelaySeconds"
+                  size="small" :min="0" :max="30" :step="1" :precision="0"
+                  :disabled="!app.config.automation.enabled || !app.config.automation.aramGrab"
+                />
+                <span class="auto-delay-unit">秒</span>
+              </div>
+            </div>
           </div>
         </section>
 
@@ -247,7 +274,7 @@ const targetLabel = (target: ShortcutTarget) => shortcutTargetLabel(target);
             <Sparkles :size="16" class="auto-card__icon" />
             <div>
               <span class="eyebrow">CHAMPION POOL</span>
-              <h2>自动选人 / 自动禁用</h2>
+              <h2>自动选人 / 自动禁用 / 大乱斗抢人</h2>
             </div>
             <div class="champion-pool-stat">
               <strong>{{ championOptions.length }}</strong>
@@ -295,6 +322,28 @@ const targetLabel = (target: ShortcutTarget) => shortcutTargetLabel(target);
                   <button type="button" class="champion-item__remove" title="移除候选" @click="removeChampion('ban', id)"><Trash2 :size="13" /></button>
                 </article>
                 <p v-if="!app.config.automation.banChampionIds.length" class="pool-empty">尚未设置禁用候选</p>
+              </div>
+            </div>
+
+            <div class="champion-pool-divider"></div>
+
+            <div class="champion-pool-section">
+              <label class="pool-label">
+                <span class="pool-label__title">大乱斗抢人候选</span>
+                <small class="pool-label__hint">极地 / 海克斯大乱斗共用；只会在替补席上出现时才换过去</small>
+              </label>
+              <NSelect v-model:value="app.config.automation.aramChampionIds" multiple filterable :options="championOptions" placeholder="按优先级选择想要的英雄" />
+              <div class="champion-list">
+                <article v-for="(id, index) in app.config.automation.aramChampionIds" :key="`aram-${id}`" class="champion-item">
+                  <span class="champion-item__order champion-item__order--aram">{{ index + 1 }}</span>
+                  <AssetIcon kind="champion" :id="id" :name="championById.get(id)?.name ?? `英雄 #${id}`" :fallback-url="championById.get(id)?.iconUrl" size="md" />
+                  <div class="champion-item__info">
+                    <strong>{{ championById.get(id)?.name ?? `英雄 #${id}` }}</strong>
+                    <small>{{ championById.get(id)?.alias ?? "LCU 目录" }} · 大乱斗候选</small>
+                  </div>
+                  <button type="button" class="champion-item__remove" title="移除候选" @click="removeChampion('aram', id)"><Trash2 :size="13" /></button>
+                </article>
+                <p v-if="!app.config.automation.aramChampionIds.length" class="pool-empty">尚未设置大乱斗候选</p>
               </div>
             </div>
 
@@ -510,6 +559,11 @@ const targetLabel = (target: ShortcutTarget) => shortcutTargetLabel(target);
 .champion-item__order--ban {
   color: var(--red);
   background: var(--red-soft);
+}
+/* 大乱斗抢人用琥珀色：和「选用（绿）/ 禁用（红）」区分开，一眼能看出这是第三份候选。 */
+.champion-item__order--aram {
+  color: var(--amber);
+  background: var(--amber-soft);
 }
 .champion-item__info { min-width: 0; }
 .champion-item__info strong { display: block; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

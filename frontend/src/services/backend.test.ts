@@ -125,3 +125,47 @@ describe("player tags in browser preview", () => {
     await expect(backend.updatePlayerTag("   ", ["备注"])).rejects.toThrow("缺少玩家标识");
   });
 });
+
+/**
+ * 观战的两条路线。
+ *
+ * 好友路线（`buddy`）要客户端下发的 `spectatorKey`，观察者模式（`observe`）不带密钥、
+ * 因此不要求对方是好友 —— 后者就是「只输一个 ID 也能观战」的依据。预览里没有真实
+ * 观战服务，所以这里只锁定**界面上会拿到的形状**：`ok` / `reason` / `route` 三者齐全，
+ * 且「按 ID 观战」能正确走到解析这一步。
+ */
+describe("spectate in browser preview", () => {
+  it("好友且有密钥时走 buddy 路线", async () => {
+    const result = await backend.spectate("friend-puuid-2");
+    expect(result).toEqual({ ok: true, reason: "", route: "buddy" });
+  });
+
+  it("拿不到密钥时落到观察者模式并给出可读原因", async () => {
+    const idle = await backend.spectate("friend-puuid-1");
+    expect(idle.ok).toBe(false);
+    expect(idle.route).toBe("observe");
+    expect(idle.reason).toContain("观察者模式");
+
+    // 不是好友也一样：这正是以前「只能观战好友」会直接失败的那条路。
+    const stranger = await backend.spectate("not-a-friend-puuid");
+    expect(stranger.ok).toBe(false);
+    expect(stranger.route).toBe("observe");
+  });
+
+  it("按「名字#标签」观战会先解析再走同一条链路", async () => {
+    // 名字 + 标签都能对上 → 复用这位好友的密钥。
+    expect(await backend.spectateById("狐狸收藏家#MID")).toEqual({ ok: true, reason: "", route: "buddy" });
+    // 只给名字也允许，只是不比标签。
+    expect((await backend.spectateById("河道观察者")).route).toBe("observe");
+    // 查无此人 → 说清「没找到」，不要去试观战。
+    const missing = await backend.spectateById("查无此人#XXX");
+    expect(missing.ok).toBe(false);
+    expect(missing.route).toBe("");
+    expect(missing.reason).toContain("没找到");
+  });
+
+  it("拒绝空的玩家标识", async () => {
+    await expect(backend.spectate("   ")).rejects.toThrow("缺少玩家标识");
+    await expect(backend.spectateById("   ")).rejects.toThrow("缺少玩家标识");
+  });
+});

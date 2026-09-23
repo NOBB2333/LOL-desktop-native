@@ -104,6 +104,71 @@ pub const Store = struct {
         return c.sqlite3_column_int64(statement.?, 0);
     }
 
+    /// 一个 kind 下的一条快照。`key` / `value` 都是调用方负责释放的副本。
+    pub const Entry = struct {
+        key: []u8,
+        value: []u8,
+        updated_at: i64,
+    };
+
+    /// 列出某个 kind 的全部快照，**写入时间新的在前**。
+    ///
+    /// 回收站（被删好友）需要「最近删的在最上面」，所以排序放在 SQL 里而不是调用方——
+    /// 只有这里知道 `updated_at`。
+    pub fn list(self: *Store, allocator: std.mem.Allocator, kind: []const u8) ![]Entry {
+        var kind_buffer: [512]u8 = undefined;
+        const scoped_kind = self.scopedKind(kind, &kind_buffer) catch |err| return if (err == error.CacheScopeUnavailable) &.{} else err;
+        const sql = "SELECT key,value,updated_at FROM snapshots WHERE kind=?1 ORDER BY updated_at DESC;";
+        var statement: ?*c.sqlite3_stmt = null;
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+        if (c.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &statement, null) != c.SQLITE_OK) return error.QueryFailed;
+        defer _ = c.sqlite3_finalize(statement);
+        try bindText(statement.?, 1, scoped_kind);
+        var entries = std.ArrayList(Entry).empty;
+        errdefer {
+            for (entries.items) |entry| {
+                allocator.free(entry.key);
+                allocator.free(entry.value);
+            }
+            entries.deinit(allocator);
+        }
+        while (c.sqlite3_step(statement.?) == c.SQLITE_ROW) {
+            const key_ptr = c.sqlite3_column_text(statement.?, 0) orelse continue;
+            const key_len = c.sqlite3_column_bytes(statement.?, 0);
+            const value_ptr = c.sqlite3_column_text(statement.?, 1) orelse continue;
+            const value_len = c.sqlite3_column_bytes(statement.?, 1);
+            try entries.append(allocator, .{
+                .key = try allocator.dupe(u8, key_ptr[0..@intCast(key_len)]),
+                .value = try allocator.dupe(u8, value_ptr[0..@intCast(value_len)]),
+                .updated_at = c.sqlite3_column_int64(statement.?, 2),
+            });
+        }
+        return entries.toOwnedSlice(allocator);
+    }
+
+    pub fn freeEntries(allocator: std.mem.Allocator, entries: []Entry) void {
+        for (entries) |entry| {
+            allocator.free(entry.key);
+            allocator.free(entry.value);
+        }
+        allocator.free(entries);
+    }
+
+    pub fn remove(self: *Store, kind: []const u8, key: []const u8) !void {
+        var kind_buffer: [512]u8 = undefined;
+        const scoped_kind = try self.scopedKind(kind, &kind_buffer);
+        const sql = "DELETE FROM snapshots WHERE kind=?1 AND key=?2;";
+        var statement: ?*c.sqlite3_stmt = null;
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+        if (c.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &statement, null) != c.SQLITE_OK) return error.QueryFailed;
+        defer _ = c.sqlite3_finalize(statement);
+        try bindText(statement.?, 1, scoped_kind);
+        try bindText(statement.?, 2, key);
+        if (c.sqlite3_step(statement.?) != c.SQLITE_DONE) return error.QueryFailed;
+    }
+
     fn exec(self: *Store, sql: []const u8) !void {
         const sql_z = try self.allocator.dupeZ(u8, sql);
         defer self.allocator.free(sql_z);

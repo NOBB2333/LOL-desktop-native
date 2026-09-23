@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { fixtureConfig } from "../fixtures/data";
-import { CURRENT_CONFIG_VERSION, defaultAssessmentTemplate, defaultOpenGameShortcutKey, migrateAppConfig } from "./config";
+import { CURRENT_CONFIG_VERSION, defaultAramSwapDelaySeconds, defaultAssessmentTemplate, defaultOpenGameShortcutKey, migrateAppConfig } from "./config";
 
 describe("config migration", () => {
   it("adds the jungle shortcut to an existing config without changing custom shortcuts", () => {
@@ -92,5 +92,20 @@ describe("config migration", () => {
 
     expect(migrateAppConfig(customized)).toBe(true);
     expect(customized.automation.shortcutSendIntervalMs).toBe(120);
+  });
+
+  it("backfills the ARAM grab defaults without enabling it", () => {
+    // v22 的新字段必须补上，但开关不能替用户打开——抢英雄要用户自己确认。
+    const legacy = structuredClone(fixtureConfig);
+    legacy.version = 21;
+    delete (legacy.automation as Partial<typeof legacy.automation>).aramGrab;
+    delete (legacy.automation as Partial<typeof legacy.automation>).aramChampionIds;
+    delete (legacy.automation as Partial<typeof legacy.automation>).aramSwapDelaySeconds;
+
+    expect(migrateAppConfig(legacy)).toBe(true);
+    expect(legacy.version).toBe(CURRENT_CONFIG_VERSION);
+    expect(legacy.automation.aramGrab).toBe(false);
+    expect(legacy.automation.aramChampionIds).toEqual([]);
+    expect(legacy.automation.aramSwapDelaySeconds).toBe(defaultAramSwapDelaySeconds);
   });
 });

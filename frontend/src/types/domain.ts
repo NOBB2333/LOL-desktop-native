@@ -243,6 +243,57 @@ export interface ScoreBreakdown {
   components: ScoreComponent[];
 }
 
+/**
+ * 一局的时间线：分钟帧 + 关键事件。
+ *
+ * 数据源与打野路线图相同（LCU 的 `game-timelines`），但口径完全不同——路线图按玩家
+ * 聚合落点，这里按「分钟」横向铺开，用来画经济曲线和事件轴。
+ */
+export interface MatchTimelineParticipant {
+  participantId: number;
+  /** 100 = 蓝方，200 = 红方。 */
+  team: number;
+  championId: number;
+}
+
+export interface MatchTimelineFrame {
+  minute: number;
+  blueGold: number;
+  redGold: number;
+  /** 蓝方减红方；正数表示蓝方领先。 */
+  goldDiff: number;
+  blueCs: number;
+  redCs: number;
+  /** 10 项，按 participantId 1..10 顺序，缺座位补 0。 */
+  gold: number[];
+}
+
+export interface MatchTimelineEvent {
+  /** CHAMPION_KILL / ELITE_MONSTER_KILL / BUILDING_KILL / TURRET_PLATE_DESTROYED */
+  type: string;
+  seconds: number;
+  /** 做这件事的一方（推塔方 / 拿龙方 / 击杀方），未知为 0。 */
+  team: number;
+  killerId: number;
+  victimId: number;
+  assistCount: number;
+  killerChampionId: number;
+  victimChampionId: number;
+  monsterType: string;
+  monsterSubType: string;
+  buildingType: string;
+  towerType: string;
+  laneType: string;
+}
+
+export interface MatchTimeline {
+  gameId: number;
+  durationSeconds: number;
+  participants: MatchTimelineParticipant[];
+  frames: MatchTimelineFrame[];
+  events: MatchTimelineEvent[];
+}
+
 export interface PlayerProfile {
   rosterKey?: string;
   puuid: string;
@@ -531,6 +582,17 @@ export interface AppConfig {
     autoBan: boolean;
     pickChampionIds: number[];
     banChampionIds: number[];
+    /**
+     * 大乱斗自动抢英雄（走替补席换人）。
+     *
+     * 极地大乱斗与海克斯大乱斗共用这一份偏好与这一个开关：两者选人机制相同
+     * （随机分英雄 + 替补席），判据是 `session.benchEnabled`，而替补席只在这两种
+     * 模式里存在。
+     */
+    aramGrab: boolean;
+    aramChampionIds: number[];
+    /** 从「在替补席上看到目标」到真正换人之间的等待秒数（对齐 AK 的 2.9 秒）。 */
+    aramSwapDelaySeconds: number;
     shortcutSendIntervalMs: number;
     shortcutRecentGameCount: number;
     shortcuts: ShortcutDefinition[];
@@ -646,9 +708,82 @@ export interface FriendDeleteOutcome {
   failed: number;
 }
 
+/**
+ * 被删好友在本地库里的存档（回收站的每一行）。
+ *
+ * 删除是不可逆的，所以删之前后端会把**客户端当时那条好友记录**抄一份到本地。
+ * 这里只有「这个人是谁 + 什么时候删的」——`availability` 这类实时状态刻意不存，
+ * 它在回收站里早就过期了。
+ */
+export interface DeletedFriendRecord {
+  id: string;
+  puuid: string;
+  summonerId: number;
+  gameName: string;
+  gameTag: string;
+  icon: number;
+  groupId: number;
+  /** 删除时刻（ISO 8601）。 */
+  deletedAt: string | null;
+}
+
+export interface DeletedFriendsSnapshot {
+  friends: DeletedFriendRecord[];
+}
+
+/**
+ * 回收站里的动作结果。
+ *
+ * `added` 只对「重新加回」有意义：客户端只有**发好友申请**这一个入口
+ * （见后端 `friends_ipc.restoreFriend`），不是直接恢复好友关系——删除是单方面的，
+ * 加回来要对方同意，界面必须把这点说清楚。
+ */
+export interface RestoreFriendResult {
+  ok: boolean;
+  reason: string;
+  added: boolean;
+  gameName: string;
+  gameTag: string;
+}
+
 export interface SpectateResult {
   ok: boolean;
   reason: string;
+  /**
+   * 这次走的是哪条路线。
+   *
+   * - `buddy`：好友路线，用客户端下发的 `spectatorKey`。
+   * - `observe`：观察者模式，**不带密钥**，所以不要求对方是好友。
+   * - `""`：失败时无意义。
+   */
+  route?: "buddy" | "observe" | "";
+}
+
+/**
+ * 一个「可以一键启动的东西」。
+ *
+ * 应用本来只会在客户端**已经跑起来**时接管（靠 lockfile 找凭据）；这套类型服务的是
+ * 另一半场景——用户先开了应用、客户端还没开，点一下直接把它拉起来。
+ */
+export interface ClientLaunchEntry {
+  /** 稳定标识（`tcls` / `wegame-launcher` / `wegame` / `riot-client` / `league-client`）。 */
+  id: string;
+  label: string;
+  /** 这条入口是从哪探到的（安装清单 / 扫盘 / 环境变量），排查用。 */
+  detail: string;
+  path: string;
+}
+
+export interface ClientInstallations {
+  entries: ClientLaunchEntry[];
+}
+
+export interface ClientLaunchResult {
+  ok: boolean;
+  reason: string;
+  /** 实际启动了哪个入口；空串表示没启动。 */
+  id: string;
+  label: string;
 }
 
 /**

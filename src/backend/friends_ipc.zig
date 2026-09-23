@@ -4,6 +4,8 @@
 //! `historyGames` / `unwrapHistoryGame` 属于跨模块的历史数据整形，仍留在共享层。
 const std = @import("std");
 const native_sdk = @import("native_sdk");
+const lcu = @import("lcu");
+const storage = @import("storage");
 const backend = @import("../backend.zig");
 
 /// `lol.get_friends` —— 好友分组 + 好友列表（含送礼时间与缓存到的最近一局）。
@@ -162,6 +164,9 @@ fn friendLastGameDto(puuid: []const u8, history_json: []const u8, output: []u8) 
 }
 
 /// `lol.delete_friend` —— 删除好友。先校验当前账号，避免切号后误删。
+///
+/// 删之前会先把**客户端当前的那条好友记录**抄进本地回收站（见 `archiveDeletedFriend`）：
+/// 删除是不可逆的，一旦手滑，本地连「刚才删的是谁」都说不出来。
 pub fn deleteFriend(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = backend.runtime(context);
     const payload_json = backend.parsePayload(struct { id: []const u8 = "" }, invocation.request.payload) catch return error.InvalidRequest;
@@ -173,10 +178,157 @@ pub fn deleteFriend(context: *anyopaque, invocation: native_sdk.bridge.Invocatio
     defer client.deinit();
     var path_buffer: [512]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buffer, "/lol-chat/v1/friends/{s}", .{payload.id}) catch return error.InvalidRequest;
+    // 必须在删除**之前**取：删完这条记录就没了，回收站也就没了内容。
+    const friends_json = client.get("/lol-chat/v1/friends") catch null;
+    defer if (friends_json) |value| std.heap.page_allocator.free(value);
     try backend.verifyActionAccount(self, client);
     const response = try client.delete(path);
-    defer std.heap.page_allocator.free(response);
+    std.heap.page_allocator.free(response);
+    archiveDeletedFriend(self, friends_json, payload.id);
     return std.fmt.bufPrint(output, "{{\"deleted\":true}}", .{});
+}
+
+/// 被删好友在本地库里的存放位置。
+///
+/// 复用 `storage.zig` 唯一那张 `(kind,key,value,updated_at)` 表：value 直接就是
+/// 一条**已经拼好的 JSON 记录**，读的时候不需要再解析重组，也不怕字段漂移。
+const deleted_friend_kind = "deletedFriend";
+
+/// 回收站最多回给界面多少条（按删除时间新的在前）。
+///
+/// 只是防止删了几千个好友之后把 1MB 的结果缓冲塞满；真正的删除量远小于此数。
+const deleted_friend_read_limit: usize = 300;
+
+/// 把即将被删掉的好友整条记录写进回收站。
+///
+/// 记录来源是**客户端刚返回的好友列表**，而不是前端传上来的数据：删除不可逆，
+/// 存档要是和真实好友对不上，这个回收站就成了假的后悔药。取不到列表（网络抖动）
+/// 就只是没有存档，绝不因此拦住删除本身。
+fn archiveDeletedFriend(self: *backend.Runtime, friends_json: ?[]const u8, id: []const u8) void {
+    const raw = friends_json orelse return;
+    const store = if (self.storage) |*value| value else return;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const friends = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), raw, .{}) catch return;
+    if (friends != .array) return;
+    for (friends.array.items) |friend| {
+        if (friend != .object) continue;
+        if (!std.mem.eql(u8, backend.jsonField(friend, "id"), id)) continue;
+        var buffer: [1024]u8 = undefined;
+        const record = deletedFriendRecord(&buffer, friend, backend.runtimeNowMillis(self)) catch return;
+        store.put(deleted_friend_kind, id, record) catch {};
+        return;
+    }
+}
+
+/// 一条回收站记录：只留「这个人是谁 + 什么时候删的」。
+///
+/// 刻意**不**抄 `availability` / `gameStatus` 这类实时状态——它们在回收站里早就过期了，
+/// 留着只会让人以为「显示游戏中，其实根本没在线」。
+fn deletedFriendRecord(buffer: []u8, friend: std.json.Value, now_millis: i64) ![]const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    try writer.writeAll("{\"id\":");
+    try backend.jsonString(&writer, backend.jsonField(friend, "id"));
+    try writer.writeAll(",\"puuid\":");
+    try backend.jsonString(&writer, backend.jsonField(friend, "puuid"));
+    try writer.print(",\"summonerId\":{d},\"gameName\":", .{backend.jsonInt(friend, "summonerId")});
+    try backend.jsonString(&writer, if (backend.jsonField(friend, "gameName").len > 0) backend.jsonField(friend, "gameName") else backend.jsonField(friend, "name"));
+    try writer.writeAll(",\"gameTag\":");
+    try backend.jsonString(&writer, backend.jsonField(friend, "gameTag"));
+    try writer.print(",\"icon\":{d},\"groupId\":{d},\"deletedAt\":", .{ backend.jsonInt(friend, "icon"), backend.jsonInt(friend, "groupId") });
+    try backend.writeIsoTimestamp(&writer, now_millis);
+    try writer.writeByte('}');
+    return writer.buffered();
+}
+
+/// `lol.get_deleted_friends` —— 回收站内容（本地存档，不需要客户端在线）。
+pub fn getDeletedFriends(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = backend.runtime(context);
+    _ = invocation;
+    const empty = "{\"friends\":[]}";
+    const store = if (self.storage) |*value| value else return std.fmt.bufPrint(output, "{s}", .{empty});
+    const entries = store.list(std.heap.page_allocator, deleted_friend_kind) catch return std.fmt.bufPrint(output, "{s}", .{empty});
+    defer storage.Store.freeEntries(std.heap.page_allocator, entries);
+    var writer = std.Io.Writer.fixed(output);
+    try writer.writeAll("{\"friends\":[");
+    var first = true;
+    for (entries) |entry| {
+        if (!first and writer.buffered().len + entry.value.len + 3 > output.len) break;
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.writeAll(entry.value);
+    }
+    try writer.writeAll("]}");
+    return writer.buffered();
+}
+
+/// `lol.restore_friend` —— 回收站里的动作，两种语义由 `addBack` 决定：
+///
+/// - `addBack = false`：只把这条存档划掉（「我确认不要了」），不动客户端。
+/// - `addBack = true`：先向对方发一条好友申请，成功后再划掉存档。
+///
+/// ⚠️ 这是**发好友申请**（`POST /lol-chat/v2/friend-requests`，body 抄 AK 的
+/// `ChatHttpApi.friendRequests`：`{gameName, tagLine, gameTag}`），**不是**直接恢复好友关系。
+/// 删除是单方面的，加回来必须对方同意；失败时存档保留，可以再试。
+pub fn restoreFriend(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    const self = backend.runtime(context);
+    const parsed = backend.parsePayload(struct { id: []const u8 = "", add_back: bool = false }, invocation.request.payload) catch return error.InvalidRequest;
+    defer parsed.deinit();
+    const id = parsed.value.id;
+    if (id.len == 0) return error.InvalidRequest;
+    const store = if (self.storage) |*value| value else return error.StorageUnavailable;
+    const stored = (store.get(deleted_friend_kind, id) catch null) orelse return error.FriendNotArchived;
+    defer std.heap.page_allocator.free(stored);
+
+    if (!parsed.value.add_back) {
+        store.remove(deleted_friend_kind, id) catch return error.QueryFailed;
+        return restoreResult(output, true, "", false, "", "");
+    }
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const record = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), stored, .{}) catch return error.LcuInvalidResponse;
+    const game_name = backend.jsonField(record, "gameName");
+    const game_tag = backend.jsonField(record, "gameTag");
+    if (game_name.len == 0) return restoreResult(output, false, "这条存档里没有名字，无法发送好友申请", false, "", "");
+
+    if (self.mode != .live) return restoreResult(output, false, "没连上客户端", false, game_name, game_tag);
+    const io = self.io orelse return restoreResult(output, false, "没连上客户端", false, game_name, game_tag);
+    var client = backend.discoverClient(self, io) catch return restoreResult(output, false, "没连上客户端", false, game_name, game_tag);
+    defer client.deinit();
+    var body_buffer: [1024]u8 = undefined;
+    const body = friendRequestBody(&body_buffer, game_name, game_tag) catch return restoreResult(output, false, "名字过长", false, game_name, game_tag);
+    const response = client.post("/lol-chat/v2/friend-requests", body) catch
+        return restoreResult(output, false, "客户端拒绝了这条好友申请（可能对方已经是好友，或名字里有特殊字符）", false, game_name, game_tag);
+    std.heap.page_allocator.free(response);
+    store.remove(deleted_friend_kind, id) catch {};
+    return restoreResult(output, true, "", true, game_name, game_tag);
+}
+
+/// 好友申请请求体。字段名对齐 AK 的 `ChatHttpApi.friendRequests`：
+/// `tagLine` 与 `gameTag` 是同一个值的两个名字，两个都要给。
+fn friendRequestBody(buffer: []u8, game_name: []const u8, tag_line: []const u8) ![]const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    try writer.writeAll("{\"gameName\":");
+    try backend.jsonString(&writer, game_name);
+    try writer.writeAll(",\"tagLine\":");
+    try backend.jsonString(&writer, tag_line);
+    try writer.writeAll(",\"gameTag\":");
+    try backend.jsonString(&writer, tag_line);
+    try writer.writeByte('}');
+    return writer.buffered();
+}
+
+fn restoreResult(output: []u8, ok: bool, reason: []const u8, added: bool, game_name: []const u8, game_tag: []const u8) ![]const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    try writer.print("{{\"ok\":{s},\"reason\":", .{if (ok) "true" else "false"});
+    try backend.jsonString(&writer, reason);
+    try writer.print(",\"added\":{s},\"gameName\":", .{if (added) "true" else "false"});
+    try backend.jsonString(&writer, game_name);
+    try writer.writeAll(",\"gameTag\":");
+    try backend.jsonString(&writer, game_tag);
+    try writer.writeByte('}');
+    return writer.buffered();
 }
 
 /// 一次批量最多删多少个。好友列表本身是几百的量级，给上限免得单个请求把界面卡住
@@ -198,6 +350,9 @@ pub fn deleteFriends(context: *anyopaque, invocation: native_sdk.bridge.Invocati
     const io = self.io orelse return error.LcuNotRunning;
     var client = backend.discoverClient(self, io) catch return error.LcuNotRunning;
     defer client.deinit();
+    // 整批只取一次好友列表，删之前取（删完这批记录就没了）。存档失败不影响删除。
+    const friends_json = client.get("/lol-chat/v1/friends") catch null;
+    defer if (friends_json) |value| std.heap.page_allocator.free(value);
     try backend.verifyActionAccount(self, client);
     var writer = std.Io.Writer.fixed(output);
     try writer.writeAll("{\"results\":[");
@@ -224,6 +379,7 @@ pub fn deleteFriends(context: *anyopaque, invocation: native_sdk.bridge.Invocati
             continue;
         };
         std.heap.page_allocator.free(response);
+        archiveDeletedFriend(self, friends_json, id);
         writeDeleteResult(&writer, &first, id, true, "");
         deleted += 1;
     }
@@ -233,40 +389,120 @@ pub fn deleteFriends(context: *anyopaque, invocation: native_sdk.bridge.Invocati
 
 /// `lol.spectate` —— 观战。
 ///
-/// 本地只有一条路：`POST /lol-spectator/v1/spectate/launch`，body 形如
-/// `{"puuid":..,"spectatorKey":..}`（对齐 AK `SpectatorHttpApi.launchSpectator`，
-/// 路径和字段名都别改）。
+/// `POST /lol-spectator/v1/spectate/launch`，两条路线，**先试已证实可用的好友路线**：
 ///
-/// **`spectatorKey` 不是随时都有**：它挂在好友对象的 `lol.spectatorKey` 上，
-/// 客户端只在好友「在线且正在游戏」时才下发（AK 的 `isFriendSpectatable` 还额外要求
-/// `availability === "dnd"`）。所以「历史里遇到的玩家」「已经下线的朋友」基本都拿不到 key，
-/// 这里就直说「观战不可用」，而不是硬发一个没有 key 的请求让客户端报错。
+/// 1. **好友路线**：body `{"puuid":..,"spectatorKey":..}`（对齐 AK
+///    `SpectatorHttpApi.launchSpectator`，路径与字段名都别改）。`spectatorKey` 挂在
+///    好友对象的 `lol.spectatorKey` 上，客户端只在好友「在线且正在游戏」时才下发
+///    （AK 的 `isFriendSpectatable` 还额外要求 `availability === "dnd"`）。
+/// 2. **观察者模式**：body 不带 `spectatorKey`，只给 `allowObserveMode: "ALL"`。
+///    非好友、或好友不在局内时走这条——这正是「只输一个 ID 就能观战」的由来。
+///    能否生效取决于对方是否允许被观战 + 区服策略，失败时按普通错误回报。
+///
+/// 入参二选一：`query`（`名字#标签`，先解析成 puuid）或 `puuid`（直接给）。
 pub fn spectate(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = backend.runtime(context);
-    const parsed = backend.parsePayload(struct { puuid: []const u8 = "" }, invocation.request.payload) catch return error.InvalidRequest;
+    const parsed = backend.parsePayload(struct { puuid: []const u8 = "", query: []const u8 = "" }, invocation.request.payload) catch return error.InvalidRequest;
     defer parsed.deinit();
-    const puuid = parsed.value.puuid;
-    if (puuid.len == 0) return error.InvalidRequest;
-    if (self.mode != .live) return spectateResult(output, false, "没连上客户端");
-    const io = self.io orelse return spectateResult(output, false, "没连上客户端");
-    var client = backend.discoverClient(self, io) catch return spectateResult(output, false, "没连上客户端");
+    const query = std.mem.trim(u8, parsed.value.query, " \t\r\n");
+    if (parsed.value.puuid.len == 0 and query.len == 0) return error.InvalidRequest;
+    if (self.mode != .live) return spectateResult(output, false, "没连上客户端", "");
+    const io = self.io orelse return spectateResult(output, false, "没连上客户端", "");
+    var client = backend.discoverClient(self, io) catch return spectateResult(output, false, "没连上客户端", "");
     defer client.deinit();
-    const friends_json = client.get("/lol-chat/v1/friends") catch return spectateResult(output, false, "读不到好友列表");
-    defer std.heap.page_allocator.free(friends_json);
+
+    // 给了 `名字#标签` 就先在本大区解析成 puuid；直接给了 puuid 就跳过。
+    var puuid_buffer: [256]u8 = undefined;
+    const puuid = if (parsed.value.puuid.len > 0)
+        parsed.value.puuid
+    else
+        resolveSummonerPuuid(client, query, &puuid_buffer) catch
+            return spectateResult(output, false, "没找到这位召唤师：需要完整的「名字#标签」，且只能解析当前大区的玩家", "");
+
+    const friends_json = client.get("/lol-chat/v1/friends") catch null;
+    defer if (friends_json) |value| std.heap.page_allocator.free(value);
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    const friends = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), friends_json, .{}) catch
-        return spectateResult(output, false, "好友列表格式不认识");
-    const spectator_key = switch (spectatorKeyFor(friends, puuid)) {
-        .key => |value| value,
-        .no_key => return spectateResult(output, false, "这位好友现在不在选人也不在对局中，拿不到观战密钥"),
-        .not_friend => return spectateResult(output, false, "只能观战好友，这位不在好友列表里"),
-    };
+    const friends = if (friends_json) |value|
+        std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), value, .{}) catch std.json.Value{ .null = {} }
+    else
+        std.json.Value{ .null = {} };
+
     var body_buffer: [1024]u8 = undefined;
-    const body = launchBody(&body_buffer, puuid, spectator_key) catch return spectateResult(output, false, "观战密钥过长");
-    const response = client.post("/lol-spectator/v1/spectate/launch", body) catch return spectateResult(output, false, "客户端拒绝了观战请求");
+    switch (spectatorKeyFor(friends, puuid)) {
+        // 好友且拿到了密钥 → 走这条（行为与改造前一致，是已验证能用的路线）。
+        .key => |value| {
+            const body = launchBody(&body_buffer, puuid, value) catch return spectateResult(output, false, "观战密钥过长", "");
+            const response = client.post("/lol-spectator/v1/spectate/launch", body) catch
+                return spectateResult(output, false, "客户端拒绝了观战请求", "");
+            std.heap.page_allocator.free(response);
+            return spectateResult(output, true, "", "buddy");
+        },
+        // 非好友，或好友但没密钥（在挂机/没在局内）→ 落到观察者模式再试一次。
+        .no_key, .not_friend => {},
+    }
+
+    const observe_body = observeLaunchBody(&body_buffer, puuid) catch return spectateResult(output, false, "玩家标识过长", "");
+    const rejected_reason = if (spectatorKeyFor(friends, puuid) == .no_key)
+        "观察者模式未生效：这位好友现在不在对局中"
+    else
+        "观察者模式未生效：对方可能不在对局中，或未允许被观战";
+    const response = client.post("/lol-spectator/v1/spectate/launch", observe_body) catch
+        return spectateResult(output, false, rejected_reason, "observe");
     std.heap.page_allocator.free(response);
-    return spectateResult(output, true, "");
+    return spectateResult(output, true, "", "observe");
+}
+
+/// 把 `名字#标签` 解析成 puuid（**只在当前大区**，本地没有跨区索引）。
+///
+/// ⚠️ LCU 的 `summoners?name=` 遇到解析不了的输入**会忽略参数、直接返回当前登录账号**，
+/// 所以拿到结果后必须把 `gameName` / `tagLine` 跟原始查询比对一次，
+/// 不匹配就当作「查无此人」——否则会把「搜不到」误判成「就是你自己」。
+fn resolveSummonerPuuid(client: lcu.Client, query: []const u8, output: []u8) ![]const u8 {
+    var encoded_buffer: [1536]u8 = undefined;
+    const encoded = try backend.percentEncodeQuery(query, &encoded_buffer);
+    var path_buffer: [1792]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "/lol-summoner/v1/summoners?name={s}", .{encoded});
+    const response = try client.get(path);
+    defer std.heap.page_allocator.free(response);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), response, .{}) catch return error.LcuInvalidResponse;
+    const summoner = if (root == .array and root.array.items.len > 0) root.array.items[0] else root;
+    if (summoner != .object) return error.SummonerNotFound;
+    const game_name = backend.jsonField(summoner, "gameName");
+    if (game_name.len == 0) return error.SummonerNotFound;
+    const tag_line = backend.jsonField(summoner, "tagLine");
+    // 没给标签时（`名字` 直接查）只比名字，够用且不会误伤。
+    const wants_tag = std.mem.indexOfScalar(u8, query, '#') != null;
+    if (!std.ascii.eqlIgnoreCase(game_name, gameNamePart(query))) return error.SummonerNotFound;
+    if (wants_tag and !std.ascii.eqlIgnoreCase(tag_line, tagLinePart(query))) return error.SummonerNotFound;
+    const puuid = backend.jsonField(summoner, "puuid");
+    if (puuid.len == 0 or puuid.len > output.len) return error.SummonerNotFound;
+    @memcpy(output[0..puuid.len], puuid);
+    return output[0..puuid.len];
+}
+
+fn gameNamePart(query: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, query, '#')) |index| return std.mem.trim(u8, query[0..index], " \t");
+    return std.mem.trim(u8, query, " \t");
+}
+
+fn tagLinePart(query: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, query, '#')) |index| return std.mem.trim(u8, query[index + 1 ..], " \t");
+    return "";
+}
+
+/// 观察者模式的启动体：**不带 `spectatorKey`**，所以不要求对方是好友。
+///
+/// 取自开源项目 `mayiflex/LeagueSpectator`（C#，按「名字#标签」观战）：
+/// `{"allowObserveMode":"ALL","dropInSpectateGameId":"","gameQueueType":"","puuid":...}`。
+fn observeLaunchBody(buffer: []u8, puuid: []const u8) ![]const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    try writer.writeAll("{\"allowObserveMode\":\"ALL\",\"dropInSpectateGameId\":\"\",\"gameQueueType\":\"\",\"puuid\":");
+    try backend.jsonString(&writer, puuid);
+    try writer.writeByte('}');
+    return writer.buffered();
 }
 
 const SpectateLookup = union(enum) {
@@ -310,10 +546,14 @@ fn launchBody(buffer: []u8, puuid: []const u8, spectator_key: []const u8) ![]con
     return writer.buffered();
 }
 
-fn spectateResult(output: []u8, ok: bool, reason: []const u8) ![]const u8 {
+/// `route` 告诉界面这次是哪条路成功的：`"buddy"`（好友密钥）/ `"observe"`（观察者模式）/
+/// `""`（失败时无意义）。界面用它给一句「走的是观察者模式」之类的提示。
+fn spectateResult(output: []u8, ok: bool, reason: []const u8, route: []const u8) ![]const u8 {
     var writer = std.Io.Writer.fixed(output);
     try writer.print("{{\"ok\":{s},\"reason\":", .{if (ok) "true" else "false"});
     try backend.jsonString(&writer, reason);
+    try writer.writeAll(",\"route\":");
+    try backend.jsonString(&writer, route);
     try writer.writeByte('}');
     return writer.buffered();
 }
@@ -351,6 +591,44 @@ test "观战启动请求体与 AK 一致" {
     var buffer: [256]u8 = undefined;
     const body = try launchBody(&buffer, "puuid-1", "key-1");
     try std.testing.expectEqualStrings("{\"puuid\":\"puuid-1\",\"spectatorKey\":\"key-1\"}", body);
+}
+
+test "观察者模式启动体不带 spectatorKey，字段与 LeagueSpectator 一致" {
+    var buffer: [256]u8 = undefined;
+    const body = try observeLaunchBody(&buffer, "puuid-2");
+    try std.testing.expectEqualStrings(
+        "{\"allowObserveMode\":\"ALL\",\"dropInSpectateGameId\":\"\",\"gameQueueType\":\"\",\"puuid\":\"puuid-2\"}",
+        body,
+    );
+    // 这是它和好友路线的唯一区别：没有密钥，所以不要求对方是好友。
+    try std.testing.expect(std.mem.indexOf(u8, body, "spectatorKey") == null);
+}
+
+test "名字#标签 按第一个 # 切分，缺标签时只认名字" {
+    try std.testing.expectEqualStrings("张三", gameNamePart("张三#CN1"));
+    try std.testing.expectEqualStrings("CN1", tagLinePart("张三#CN1"));
+    // 名字里带空格要保留首尾裁剪后的内容
+    try std.testing.expectEqualStrings("Long Name", gameNamePart(" Long Name #TAG "));
+    try std.testing.expectEqualStrings("TAG", tagLinePart(" Long Name #TAG "));
+    // 只给名字：标签为空 → 调用方据此跳过标签比对
+    try std.testing.expectEqualStrings("张三", gameNamePart("张三"));
+    try std.testing.expectEqualStrings("", tagLinePart("张三"));
+    // 名字本身含 # 时只按第一个切（Riot ID 不允许，但别静默出错）
+    try std.testing.expectEqualStrings("a", gameNamePart("a#b#c"));
+    try std.testing.expectEqualStrings("b#c", tagLinePart("a#b#c"));
+}
+
+test "观战结果带上走的哪条路线" {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"ok\":true,\"reason\":\"\",\"route\":\"observe\"}",
+        try spectateResult(&buffer, true, "", "observe"),
+    );
+    var buffer2: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"reason\":\"没连上客户端\",\"route\":\"\"}",
+        try spectateResult(&buffer2, false, "没连上客户端", ""),
+    );
 }
 
 test "批量删除逐条回报，失败的带上原因" {
@@ -403,4 +681,91 @@ test "extracts the latest friend match timestamp" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("friend-puuid", parsed.value.object.get("puuid").?.string);
     try std.testing.expectEqualStrings("2021-07-01T17:11:13.123Z", parsed.value.object.get("lastGameAt").?.string);
+}
+
+test "回收站记录只留身份与删除时间，不抄实时状态" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const friend = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"id":"fid-1","puuid":"puuid-1","summonerId":42,"gameName":"张三","gameTag":"CN1","icon":3494,
+        \\ "groupId":7,"availability":"dnd","lol":{"gameStatus":"ingame","spectatorKey":"KEY"}}
+    , .{});
+    var buffer: [512]u8 = undefined;
+    const record = try deletedFriendRecord(&buffer, friend, 1625159473123);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, record, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("张三", parsed.value.object.get("gameName").?.string);
+    try std.testing.expectEqualStrings("CN1", parsed.value.object.get("gameTag").?.string);
+    try std.testing.expectEqual(@as(i64, 3494), parsed.value.object.get("icon").?.integer);
+    try std.testing.expectEqualStrings("2021-07-01T17:11:13.123Z", parsed.value.object.get("deletedAt").?.string);
+    // 实时状态不该进存档：它明天就是错的。
+    try std.testing.expect(parsed.value.object.get("availability") == null);
+    try std.testing.expect(parsed.value.object.get("gameStatus") == null);
+}
+
+test "好友申请请求体与 AK 的 ChatHttpApi.friendRequests 一致" {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"gameName\":\"张三\",\"tagLine\":\"CN1\",\"gameTag\":\"CN1\"}",
+        try friendRequestBody(&buffer, "张三", "CN1"),
+    );
+    // 名字里有引号/反斜杠时必须转义，否则客户端会 400。
+    var quoted: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"gameName\":\"a\\\"b\",\"tagLine\":\"T\",\"gameTag\":\"T\"}",
+        try friendRequestBody(&quoted, "a\"b", "T"),
+    );
+}
+
+test "回收站：写入后能列出、能单条移除，且只影响被删的那条" {
+    var state = backend.Runtime.init();
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, ":memory:");
+    defer store.deinit();
+    state.storage = store;
+    defer state.storage = null;
+
+    const friends =
+        \\[{"id":"fid-1","puuid":"puuid-1","summonerId":41,"gameName":"甲","gameTag":"CN1","icon":1,"groupId":7},
+        \\ {"id":"fid-2","puuid":"puuid-2","summonerId":42,"gameName":"乙","gameTag":"CN2","icon":2,"groupId":7}]
+    ;
+    archiveDeletedFriend(&state, friends, "fid-1");
+    archiveDeletedFriend(&state, friends, "fid-2");
+    // 名单里没有的 id 不该凭空造出记录。
+    archiveDeletedFriend(&state, friends, "fid-9");
+    archiveDeletedFriend(&state, null, "fid-1");
+
+    var output: [2048]u8 = undefined;
+    const listed = try getDeletedFriends(&state, undefined, &output);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, listed, .{});
+    defer parsed.deinit();
+    const items = parsed.value.object.get("friends").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+
+    try store.remove(deleted_friend_kind, "fid-1");
+    var second_output: [2048]u8 = undefined;
+    const after = try getDeletedFriends(&state, undefined, &second_output);
+    const after_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, after, .{});
+    defer after_parsed.deinit();
+    const remaining = after_parsed.value.object.get("friends").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), remaining.len);
+    try std.testing.expectEqualStrings("乙", remaining[0].object.get("gameName").?.string);
+}
+
+test "回收站：没有本地库时回空列表而不是报错" {
+    var state = backend.Runtime.init();
+    var output: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("{\"friends\":[]}", try getDeletedFriends(&state, undefined, &output));
+}
+
+test "恢复结果 DTO 带上名字与是否真的发出了好友申请" {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"ok\":true,\"reason\":\"\",\"added\":true,\"gameName\":\"甲\",\"gameTag\":\"CN1\"}",
+        try restoreResult(&buffer, true, "", true, "甲", "CN1"),
+    );
+    var buffer2: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"reason\":\"没连上客户端\",\"added\":false,\"gameName\":\"甲\",\"gameTag\":\"CN1\"}",
+        try restoreResult(&buffer2, false, "没连上客户端", false, "甲", "CN1"),
+    );
 }

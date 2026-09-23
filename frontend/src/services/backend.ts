@@ -15,7 +15,10 @@ import type {
   ClaimOutcome,
   ClaimSnapshot,
   ClaimSource,
+  ClientInstallations,
+  ClientLaunchResult,
   DataMode,
+  DeletedFriendsSnapshot,
   EncounterRecord,
   FinalBpRecord,
   FriendDeleteOutcome,
@@ -25,6 +28,8 @@ import type {
   JunglePathMap,
   LiveLobby,
   MatchSummary,
+  MatchTimeline,
+  RestoreFriendResult,
   ShortcutValidation,
   SpectateResult,
   SummonerSearchResult,
@@ -180,8 +185,18 @@ export const backend = {
       gameIds: ids,
     });
   },
-  async asset(kind: "champion" | "item" | "spell" | "perk" | "profile", id: number): Promise<AssetPayload> {
-    if (usesFixtureData()) throw new Error("Fixture 使用静态资源");
+  /**
+   * 一局的分钟帧 + 关键事件（经济曲线、野怪、掉塔）。
+   *
+   * 和 `junglePath` 同源（都读 LCU 的 `game-timelines`），但返回的是整场的宏观走势。
+   * 逐帧数据打完就不变，后端有 `matchTimeline` 落盘缓存，重复进入同一局不会重复联网。
+   */
+  async matchTimeline(gameId: number, selfPuuid = ""): Promise<MatchTimeline | null> {
+    if (!Number.isFinite(gameId) || gameId <= 0) return null;
+    if (usesFixtureData()) return browserBackend.matchTimeline(gameId);
+    return command<MatchTimeline | null>("get_match_timeline", { gameId, selfPuuid: selfPuuid?.trim() ?? "" });
+  },
+  async asset(kind: "champion" | "item" | "spell" | "perk" | "profile", id: number): Promise<AssetPayload> {    if (usesFixtureData()) throw new Error("Fixture 使用静态资源");
     const key = `${kind}:${id}`;
     const cached = assetRequests.get(key);
     if (cached) return cached;
@@ -269,16 +284,71 @@ export const backend = {
     return command("delete_friends", { ids: targets });
   },
   /**
-   * 观战。
+   * 回收站：被删好友的本地存档。
    *
-   * 只有「在线且正在对局中」的好友拿得到观战密钥，其余情况后端会返回
-   * `ok: false` 与一句能直接展示的原因——所以调用方**不要**把它当成异常来处理。
+   * 完全来自本地库，所以**客户端没开也能看**——这正是它作为「后悔药」的意义。
+   */
+  async deletedFriends(): Promise<DeletedFriendsSnapshot> {
+    if (!isTauri()) return browserBackend.deletedFriends();
+    return command("get_deleted_friends");
+  },
+  /**
+   * 回收站里的动作。
+   *
+   * `addBack = false` 只划掉存档；`addBack = true` 会**向对方发一条好友申请**
+   * （客户端只有这一个入口，加回来需要对方同意），成功后才划掉存档。
+   */
+  async restoreFriend(id: string, addBack = false): Promise<RestoreFriendResult> {
+    const target = id?.trim() ?? "";
+    if (!target) throw new Error("缺少好友 id");
+    if (usesFixtureData()) return browserBackend.restoreFriend(target, addBack);
+    return command("restore_friend", { id: target, add_back: addBack });
+  },
+  /**
+   * 观战（按 puuid）。
+   *
+   * 后端会先试**好友路线**（用客户端下发的 `spectatorKey`）；拿不到密钥
+   * （非好友、或对方不在局内）就自动落到**观察者模式**——那条路不带密钥，
+   * 所以不要求对方是好友。失败时返回 `ok: false` 与一句能直接展示的原因，
+   * 调用方**不要**把它当成异常来处理。
    */
   async spectate(puuid: string): Promise<SpectateResult> {
     const target = puuid?.trim() ?? "";
     if (!target) throw new Error("缺少玩家标识，无法观战");
     if (usesFixtureData()) return browserBackend.spectate(target);
-    return command("spectate", { puuid: target });
+    return command("spectate", { puuid: target, query: "" });
+  },
+  /**
+   * 观战（按「名字#标签」）。
+   *
+   * 后端先在**当前大区**把 Riot ID 解析成 puuid，再走上面同一条观战链路。
+   * 本地没有跨区索引，所以只解析得到当前大区的玩家。
+   */
+  async spectateById(query: string): Promise<SpectateResult> {
+    const target = query?.trim() ?? "";
+    if (!target) throw new Error("缺少玩家标识，无法观战");
+    if (usesFixtureData()) return browserBackend.spectateById(target);
+    return command("spectate", { puuid: "", query: target });
+  },
+  /**
+   * 本机能一键启动的客户端入口。
+   *
+   * 探测完全在原生侧做（读 Riot 安装清单 + 扫盘），前端只拿结果。返回空数组表示
+   * 这台机器上没找到任何入口。
+   */
+  async clientInstallations(): Promise<ClientInstallations> {
+    if (usesFixtureData()) return browserBackend.clientInstallations();
+    return command("get_client_installations");
+  },
+  /**
+   * 启动客户端。
+   *
+   * `id` 为空表示「按探测顺序挑第一个」。**路径一律由后端现场重新探测**，前端不传
+   * 路径——否则这个命令就成了拉任意 exe 的口子。
+   */
+  async launchClient(id = ""): Promise<ClientLaunchResult> {
+    if (usesFixtureData()) return browserBackend.launchClient(id);
+    return command("launch_client", { id: id.trim() });
   },
   /** 当前能领的东西（只读）。`total === 0` 表示没有可领的。 */
   async claims(): Promise<ClaimSnapshot> {

@@ -116,6 +116,13 @@
         ]
       },
       {
+        "name": "lol.get_match_timeline",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
         "name": "lol.search_summoner",
         "origins": [
           "zero://app",
@@ -159,6 +166,20 @@
       },
       {
         "name": "lol.delete_friend",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_deleted_friends",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.restore_friend",
         "origins": [
           "zero://app",
           "http://127.0.0.1:49173"
@@ -278,6 +299,20 @@
       },
       {
         "name": "lol.spectate",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.get_client_installations",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
+        "name": "lol.launch_client",
         "origins": [
           "zero://app",
           "http://127.0.0.1:49173"

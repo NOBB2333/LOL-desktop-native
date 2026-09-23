@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import { Eye, RefreshCw, Search, Trash2, UserRound } from "@lucide/vue";
+import { Eye, History, RefreshCw, RotateCcw, Search, Trash2, UserRound } from "@lucide/vue";
 import { NButton, NCheckbox, NInput, NPopconfirm, useMessage } from "naive-ui";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import AssetIcon from "../components/AssetIcon.vue";
 import PageHeader from "../components/PageHeader.vue";
 import { backend, isTauri } from "../services/backend";
 import { useAppStore } from "../stores/app";
-import type { FriendRecord, FriendToolsSnapshot } from "../types/domain";
-import { relativeTime, shortDate } from "../utils/format";
+import type { DeletedFriendRecord, FriendRecord, FriendToolsSnapshot, SpectateResult } from "../types/domain";
+import { profileIconId, profileIconImage, relativeTime, shortDate } from "../utils/format";
 
 const app = useAppStore();
 const message = useMessage();
@@ -15,8 +15,14 @@ const data = ref<FriendToolsSnapshot>({ groups: [], friends: [] });
 const loading = ref(false);
 const deleting = ref(false);
 const spectating = ref<string | null>(null);
+const spectateQuery = ref("");
+const spectatingById = ref(false);
 const search = ref("");
 const selected = ref<string[]>([]);
+/** 回收站（被删好友的本地存档）。删之前后端会把记录抄一份到本地库，这里读的就是它。 */
+const deleted = ref<DeletedFriendRecord[]>([]);
+const binLoading = ref(false);
+const restoring = ref<string | null>(null);
 let loadGeneration = 0;
 let friendEventTimer: ReturnType<typeof setTimeout> | null = null;
 let stopLcuEventListener: (() => void) | null = null;
@@ -42,6 +48,8 @@ const groupedFriends = computed(() => {
 const selectedCount = computed(() => selected.value.length);
 /** 现在真的能观战的好友有几位的依据是后端的 `canSpectate`，不是我们自己猜 `availability`。 */
 const spectatableCount = computed(() => data.value.friends.filter((friend) => friend.canSpectate).length);
+/** 观战必须走 LCU，所以「原生宿主 + 客户端在线」两个条件缺一不可（与刷新按钮同一口径）。 */
+const spectateUnavailable = computed(() => app.mode === "live" && app.connection.status !== "connected");
 const allVisibleSelected = computed(() => visibleFriends.value.length > 0 && visibleFriends.value.every((friend) => selected.value.includes(friend.id)));
 
 function updateSelection(id: string, checked: boolean) {
@@ -105,8 +113,10 @@ async function deleteSelected() {
       const names = failures.slice(0, 3).map((entry) => nameOf(entry.id)).join("、");
       message.warning(`已删除 ${outcome.deleted} 位，${failures.length} 位没删掉：${names}`);
     } else {
-      message.success(`已删除 ${outcome.deleted} 位好友`);
+      // 说清楚「还在回收站里」，否则删完会以为回不来了。
+      message.success(`已删除 ${outcome.deleted} 位好友，记录留在页面底部的回收站里`);
     }
+    void loadDeleted();
   } catch (cause) {
     message.error(cause instanceof Error ? cause.message : String(cause));
   } finally {
@@ -114,18 +124,57 @@ async function deleteSelected() {
   }
 }
 
+/** 读回收站。纯本地存档，客户端没开也能看。 */
+async function loadDeleted() {
+  binLoading.value = true;
+  try {
+    deleted.value = (await backend.deletedFriends()).friends;
+  } catch (cause) {
+    message.error(cause instanceof Error ? cause.message : String(cause));
+  } finally {
+    binLoading.value = false;
+  }
+}
+
+/**
+ * 回收站里的两个动作。
+ *
+ * `addBack = true` 走的是**发好友申请**（客户端没有「直接把好友加回来」这种接口），
+ * 所以成功不等于好友回来了，必须说清楚需要对方同意——这就是「后悔药」的真实边界。
+ */
+async function restore(record: DeletedFriendRecord, addBack: boolean) {
+  if (restoring.value) return;
+  restoring.value = record.id;
+  try {
+    const result = await backend.restoreFriend(record.id, addBack);
+    if (result.ok) {
+      deleted.value = deleted.value.filter((item) => item.id !== record.id);
+      const who = `${result.gameName || record.gameName}#${result.gameTag || record.gameTag}`;
+      message.success(result.added ? `已向 ${who} 发送好友申请，需要对方同意才能加回` : `已从回收站移除 ${who} 的记录`);
+    } else {
+      message.warning(result.reason || "没能完成这个操作");
+    }
+  } catch (cause) {
+    message.error(cause instanceof Error ? cause.message : String(cause));
+  } finally {
+    restoring.value = null;
+  }
+}
+
 /**
  * 观战。
  *
- * 观战密钥由客户端临时下发，只有「在线且正在对局中」的好友才有，所以这里
- * **不**把它当成一个必成功的动作：成功/失败都用后端的 `reason` 告诉用户。
+ * 后端会先试**好友路线**（客户端临时下发的观战密钥，只有「在线且正在对局中」的
+ * 好友才有），拿不到密钥就自动落到**观察者模式**——那条路不带密钥，所以
+ * 不要求对方是好友。这里**不**把它当成一个必成功的动作：成功/失败都用后端的
+ * `reason` 告诉用户，成功时顺带说明走的是哪条路线。
  */
 async function spectate(friend: FriendRecord) {
   if (spectating.value) return;
   spectating.value = friend.puuid;
   try {
     const result = await backend.spectate(friend.puuid);
-    if (result.ok) message.success(`正在启动观战：${friend.gameName}`);
+    if (result.ok) message.success(spectateSuccessText(friend.gameName, result.route));
     else message.warning(result.reason);
   } catch (cause) {
     message.error(cause instanceof Error ? cause.message : String(cause));
@@ -134,8 +183,40 @@ async function spectate(friend: FriendRecord) {
   }
 }
 
+/**
+ * 按「名字#标签」观战任意玩家。
+ *
+ * 与列表里的观战按钮共用同一条后端链路，区别只是多了一步「先在本大区把 Riot ID
+ * 解析成 puuid」。本地没有跨区索引，所以只解析得到当前大区的玩家。
+ */
+async function spectateById() {
+  const query = spectateQuery.value.trim();
+  if (!query || spectatingById.value) return;
+  spectatingById.value = true;
+  try {
+    const result = await backend.spectateById(query);
+    if (result.ok) message.success(spectateSuccessText(gameNamePart(query), result.route));
+    else message.warning(result.reason);
+  } catch (cause) {
+    message.error(cause instanceof Error ? cause.message : String(cause));
+  } finally {
+    spectatingById.value = false;
+  }
+}
+
+/** 只取 `名字#标签` 里的名字部分，用来拼提示文案。 */
+function gameNamePart(query: string) {
+  const index = query.indexOf("#");
+  return (index >= 0 ? query.slice(0, index) : query).trim();
+}
+
+function spectateSuccessText(name: string, route?: SpectateResult["route"]) {
+  return route === "observe" ? `正在用观察者模式启动观战：${name}` : `正在启动观战：${name}`;
+}
+
 onMounted(() => {
   void refresh();
+  void loadDeleted();
   if (!isTauri()) return;
   const onLcuEvent = (rawEvent: Event) => {
     const uri = (rawEvent as CustomEvent<{ uri?: string }>).detail?.uri ?? "";
@@ -163,11 +244,30 @@ onBeforeUnmount(() => {
     </PageHeader>
 
     <section class="friends-toolbar">
-      <NInput v-model:value="search" clearable size="small" placeholder="搜索好友名称或标签"><template #prefix><Search :size="14" /></template></NInput>
-      <NPopconfirm :disabled="!selectedCount || deleting" positive-text="删除" negative-text="取消" @positive-click="deleteSelected">
-        <template #trigger><NButton size="small" type="error" secondary :disabled="!selectedCount || deleting"><template #icon><Trash2 :size="14" /></template>{{ selectedCount ? `删除 (${selectedCount})` : "删除" }}</NButton></template>
-        将从 League 客户端删除选中的好友，此操作不可恢复。
-      </NPopconfirm>
+      <div class="friends-toolbar-row">
+        <NInput v-model:value="search" clearable size="small" placeholder="搜索好友名称或标签"><template #prefix><Search :size="14" /></template></NInput>
+        <NPopconfirm :disabled="!selectedCount || deleting" positive-text="删除" negative-text="取消" @positive-click="deleteSelected">
+          <template #trigger><NButton size="small" type="error" secondary :disabled="!selectedCount || deleting"><template #icon><Trash2 :size="14" /></template>{{ selectedCount ? `删除 (${selectedCount})` : "删除" }}</NButton></template>
+          将从 League 客户端删除选中的好友。客户端侧不可撤销，但本地会留一份记录放进下方回收站，可以据此重新发好友申请。
+        </NPopconfirm>
+      </div>
+      <!--
+        按 ID 观战。客户端里「观战」有两条路线：好友路线要 spectatorKey（只有对方
+        在线且正在对局时才由客户端下发），观察者模式则**不带密钥**。所以观战不必
+        被好友列表绑死——输入 Riot ID 就能看非好友。
+      -->
+      <div class="friends-toolbar-row friends-toolbar-row--spectate">
+        <NInput
+          v-model:value="spectateQuery"
+          clearable
+          size="small"
+          placeholder="名字#标签"
+          :disabled="spectateUnavailable"
+          @keyup.enter="spectateById"
+        ><template #prefix><Eye :size="14" /></template></NInput>
+        <NButton size="small" type="primary" secondary :loading="spectatingById" :disabled="!spectateQuery.trim() || spectatingById || spectateUnavailable" @click="spectateById">观战</NButton>
+        <small>不要求是好友；需要对方正在对局中且允许被观战，只能解析当前大区的玩家。</small>
+      </div>
     </section>
 
     <section class="friends-table" :class="{ loading }">
@@ -179,22 +279,63 @@ onBeforeUnmount(() => {
         <div class="friend-group"><UserRound :size="14" /><strong>{{ group.name }}</strong><span>{{ group.friends.length }}</span></div>
         <article v-for="friend in group.friends" :key="friend.id" class="friend-row">
           <NCheckbox :checked="selected.includes(friend.id)" @update:checked="updateSelection(friend.id, $event)" />
-          <div class="friend-identity"><AssetIcon kind="profile" :id="friend.icon" :name="friend.gameName" size="xs" /><span><strong>{{ friend.gameName }}</strong><small>#{{ friend.gameTag || "--" }}</small></span></div>
+          <div class="friend-identity"><AssetIcon kind="profile" :id="profileIconId(friend.icon)" :name="friend.gameName" :fallback-url="profileIconImage(friend.icon)" round size="sm" /><span><strong>{{ friend.gameName }}</strong><small>#{{ friend.gameTag || "--" }}</small></span></div>
           <span class="friend-presence" :data-state="friend.availability">{{ availabilityLabel[friend.availability] ?? friend.availability ?? "未知" }}</span>
           <time v-if="friend.lastGameAt" :datetime="friend.lastGameAt" :title="shortDate(friend.lastGameAt)"><strong>{{ shortDate(friend.lastGameAt) }}</strong><small>{{ relativeTime(friend.lastGameAt) }}</small></time><span v-else class="friend-empty">无对局数据</span>
           <time v-if="friend.friendsSince" :datetime="friend.friendsSince" :title="shortDate(friend.friendsSince)"><strong>{{ shortDate(friend.friendsSince) }}</strong><small>{{ relativeTime(friend.friendsSince) }}</small></time><span v-else class="friend-empty">未知</span>
-          <NButton size="tiny" secondary class="friend-spectate" :loading="spectating === friend.puuid" :disabled="!friend.canSpectate || Boolean(spectating)" :title="friend.canSpectate ? `观战 ${friend.gameName}` : '观战密钥只在好友正在对局时由客户端下发'" @click="spectate(friend)"><template #icon><Eye :size="13" /></template>观战</NButton>
+          <!--
+            列表里的按钮与上面「按 ID 观战」走的是同一套后端链路，所以**不**再用
+            `canSpectate` 把它禁掉：没有密钥只代表拿不到好友路线的密钥，观察者模式
+            仍然可能成功（例如对方在局内但状态不是「游戏中」）。失败的说明交给
+            后端返回的 `reason`。
+          -->
+          <NButton size="tiny" secondary class="friend-spectate" :loading="spectating === friend.puuid" :disabled="Boolean(spectating) || spectateUnavailable" :title="friend.canSpectate ? `观战 ${friend.gameName}` : `观战 ${friend.gameName}（对方不在局内时会改走观察者模式）`" @click="spectate(friend)"><template #icon><Eye :size="13" /></template>观战</NButton>
         </article>
       </template>
       <div v-if="!visibleFriends.length" class="friends-empty"><UserRound :size="22" /><strong>{{ search ? "没有匹配的好友" : loading ? "正在读取好友" : "好友列表为空" }}</strong></div>
     </section>
+
+    <!--
+      回收站。删除是不可逆的，所以后端在真正删之前会把**客户端当时那条记录**抄一份到
+      本地库（`friends_ipc.archiveDeletedFriend`），这里就是它的出口。
+
+      刻意放在列表**下面**并且默认收起：它是「手滑了来补救」的地方，不该和日常浏览
+      抢注意力。也刻意做得能离线用——存档在本地，客户端没开也看得见删过谁。
+    -->
+    <details class="friends-bin">
+      <summary>
+        <History :size="14" />
+        <strong>回收站</strong>
+        <span>{{ deleted.length }} 条</span>
+        <small>删除好友前会先把记录存到本地，删错了可以从这里发回好友申请</small>
+      </summary>
+      <div class="friends-bin__body" :class="{ loading: binLoading }">
+        <ul v-if="deleted.length">
+          <li v-for="record in deleted" :key="record.id">
+            <AssetIcon kind="profile" :id="profileIconId(record.icon)" :name="record.gameName" :fallback-url="profileIconImage(record.icon)" round size="sm" />
+            <span class="friends-bin__identity"><strong>{{ record.gameName }}<small>#{{ record.gameTag || "--" }}</small></strong><time v-if="record.deletedAt" :datetime="record.deletedAt" :title="shortDate(record.deletedAt)">删除于 {{ relativeTime(record.deletedAt) }}</time></span>
+            <NButton size="tiny" secondary :loading="restoring === record.id" :disabled="Boolean(restoring)" @click="restore(record, true)"><template #icon><RotateCcw :size="13" /></template>加回好友</NButton>
+            <NPopconfirm positive-text="移除" negative-text="取消" @positive-click="restore(record, false)">
+              <template #trigger><NButton size="tiny" quaternary :disabled="Boolean(restoring)" title="只删掉本地这条存档"><template #icon><Trash2 :size="13" /></template></NButton></template>
+              只删掉本地这条存档，客户端和好友关系都不受影响。确定吗？
+            </NPopconfirm>
+          </li>
+        </ul>
+        <p v-else class="friends-bin__empty">还没有删除记录。删掉的好友会自动存在这里。</p>
+      </div>
+    </details>
   </div>
 </template>
 
 <style scoped>
 .friends-page { max-width: 1240px; }
-.friends-toolbar { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border: 1px solid var(--line); border-bottom: 0; background: var(--surface-muted); }
-.friends-toolbar .n-input { width: min(360px, 100%); margin-right: auto; }
+.friends-toolbar { display: grid; gap: 8px; padding: 10px 12px; border: 1px solid var(--line); border-bottom: 0; background: var(--surface-muted); }
+.friends-toolbar-row { display: flex; align-items: center; gap: 8px; }
+.friends-toolbar-row .n-input { width: min(360px, 100%); }
+.friends-toolbar-row:first-child .n-input { margin-right: auto; }
+.friends-toolbar-row--spectate { padding-top: 8px; border-top: 1px dashed var(--line); }
+.friends-toolbar-row--spectate .n-input { margin-right: 0; }
+.friends-toolbar-row--spectate small { color: var(--text-muted); font-size: 9px; }
 .friends-table { border: 1px solid var(--line); background: var(--surface); transition: opacity .15s; }.friends-table.loading { opacity: .72; }
 .friends-table > header, .friend-row { display: grid; grid-template-columns: 32px minmax(220px, 1.4fr) 100px minmax(150px, 1fr) minmax(150px, 1fr) auto; align-items: center; gap: 10px; }
 .friends-table > header { min-height: 34px; padding: 0 12px; border-bottom: 1px solid var(--line); color: var(--text-muted); background: var(--surface-muted); font-size: 9px; }
@@ -206,5 +347,24 @@ onBeforeUnmount(() => {
 .friend-row time strong, .friend-row time small { display: block; }.friend-row time strong { font-size: 10px; font-weight: 500; }.friend-row time small { margin-top: 2px; color: var(--text-muted); font-size: 8px; }.friend-empty { color: var(--text-muted); font-size: 9px; }
 .friend-spectate { justify-self: start; }
 .friends-empty { display: grid; place-items: center; gap: 7px; min-height: 220px; color: var(--text-muted); }.friends-empty strong { font-size: 11px; }
-@media (max-width: 900px) { .friends-toolbar { align-items: stretch; flex-wrap: wrap; }.friends-toolbar .n-input { width: 100%; }.friends-table { overflow-x: auto; }.friends-table > header, .friend-row { min-width: 860px; }.friend-group { min-width: 836px; } }
+/* 回收站：默认收起，展开后是一列「谁 + 什么时候删的 + 两个动作」。 */
+.friends-bin { margin-top: 12px; border: 1px solid var(--line); background: var(--surface); }
+.friends-bin > summary { display: flex; align-items: center; gap: 8px; min-height: 38px; padding: 0 12px; color: var(--text-secondary); cursor: pointer; list-style: none; }
+.friends-bin > summary::-webkit-details-marker { display: none; }
+.friends-bin > summary:hover { background: var(--surface-raised); }
+.friends-bin > summary > strong { color: var(--text-primary); font-size: 11px; }
+.friends-bin > summary > span { padding: 2px 6px; color: var(--accent); background: var(--accent-soft); font-size: 9px; }
+.friends-bin > summary > small { margin-left: auto; overflow: hidden; color: var(--text-muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.friends-bin[open] > summary { border-bottom: 1px solid var(--line); }
+.friends-bin__body { transition: opacity .15s; }.friends-bin__body.loading { opacity: .72; }
+.friends-bin__body ul { margin: 0; padding: 0; list-style: none; }
+.friends-bin__body li { display: grid; grid-template-columns: 26px minmax(0, 1fr) auto auto; align-items: center; gap: 10px; min-height: 50px; padding: 7px 12px; border-bottom: 1px solid var(--line); }
+.friends-bin__body li:last-child { border-bottom: 0; }
+.friends-bin__body li:hover { background: var(--surface-raised); }
+.friends-bin__identity { display: grid; gap: 2px; min-width: 0; }
+.friends-bin__identity strong { display: flex; align-items: baseline; gap: 2px; overflow: hidden; color: var(--text-primary); font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.friends-bin__identity strong small { color: var(--text-muted); font-size: 9px; font-weight: 500; }
+.friends-bin__identity time { color: var(--text-muted); font-size: 9px; }
+.friends-bin__empty { margin: 0; padding: 18px 12px; color: var(--text-muted); font-size: 10px; text-align: center; }
+@media (max-width: 900px) { .friends-toolbar-row { align-items: stretch; flex-wrap: wrap; }.friends-toolbar-row .n-input { width: 100%; }.friends-toolbar-row:first-child .n-input { margin-right: 0; }.friends-table { overflow-x: auto; }.friends-table > header, .friend-row { min-width: 860px; }.friend-group { min-width: 836px; }.friends-bin > summary > small { display: none; }.friends-bin__body li { grid-template-columns: 26px minmax(0, 1fr) auto; }.friends-bin__body li .n-popconfirm { display: none; } }
 </style>

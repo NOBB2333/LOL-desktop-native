@@ -13,11 +13,14 @@ import { isNative } from "./native";
 import {
   createFixtureJunglePath,
   createFixtureLobby,
+  createFixtureMatchTimeline,
   fixtureBootstrap,
   fixtureBpHistory,
   fixtureChampions,
   fixtureClaims,
+  fixtureClientInstallations,
   fixtureConfig,
+  fixtureDeletedFriends,
   fixtureEncounters,
   fixtureFriends,
   fixtureLobby,
@@ -35,7 +38,10 @@ import type {
   ClaimOutcome,
   ClaimSnapshot,
   ClaimSource,
+  ClientInstallations,
+  ClientLaunchResult,
   DataMode,
+  DeletedFriendsSnapshot,
   EncounterRecord,
   FinalBpRecord,
   FriendDeleteOutcome,
@@ -45,7 +51,9 @@ import type {
   JunglePathMap,
   LiveLobby,
   MatchSummary,
+  MatchTimeline,
   PlayerProfile,
+  RestoreFriendResult,
   ShortcutValidation,
   SpectateResult,
   SummonerSearchResult,
@@ -62,6 +70,13 @@ export const browserState = {
   /** 配置缓存：两条路径共用；native 下每次读写后端后同步到这里。 */
   config: structuredClone(fixtureConfig),
   friends: structuredClone(fixtureFriends),
+  /**
+   * 浏览器预览下的好友回收站。
+   *
+   * 必须真的**可写**：预览里删一个好友，回收站里就要多一条，否则这块功能在预览下
+   * 永远是空的，看不出它对不对（真机上是 SQLite，预览里就放内存）。
+   */
+  deletedFriends: structuredClone(fixtureDeletedFriends).friends,
   /** 浏览器预览下的可领清单，领取后就地从这里减掉，方便演示「领完变空」。 */
   claims: structuredClone(fixtureClaims),
   /** 浏览器预览下的玩家标记，写在内存里方便演示。 */
@@ -76,6 +91,34 @@ if (storedConfig) {
 /** 当前是否必须走模拟实现：没有原生桥，或数据模式不是 live。 */
 export function usesFixtureData(): boolean {
   return !isNative() || browserState.mode !== "live";
+}
+
+/**
+ * 把即将从预览里删掉的好友抄进回收站。
+ *
+ * 与后端 `friends_ipc.archiveDeletedFriend` 同一口径：**删之前**取记录，
+ * 且只留身份 + 删除时间（`availability` 之类实时状态不留，过期就是错的）。
+ * 原生侧只有删除成功才落档，这里没有失败路径，所以照着删。
+ */
+function archiveBrowserFriends(ids: string[]): void {
+  const now = new Date().toISOString();
+  for (const id of ids) {
+    const friend = browserState.friends.friends.find((item) => item.id === id);
+    if (!friend) continue;
+    browserState.deletedFriends = [
+      {
+        id: friend.id,
+        puuid: friend.puuid,
+        summonerId: friend.summonerId,
+        gameName: friend.gameName,
+        gameTag: friend.gameTag,
+        icon: friend.icon,
+        groupId: friend.groupId,
+        deletedAt: now,
+      },
+      ...browserState.deletedFriends.filter((item) => item.id !== id),
+    ];
+  }
 }
 
 function lobbyFixture(): LiveLobby {
@@ -173,6 +216,24 @@ function browserPremadeGroups(players: PlayerProfile[]): string {
 }
 
 /**
+ * 预览里的观战结果。
+ *
+ * 真机上后端会**先试好友路线、拿不到密钥再落到观察者模式**，而观察者模式是否
+ * 生效只有客户端才知道。预览里没有真实观战服务，所以只按「这位好友现在有没有
+ * 密钥」给出可读的成败与路线，让界面两条分支都能看到。
+ */
+function spectateFixture(puuid: string): SpectateResult {
+  const friend = browserState.friends.friends.find((item) => item.puuid === puuid);
+  if (!friend) {
+    return { ok: false, reason: "观察者模式未生效：对方可能不在对局中，或未允许被观战", route: "observe" };
+  }
+  if (!friend.canSpectate) {
+    return { ok: false, reason: "观察者模式未生效：这位好友现在不在对局中", route: "observe" };
+  }
+  return { ok: true, reason: "", route: "buddy" };
+}
+
+/**
  * 与原生实现同一套方法签名的模拟实现。
  *
  * 参数都是门面已经做过清洗/边界处理的值（如 `targets` 已去重、`boundedLimit` 已 clamp），
@@ -201,6 +262,9 @@ export const browserBackend = {
   junglePath(puuid: string, gameIds: number[]): JunglePathMap {
     // 参数已由门面清洗（去重、截断到 10 场），这里只负责造数据。
     return createFixtureJunglePath(puuid, gameIds);
+  },
+  matchTimeline(gameId: number): MatchTimeline {
+    return createFixtureMatchTimeline(gameId);
   },
   matches(page: number, pageSize: number): MatchSummary[] {
     const source = visibleMatches(fixtureMatches, browserState.config.providers.hideUnfinishedMatches, browserState.config.providers.rankedOnly);
@@ -273,6 +337,7 @@ export const browserBackend = {
     return { puuid, lastGameAt: friend?.lastGameAt ?? null };
   },
   deleteFriend(id: string): void {
+    archiveBrowserFriends([id]);
     browserState.friends.friends = browserState.friends.friends.filter((friend) => friend.id !== id);
   },
   /**
@@ -282,11 +347,46 @@ export const browserBackend = {
   deleteFriends(ids: string[]): FriendDeleteOutcome {
     const removing = new Set(ids);
     const results: FriendDeleteResultEntry[] = ids.map((id) => ({ id, ok: true, reason: "" }));
+    archiveBrowserFriends(ids);
     browserState.friends.friends = browserState.friends.friends.filter((friend) => !removing.has(friend.id));
     return { results, deleted: results.length, failed: 0 };
   },
+  deletedFriends(): DeletedFriendsSnapshot {
+    return { friends: structuredClone(browserState.deletedFriends) };
+  },
+  /**
+   * 预览里的「撤销」。原生侧 `addBack` 会真的向对方发一条好友申请，
+   * 这里没有客户端可发，只能把记录划掉——**不能**假装加回了好友列表，
+   * 那会让人以为这个按钮能把人变回来。
+   */
+  restoreFriend(id: string, addBack: boolean): RestoreFriendResult {
+    const record = browserState.deletedFriends.find((friend) => friend.id === id);
+    if (!record) return { ok: false, reason: "回收站里没有这条记录", added: false, gameName: "", gameTag: "" };
+    browserState.deletedFriends = browserState.deletedFriends.filter((friend) => friend.id !== id);
+    return {
+      ok: true,
+      reason: addBack ? "浏览器预览不发送好友申请，只清掉了本地记录" : "",
+      added: false,
+      gameName: record.gameName,
+      gameTag: record.gameTag,
+    };
+  },
   claims(): ClaimSnapshot {
     return structuredClone(browserState.claims);
+  },
+  clientInstallations(): ClientInstallations {
+    return structuredClone(fixtureClientInstallations);
+  },
+  /**
+   * 预览里不真的拉进程，只回报「会启动哪一个」。
+   *
+   * 与原生一致：`id` 为空就按探测顺序取第一个（后端也这么做），所以预览里点一下
+   * 主按钮看到的提示，和真机是一样的。
+   */
+  launchClient(id: string): ClientLaunchResult {
+    const entry = fixtureClientInstallations.entries.find((item) => item.id === id) ?? fixtureClientInstallations.entries[0];
+    if (!entry) return { ok: false, reason: "没找到已安装的英雄联盟 / WeGame / Riot 客户端", id: "", label: "" };
+    return { ok: true, reason: "", id: entry.id, label: entry.label };
   },
   claim(source: ClaimSource | "all", keys: string[]): ClaimOutcome {
     const matches = (item: ClaimItem) =>
@@ -312,10 +412,24 @@ export const browserBackend = {
     return { action, ok: false, phase: "", reason: "浏览器预览不支持客户端操作" };
   },
   spectate(puuid: string): SpectateResult {
-    const friend = browserState.friends.friends.find((item) => item.puuid === puuid);
-    if (!friend) return { ok: false, reason: "只能观战好友，这位不在好友列表里" };
-    if (!friend.canSpectate) return { ok: false, reason: "这位好友现在不在选人也不在对局中，拿不到观战密钥" };
-    return { ok: true, reason: "" };
+    return spectateFixture(puuid);
+  },
+  /**
+   * 按「名字#标签」观战。
+   *
+   * 预览里没有 summoner 解析服务，只能在 fixture 好友名单里按 Riot ID 找同名的人，
+   * 找得到就复用好友那条判断；找不到就回报「没找到」——真机上这一步由后端
+   * 走 LCU 的 `summoners?name=` 完成。
+   */
+  spectateById(query: string): SpectateResult {
+    const [rawName, rawTag] = query.split("#");
+    const name = (rawName ?? "").trim().toLowerCase();
+    const tag = (rawTag ?? "").trim().toLowerCase();
+    const friend = browserState.friends.friends.find(
+      (item) => item.gameName.trim().toLowerCase() === name && (!tag || item.gameTag.trim().toLowerCase() === tag),
+    );
+    if (!friend) return { ok: false, reason: "没找到这位召唤师：需要完整的「名字#标签」，且只能解析当前大区的玩家", route: "" };
+    return spectateFixture(friend.puuid);
   },
   bpHistory(): FinalBpRecord[] {
     return structuredClone(fixtureBpHistory);

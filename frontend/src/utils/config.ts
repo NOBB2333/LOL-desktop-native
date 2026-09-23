@@ -1,8 +1,11 @@
 import type { AppConfig, ShortcutDefinition } from "../types/domain";
 import { normalizePlayerTagSettings } from "../tags/settings";
 
-export const CURRENT_CONFIG_VERSION = 21;
+export const CURRENT_CONFIG_VERSION = 22;
 export const defaultOpenGameShortcutKey = "Ctrl+F1";
+
+/** 大乱斗换人前的等待秒数（对齐 AK `benchSwapAccumulatedDelaySeconds` = 2.9s）。 */
+export const defaultAramSwapDelaySeconds = 3;
 
 /**
  * `{main_position}`（主玩位置）插在段位与逐场战绩之间。旧版本存下来的默认模板
@@ -133,6 +136,22 @@ export function migrateAppConfig(config: AppConfig) {
     // 65ms 后，只把「还停在旧默认值」的配置降下来——用户自己调过的值一律保留。
     if (config.automation.shortcutSendIntervalMs === 250) {
       config.automation.shortcutSendIntervalMs = 65;
+      changed = true;
+    }
+  }
+  if (config.version < 22) {
+    // v22：大乱斗自动抢英雄（替补席换人）。老配置一律补默认值——这个功能必须由用户
+    // 主动开启，并且必须先设好偏好英雄，所以开关默认关、候选默认空。
+    if (typeof config.automation.aramGrab !== "boolean") {
+      config.automation.aramGrab = false;
+      changed = true;
+    }
+    if (!Array.isArray(config.automation.aramChampionIds)) {
+      config.automation.aramChampionIds = [];
+      changed = true;
+    }
+    if (!Number.isFinite(config.automation.aramSwapDelaySeconds)) {
+      config.automation.aramSwapDelaySeconds = defaultAramSwapDelaySeconds;
       changed = true;
     }
   }

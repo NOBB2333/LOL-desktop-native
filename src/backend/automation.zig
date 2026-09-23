@@ -11,6 +11,18 @@ var pick_lock_deadline_ms: i64 = 0;
 var pick_intent_sent = false;
 var pick_lock_sent = false;
 
+/// 大乱斗抢人的状态机。
+///
+/// `target_id` / `target_seen_ms` 记的是「替补席上这个目标英雄是**什么时候**出现的」。
+/// 对齐 AK 的 `benchSwapAccumulatedDelaySeconds`（默认 2.9 秒，我们取整成 3 秒）：
+/// 换人是不可逆的，刚出现在替补席上就立刻抢掉既不礼貌也容易点错，留几秒给手动换人。
+/// `pending_swap_id` / `pending_until_ms` 是「请求已发出、客户端还没反映过来」的窗口，
+/// 避免每 250ms 重复 POST 同一次换人。
+var aram_target_id: i64 = 0;
+var aram_target_seen_ms: i64 = 0;
+var aram_pending_swap_id: i64 = 0;
+var aram_pending_until_ms: i64 = 0;
+
 const PendingAction = struct {
     action_type: []const u8,
     action_id: i64,
@@ -56,12 +68,21 @@ pub fn run(io: std.Io, client: lcu.Client, config_json: []const u8, output: []u8
     ready_check_retry_at_ms = 0;
     if (!std.mem.eql(u8, normalized_phase, "ChampSelect")) {
         resetPickState();
+        resetAramState();
         return std.fmt.bufPrint(output, "[]", .{});
     }
 
     const session_json = client.get("/lol-champ-select/v1/session") catch return error.LcuRequestFailed;
     defer std.heap.page_allocator.free(session_json);
     const session = std.json.parseFromSliceLeaky(std.json.Value, allocator, session_json, .{}) catch return error.LcuInvalidResponse;
+
+    // 大乱斗没有 pick/ban action：进选人时客户端已经随机分好英雄，只能从替补席换人。
+    // 所以这条路要**先于**选人/禁用那条走，否则永远轮不到（`selectPendingAction` 在
+    // 大乱斗里必然返回 null）。
+    if (aramGrabEnabled(config) and isBenchSelect(session)) {
+        return runAramGrab(io, client, config, session, output);
+    }
+    resetAramState();
     const pending = selectPendingAction(config, session) orelse {
         // There is no active local action, or the player has already made a
         // manual choice. Keep state only while the same action is alive.
@@ -276,6 +297,155 @@ fn runReadyCheck(io: std.Io, client: lcu.Client, config: std.json.Value, allocat
 
 fn nowMillis(io: std.Io) i64 {
     return @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
+}
+
+/// 是不是「有替补席的选人」。
+///
+/// 用 `benchEnabled` 当判据，等于 AK 的 `isAramLikeMode`
+/// （`auto-gameflow/aram-team-side-controller.ts`：`benchEnabled && gameMode ∈ {ARAM, KIWI}`）
+/// **减去模式名那半条**——替补席只在这两种模式里存在，而模式名要去
+/// `/lol-gameflow/v1/session`（几百 KB）里读，每 250ms 拉一次不划算，
+/// 手里这份 champ-select session 又不带模式名。所以以替补席为准。
+fn isBenchSelect(session: std.json.Value) bool {
+    return jsonBoolField(session, "benchEnabled");
+}
+
+fn aramGrabEnabled(config: std.json.Value) bool {
+    return automationBool(config, "aramGrab");
+}
+
+fn aramSwapDelaySeconds(config: std.json.Value) i64 {
+    // 0 也是合法值（立刻换），所以不能用「取不到就连带默认」的写法，得区分缺字段。
+    const automation = automationObject(config) orelse return 3;
+    const value = automation.object.get("aramSwapDelaySeconds") orelse return 3;
+    return std.math.clamp(jsonInteger(value), @as(i64, 0), @as(i64, 30));
+}
+
+/// 大乱斗抢人：从替补席里换出**偏好顺序里最靠前、且当前真的可换**的那个英雄。
+///
+/// 只在两种情况下动手（对齐 AK `bench-controller.ts` 的 `getExpectedSwaps`）：
+/// - 手上的英雄压根不在偏好列表里；
+/// - 手上的英雄在列表里，但替补席上有**优先级更高**的。
+/// 手上已经是最优解时什么都不做，返回空数组（不刷状态栏）。
+fn runAramGrab(io: std.Io, client: lcu.Client, config: std.json.Value, session: std.json.Value, output: []u8) ![]const u8 {
+    const now_ms = nowMillis(io);
+    const current_id = localChampionId(session);
+
+    // 客户端已经把换人反映出来了（手上的英雄就是上次请求的那个）→ 清掉待确认窗口。
+    if (aram_pending_swap_id != 0 and current_id == aram_pending_swap_id) aram_pending_swap_id = 0;
+    if (aram_pending_swap_id != 0 and now_ms < aram_pending_until_ms) {
+        return writeAction(output, "bench-swap", 0, aram_pending_swap_id, false, "已发送换人请求，等待客户端更新");
+    }
+
+    const candidates = aramCandidates(config);
+    if (candidates.len == 0) {
+        resetAramState();
+        return writeAction(output, "bench-swap", 0, 0, false, "大乱斗抢人已开启，但还没设置偏好英雄");
+    }
+    // 拿不到替补席列表（接口暂时不可用）不能当成「替补席是空的」，否则会误判成
+    // 「当前已经是最优」而静默什么都不做。
+    const bench_json = client.get("/lol-champ-select/v1/pickable-champion-ids") catch
+        return writeAction(output, "bench-swap", 0, 0, false, "读不到替补席列表，稍后重试");
+    defer std.heap.page_allocator.free(bench_json);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const bench = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), bench_json, .{}) catch
+        return writeAction(output, "bench-swap", 0, 0, false, "替补席列表格式不认识，稍后重试");
+
+    const target_id = benchTarget(config, bench, current_id);
+    if (target_id <= 0) {
+        resetAramState();
+        return std.fmt.bufPrint(output, "[]", .{});
+    }
+
+    if (aram_target_id != target_id) {
+        aram_target_id = target_id;
+        aram_target_seen_ms = now_ms;
+    }
+    const delay_ms = aramSwapDelaySeconds(config) * std.time.ms_per_s;
+    const waited_ms = now_ms - aram_target_seen_ms;
+    if (waited_ms < delay_ms) {
+        const remaining = @divTrunc(delay_ms - waited_ms + 999, 1000);
+        var reason_buffer: [128]u8 = undefined;
+        const reason = std.fmt.bufPrint(&reason_buffer, "替补席上有更合适的英雄，{d} 秒后自动换上", .{remaining}) catch "等待延迟后从替补席换人";
+        return writeAction(output, "bench-swap", 0, target_id, false, reason);
+    }
+    if (automationBool(config, "advisoryMode")) {
+        return writeAction(output, "bench-swap", 0, target_id, true, "建议模式：会从替补席换上这个英雄，不写入客户端");
+    }
+
+    var path_buffer: [128]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/lol-champ-select/v1/session/bench/swap/{d}", .{target_id}) catch return error.InvalidConfig;
+    // 与 AK 的 `benchSwap` 一致：POST 不带 body。
+    const response = client.postNoContent(path) catch return error.LcuRequestFailed;
+    std.heap.page_allocator.free(response);
+    aram_pending_swap_id = target_id;
+    aram_target_id = 0;
+    aram_target_seen_ms = 0;
+    // 客户端不是立刻更新 session，留一个窗口，避免每 250ms 重复提交同一次换人。
+    aram_pending_until_ms = now_ms + 3 * std.time.ms_per_s;
+    return writeAction(output, "bench-swap", 0, target_id, true, "已从替补席换上优先级更高的英雄");
+}
+
+/// 偏好列表。
+fn aramCandidates(config: std.json.Value) []const std.json.Value {
+    const automation = automationObject(config) orelse return &.{};
+    const list = automation.object.get("aramChampionIds") orelse return &.{};
+    return if (list == .array) list.array.items else &.{};
+}
+
+/// 该换上哪个英雄；`0` 表示不用换。
+fn benchTarget(config: std.json.Value, bench: std.json.Value, current_id: i64) i64 {
+    const candidates = aramCandidates(config);
+    if (candidates.len == 0 or bench != .array) return 0;
+    var current_rank: i64 = -1;
+    if (current_id > 0) {
+        for (candidates, 0..) |item, index| {
+            if (jsonInteger(item) == current_id) {
+                current_rank = @intCast(index);
+                break;
+            }
+        }
+    }
+    for (candidates, 0..) |item, index| {
+        const champion_id = jsonInteger(item);
+        if (champion_id <= 0 or !championInBench(bench, champion_id)) continue;
+        if (champion_id == current_id) return 0;
+        // 替补席上优先级最高的那个还不如手上的 → 不换。
+        if (current_rank >= 0 and @as(i64, @intCast(index)) > current_rank) return 0;
+        return champion_id;
+    }
+    return 0;
+}
+
+fn championInBench(bench: std.json.Value, champion_id: i64) bool {
+    for (bench.array.items) |item| if (jsonInteger(item) == champion_id) return true;
+    return false;
+}
+
+/// 本地玩家在选人里拿到的英雄。
+///
+/// 大乱斗选人没有 action，`myTeam[].championId` 就是手上那个；刚进选人时可能还是 0。
+fn localChampionId(session: std.json.Value) i64 {
+    if (session != .object) return 0;
+    const cell_id = jsonIntField(session, "localPlayerCellId");
+    if (cell_id < 0) return 0;
+    const team = session.object.get("myTeam") orelse return 0;
+    if (team != .array) return 0;
+    for (team.array.items) |participant| {
+        if (jsonIntField(participant, "cellId") != cell_id) continue;
+        const committed = jsonIntField(participant, "championId");
+        if (committed > 0) return committed;
+        return @max(@as(i64, 0), jsonIntField(participant, "championPickIntent"));
+    }
+    return 0;
+}
+
+fn resetAramState() void {
+    aram_target_id = 0;
+    aram_target_seen_ms = 0;
+    aram_pending_swap_id = 0;
+    aram_pending_until_ms = 0;
 }
 
 fn getReadyCheck(client: lcu.Client, allocator: std.mem.Allocator) !ReadyCheckSnapshot {
@@ -610,8 +780,7 @@ test "treats the current champion-select ban list as occupied" {
     try std.testing.expect(!championOccupied(session, 7));
 }
 
-test "ready check activity rejects installed but inactive routes" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+test "ready check activity rejects installed but inactive routes" {    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const active = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"state\":\"InProgress\",\"playerResponse\":\"None\",\"timer\":0}", .{});
@@ -624,4 +793,85 @@ test "ready check activity rejects installed but inactive routes" {
     try std.testing.expect(!readyCheckValueActionable(accepted));
     try std.testing.expect(readyCheckValueActionable(queue_specific));
     try std.testing.expect(readyCheckJsonTerminal(allocator, "{\"state\":\"EveryoneReady\",\"playerResponse\":\"Accepted\"}"));
+}
+
+test "大乱斗：替补席上有优先级更高的英雄才换" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const config = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"automation\":{\"aramGrab\":true,\"aramChampionIds\":[103,64,222]}}", .{});
+    const bench = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "[64,222,7]", .{});
+
+    // 手上没有偏好里的英雄 → 换上替补席上优先级最高的那个。
+    try std.testing.expectEqual(@as(i64, 64), benchTarget(config, bench, 7));
+    // 手上是第二优先，替补席上还有第一优先 → 换。
+    try std.testing.expectEqual(@as(i64, 64), benchTarget(config, bench, 222));
+    // 手上已经是替补席上优先级最高的 → 不动。
+    try std.testing.expectEqual(@as(i64, 0), benchTarget(config, bench, 64));
+    // 手上是第一优先，替补席上只有更差的 → 不动（AK 的「找到更高优先级才换」）。
+    const worse_bench = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "[222,7]", .{});
+    try std.testing.expectEqual(@as(i64, 0), benchTarget(config, worse_bench, 103));
+    // 偏好里一个都不在替补席上 → 不动。
+    const empty_bench = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "[7,40]", .{});
+    try std.testing.expectEqual(@as(i64, 0), benchTarget(config, empty_bench, 7));
+    // 没配偏好 → 不动。
+    const bare = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"automation\":{\"aramGrab\":true}}", .{});
+    try std.testing.expectEqual(@as(i64, 0), benchTarget(bare, bench, 7));
+}
+
+test "大乱斗：只有替补席开启时才走抢人这条线" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const aram = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"benchEnabled\":true,\"localPlayerCellId\":0}", .{});
+    const ranked = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"benchEnabled\":false,\"localPlayerCellId\":0}", .{});
+    try std.testing.expect(isBenchSelect(aram));
+    try std.testing.expect(!isBenchSelect(ranked));
+    // 取不到字段时不能当成大乱斗，否则排位选人也会去读替补席。
+    const empty = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{}", .{});
+    try std.testing.expect(!isBenchSelect(empty));
+}
+
+test "大乱斗：换人延迟默认 3 秒、可关到 0、上限 30" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const unset = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"automation\":{\"aramGrab\":true}}", .{});
+    try std.testing.expectEqual(@as(i64, 3), aramSwapDelaySeconds(unset));
+    const zero = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"automation\":{\"aramSwapDelaySeconds\":0}}", .{});
+    try std.testing.expectEqual(@as(i64, 0), aramSwapDelaySeconds(zero));
+    const huge = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"automation\":{\"aramSwapDelaySeconds\":900}}", .{});
+    try std.testing.expectEqual(@as(i64, 30), aramSwapDelaySeconds(huge));
+    const negative = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"automation\":{\"aramSwapDelaySeconds\":-5}}", .{});
+    try std.testing.expectEqual(@as(i64, 0), aramSwapDelaySeconds(negative));
+}
+
+test "大乱斗：手上那个英雄从 myTeam 的本地格子里读" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const session = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"localPlayerCellId":3,"myTeam":[{"cellId":1,"championId":64},{"cellId":3,"championId":103}]}
+    , .{});
+    try std.testing.expectEqual(@as(i64, 103), localChampionId(session));
+
+    // 还没分到英雄时用预选意图兜底。
+    const intent = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"localPlayerCellId":1,"myTeam":[{"cellId":1,"championId":0,"championPickIntent":64}]}
+    , .{});
+    try std.testing.expectEqual(@as(i64, 64), localChampionId(intent));
+
+    const broken = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{}", .{});
+    try std.testing.expectEqual(@as(i64, 0), localChampionId(broken));
+}
+
+test "大乱斗：抢人动作带上 championId，界面能据此显示换了谁" {
+    var output: [256]u8 = undefined;
+    const result = try writeAction(&output, "bench-swap", 0, 64, true, "已从替补席换上优先级更高的英雄");
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    const action = parsed.value.array.items[0];
+    try std.testing.expectEqualStrings("bench-swap", action.object.get("actionType").?.string);
+    try std.testing.expectEqual(@as(i64, 64), action.object.get("championId").?.integer);
+    try std.testing.expect(action.object.get("executed").?.bool);
 }

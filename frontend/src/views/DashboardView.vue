@@ -9,7 +9,7 @@ import MatchDetailCard from "../components/MatchDetailCard.vue";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { RankQueueSummary } from "../types/domain";
-import { championImage, percent, platformRegionGuide, platformRegionName, platformRegionOverview, rankName, relativeTime } from "../utils/format";
+import { championImage, percent, platformRegionGuide, platformRegionName, platformRegionOverview, profileIconId, profileIconImage, rankName, relativeTime } from "../utils/format";
 import { visibleMatches } from "../matches/filters";
 import { matchHistoryQueryKey } from "../matches/query";
 import { useMatchDetail } from "../composables/useMatchDetail";
@@ -180,9 +180,10 @@ function toggleMatch(gameId: number) {
                 <div class="avatar-wrap">
                   <AssetIcon
                     kind="profile"
-                    :id="account.profileIconId ?? 0"
+                    :id="profileIconId(account.profileIconId)"
                     :name="account.gameName || account.summonerName || '测试召唤师'"
-                    fallback-url="./fixtures/champions/Ahri.png"
+                    :fallback-url="profileIconImage(account.profileIconId)"
+                    round
                     size="xl"
                   />
                   <span

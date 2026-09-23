@@ -69,6 +69,8 @@ export function createCommandScheduler() {
       "lol.claim",
       "lol.gameflow_action",
       "lol.spectate",
+      "lol.launch_client",
+      "lol.restore_friend",
     ].includes(name)) return action(task);
     if (["lol.get_config", "lol.save_config", "lol.set_shortcut_capture", "lol.set_data_mode", "lol.get_live_lobby", "lol.get_shortcut_events", "lol.open_game_view", "lol.validate_shortcut_template"].includes(name)) return state(task);
     return query(task);

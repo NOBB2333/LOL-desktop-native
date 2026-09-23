@@ -4,6 +4,8 @@ import type {
   BanSummary,
   ChampionOverview,
   ClaimSnapshot,
+  ClientInstallations,
+  DeletedFriendsSnapshot,
   EncounterRecord,
   FriendToolsSnapshot,
   FinalBpRecord,
@@ -15,6 +17,10 @@ import type {
   ItemSummary,
   MatchParticipant,
   MatchSummary,
+  MatchTimeline,
+  MatchTimelineEvent,
+  MatchTimelineFrame,
+  MatchTimelineParticipant,
   PlayerProfile,
   RecentMatch,
   RuneSummary,
@@ -410,6 +416,34 @@ export const fixtureFriends: FriendToolsSnapshot = {
 };
 
 /**
+ * 「好友回收站」的浏览器预览样本。
+ *
+ * 形状与后端 `lol.get_deleted_friends` 一致（本地 SQLite 里的存档，按删除时间新的在前）。
+ * 给两条：一条是「删错了想加回来」的典型（有完整名字#标签），一条是名字里带空格/符号的，
+ * 用来看长名字会不会把布局撑坏。**必须留样本**——否则这块界面在预览里永远是空的。
+ */
+export const fixtureDeletedFriends: DeletedFriendsSnapshot = {
+  friends: [
+    { id: "deleted-1", puuid: "deleted-puuid-1", summonerId: 201, gameName: "手滑删掉的队友", gameTag: "HN1", icon: 3494, groupId: 1, deletedAt: new Date(now - 36 * 3600000).toISOString() },
+    { id: "deleted-2", puuid: "deleted-puuid-2", summonerId: 202, gameName: "Long Name 空格", gameTag: "233", icon: 29, groupId: 2, deletedAt: new Date(now - 9 * 86400000).toISOString() },
+  ],
+};
+
+/**
+ * 「一键启动客户端」的浏览器预览样本。
+ *
+ * 真机上入口是扫盘 / 读 Riot 安装清单扫出来的，行数和盘符有关。这里给三个典型入口
+ * （腾讯系两个 + 官方一个），就是为了让「下拉切换」这条分支在预览里也看得见。
+ */
+export const fixtureClientInstallations: ClientInstallations = {
+  entries: [
+    { id: "tcls", label: "英雄联盟（腾讯登录器）", detail: "WeGameApps 扫盘", path: "D:\\WeGameApps\\英雄联盟\\Launcher\\Client.exe" },
+    { id: "wegame-launcher", label: "英雄联盟（WeGame 启动）", detail: "WeGameApps 扫盘", path: "D:\\WeGameApps\\英雄联盟\\WeGameLauncher\\launcher.exe" },
+    { id: "riot-client", label: "Riot 客户端", detail: "Riot 安装清单", path: "C:\\Riot Games\\Riot Client\\RiotClientServices.exe" },
+  ],
+};
+
+/**
  * 「一键领取」（现挂在自动化页）的浏览器预览样本。
  *
  * 形状与后端 `lol.get_claims` 一致（三个来源各来一两条），**不参与任何真实统计**；
@@ -442,7 +476,7 @@ export const fixtureClaims: ClaimSnapshot = {
 };
 
 export const fixtureConfig: AppConfig = {
-  version: 21,
+  version: 22,
   appearance: { theme: "mint", colorMode: "light", compact: false },
   playerTags: { ...defaultPlayerTagSettings },
   connection: { kind: "local", sshTarget: "", identityFile: "", forwardedPort: 0 },
@@ -457,6 +491,9 @@ export const fixtureConfig: AppConfig = {
     autoBan: false,
     pickChampionIds: [103, 222, 64],
     banChampionIds: [164, 7, 145],
+    aramGrab: true,
+    aramChampionIds: [64, 222, 103],
+    aramSwapDelaySeconds: 3,
     shortcutSendIntervalMs: 65,
     shortcutRecentGameCount: 5,
     shortcuts: [
@@ -566,4 +603,83 @@ export function createFixtureJunglePath(puuid: string, gameIds: number[]): Jungl
     level3Points,
     level4Points,
   };
+}
+
+/**
+ * 预览用的对局时间线。
+ *
+ * 真机上这份数据来自 LCU 的 `game-timelines`，预览里没有客户端，所以按 gameId 造一份
+ * **确定但会随对局变化**的数据：经济曲线带一次翻盘拐点，事件列表覆盖四类关键事件。
+ * 不补这个 fixture，「对局时间线」页签在预览里永远是空的。
+ */
+export function createFixtureMatchTimeline(gameId: number): MatchTimeline {
+  const seed = Math.abs(Math.trunc(gameId)) % 997;
+  const minutes = 24 + (seed % 14);
+  const durationSeconds = minutes * 60;
+  // 谁笑到最后由 gameId 决定，这样不同对局的曲线不会长得一模一样。
+  const blueEdge = seed % 2 === 0 ? 1 : -1;
+  const champions = [64, 103, 12, 222, 99, 24, 105, 40, 1, 111];
+  const participants: MatchTimelineParticipant[] = champions.map((championId, index) => ({
+    participantId: index + 1,
+    team: index < 5 ? 100 : 200,
+    championId,
+  }));
+
+  // 队内经济分配：越靠前的座位越像 C 位，辅助拿最少。
+  const goldShares = [0.24, 0.22, 0.21, 0.19, 0.14];
+  const frames: MatchTimelineFrame[] = [];
+  for (let minute = 1; minute <= minutes; minute += 1) {
+    const ramp = minute / minutes;
+    // 开局 40% 处两条线交叉：前半段红方领先，后半段蓝方反超（或反过来）。
+    const swing = blueEdge * (ramp - 0.4) * 9200;
+    const blueGold = 2500 + minute * 1350 + Math.round(swing);
+    const redGold = 2500 + minute * 1330 - Math.round(swing);
+    const gold = goldShares.map((share, index) => Math.round((index < 5 ? blueGold : redGold) * share));
+    frames.push({
+      minute,
+      blueGold,
+      redGold,
+      goldDiff: blueGold - redGold,
+      blueCs: Math.round(minute * 28.5),
+      redCs: Math.round(minute * 27.2),
+      gold,
+    });
+  }
+
+  const timelineEvent = (
+    base: Pick<MatchTimelineEvent, "type" | "seconds" | "team"> & Partial<MatchTimelineEvent>,
+  ): MatchTimelineEvent => ({
+    killerId: 0,
+    victimId: 0,
+    assistCount: 0,
+    killerChampionId: 0,
+    victimChampionId: 0,
+    monsterType: "",
+    monsterSubType: "",
+    buildingType: "",
+    towerType: "",
+    laneType: "",
+    ...base,
+  });
+
+  // 脚本时间点固定，靠 `filter` 按这局的实际时长裁掉没打到的部分。
+  const events: MatchTimelineEvent[] = [
+    timelineEvent({ type: "CHAMPION_KILL", seconds: 232, team: 200, killerId: 6, victimId: 1, killerChampionId: 24, victimChampionId: 64 }),
+    timelineEvent({ type: "TURRET_PLATE_DESTROYED", seconds: 341, team: 200, killerId: 7, killerChampionId: 40, laneType: "TOP_LANE" }),
+    timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 352, team: 100, killerId: 2, killerChampionId: 103, monsterType: "DRAGON", monsterSubType: "FIRE_DRAGON" }),
+    timelineEvent({ type: "BUILDING_KILL", seconds: 528, team: 200, killerId: 7, killerChampionId: 40, buildingType: "TOWER_BUILDING", towerType: "OUTER_TURRET", laneType: "TOP_LANE" }),
+    timelineEvent({ type: "CHAMPION_KILL", seconds: 604, team: 100, killerId: 1, victimId: 8, assistCount: 2, killerChampionId: 64, victimChampionId: 1 }),
+    timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 611, team: 100, killerId: 2, killerChampionId: 103, monsterType: "RIFTHERALD" }),
+    timelineEvent({ type: "BUILDING_KILL", seconds: 902, team: 100, killerId: 1, killerChampionId: 64, buildingType: "TOWER_BUILDING", towerType: "OUTER_TURRET", laneType: "MID_LANE" }),
+    timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 968, team: 200, killerId: 6, killerChampionId: 24, monsterType: "DRAGON", monsterSubType: "OCEAN_DRAGON" }),
+    timelineEvent({ type: "CHAMPION_KILL", seconds: 1188, team: 100, killerId: 3, victimId: 9, assistCount: 1, killerChampionId: 12, victimChampionId: 105 }),
+    timelineEvent({ type: "BUILDING_KILL", seconds: 1264, team: 100, killerId: 3, killerChampionId: 12, buildingType: "TOWER_BUILDING", towerType: "INNER_TURRET", laneType: "MID_LANE" }),
+    timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 1288, team: 100, killerId: 2, killerChampionId: 103, monsterType: "BARON_NASHOR" }),
+    timelineEvent({ type: "BUILDING_KILL", seconds: 1502, team: 100, killerId: 4, killerChampionId: 222, buildingType: "INHIBITOR_BUILDING", laneType: "MID_LANE" }),
+    timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 1596, team: 100, killerId: 2, killerChampionId: 103, monsterType: "DRAGON", monsterSubType: "ELDER_DRAGON" }),
+    timelineEvent({ type: "CHAMPION_KILL", seconds: 1704, team: 100, killerId: 1, victimId: 6, assistCount: 3, killerChampionId: 64, victimChampionId: 24 }),
+    timelineEvent({ type: "BUILDING_KILL", seconds: 1810, team: 100, killerId: 5, killerChampionId: 99, buildingType: "TOWER_BUILDING", towerType: "BASE_TURRET", laneType: "MID_LANE" }),
+  ].filter((item) => item.seconds <= durationSeconds);
+
+  return { gameId, durationSeconds, participants, frames, events };
 }

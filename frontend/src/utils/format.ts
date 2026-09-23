@@ -1,3 +1,5 @@
+import { lcuAssetToCommunityDragon } from "../assets/lcuAsset";
+
 const roleMap: Record<string, string> = {
   TOP: "上路", JUNGLE: "打野", MIDDLE: "中路", MID: "中路", BOTTOM: "下路", BOT: "下路", ADC: "下路", UTILITY: "辅助", SUPPORT: "辅助",
 };
@@ -87,6 +89,27 @@ export const meterClass = (value: number) => `meter-${Math.min(100, Math.max(0, 
 // Native production pages are served from zero://app. Keep fallback assets
 // relative so a leading slash cannot escape the bundled frontend directory.
 export const championImage = (id: number) => championAlias[id] ? `./fixtures/champions/${championAlias[id]}.png` : "";
+
+/**
+ * 默认召唤师头像。
+ *
+ * LCU 的好友对象里 `icon` 可能没有值（离线好友常见），`0` 不是一个能取到的头像 id。
+ * 客户端自己此时显示的是 29 号（最经典的那个），AK 也是 `friend.icon || 29`
+ * （`SummonerSearchSidebar.vue`），所以这里保持同一口径——**别**让它退成首字母，
+ * 那正是「头像认不出来」的来源。
+ */
+export const DEFAULT_PROFILE_ICON_ID = 29;
+export const profileIconId = (id?: number | null) => (Number.isFinite(id) && (id as number) > 0 ? (id as number) : DEFAULT_PROFILE_ICON_ID);
+
+/**
+ * 头像的**远程兜底 URL**（CommunityDragon）。
+ *
+ * 走的是 `assets/lcuAsset.ts` 那条既有规则（LCU 资源路径 → CommunityDragon 同名地址），
+ * 不再另写一份资产根：头像按 id 就能拼出这条路径，所以哪怕原生取字节那一步失败，
+ * `<img>` 仍然有一个能直接加载的地址，不至于一坏就掉到首字母。
+ */
+export const profileIconImage = (id?: number | null) =>
+  lcuAssetToCommunityDragon(`/lol-game-data/assets/v1/profile-icons/${profileIconId(id)}.jpg`) ?? "";
 function parseTimestamp(value: string) {
   const direct = Date.parse(value);
   if (Number.isFinite(direct)) return direct;

@@ -5,11 +5,13 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useQueryClient } from "@tanstack/vue-query";
 import { RouterLink, RouterView, useRoute, useRouter } from "vue-router";
 import AssetIcon from "./components/AssetIcon.vue";
+import ClientLauncherButton from "./components/ClientLauncherButton.vue";
 import logoUrl from "./assets/lol-mark.png";
 import { backend, isTauri } from "./services/backend";
 import { listenNative } from "./services/native";
 import { useAppStore } from "./stores/app";
 import type { AccountPresence } from "./types/domain";
+import { profileIconId, profileIconImage } from "./utils/format";
 import { MATCH_HISTORY_QUERY_ROOT } from "./matches/query";
 
 const PROJECT_URL = "https://github.com/NOBB2333/LOL-desktop-native";
@@ -124,7 +126,7 @@ function automationEnabled() {
   const config = app.config.automation;
   // Match the Rust host loop: connection status is a UI snapshot and can lag
   // the LCU process during the short ReadyCheck transition.
-  return app.mode === "live" && config.enabled && !config.advisoryMode && (config.autoAccept || config.autoPick || config.autoBan);
+  return app.mode === "live" && config.enabled && !config.advisoryMode && (config.autoAccept || config.autoPick || config.autoBan || config.aramGrab);
 }
 
 async function runAutomationIfNeeded(events: { uri: string; phase?: string }[]) {
@@ -271,9 +273,10 @@ onBeforeUnmount(() => {
           <header class="topbar" :class="{ 'topbar--immersive': immersive }">
             <div class="breadcrumb"><span>桌上英雄联盟</span><ChevronRight :size="14" /><strong>{{ String(route.meta.title) }}</strong></div>
             <div class="topbar-actions">
+              <ClientLauncherButton />
               <button class="topbar-icon-button" type="button" :aria-label="dark ? '切换浅色模式' : '切换深色模式'" :title="dark ? '浅色模式' : '深色模式'" @click="toggleTheme"><Moon v-if="dark" :size="16" /><Sun v-else :size="16" /></button>
               <RouterLink to="/settings" class="topbar-account" title="打开设置">
-                <AssetIcon kind="profile" :id="account.profileIconId ?? 0" :name="accountName" fallback-url="./fixtures/champions/Ahri.png" size="sm" />
+                <AssetIcon kind="profile" :id="profileIconId(account.profileIconId)" :name="accountName" :fallback-url="profileIconImage(account.profileIconId)" round size="sm" />
                 <span class="topbar-account__copy"><strong>{{ accountName }}<small>{{ accountTag }}</small></strong><em :data-presence="presenceClass"><i />{{ presenceLabel }}</em></span>
               </RouterLink>
               <span class="connection-pill" :data-status="app.connection.status"><i />{{ app.connection.status === "connected" ? "LCU" : app.mode === "fixture" ? "本地" : "未连接" }}<Wifi v-if="app.connection.status === 'connected'" :size="14" /><WifiOff v-else :size="14" /></span>
