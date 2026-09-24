@@ -5,6 +5,7 @@ import { computed, ref, watch } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 import { useRouter } from "vue-router";
 import AssetIcon from "../components/AssetIcon.vue";
+import MatchMetPlayers from "../components/MatchMetPlayers.vue";
 import MatchTimelinePanel from "../components/MatchTimelinePanel.vue";
 import PageHeader from "../components/PageHeader.vue";
 import { backend } from "../services/backend";
@@ -17,7 +18,14 @@ import { clockOf } from "../matches/timeline";
 import { aggregateRelationships, lastSeenLabel, relationLabel } from "../encounters/relationships";
 
 const app = useAppStore();
-const tab = ref<"matches" | "encounters" | "timeline" | "bp">("matches");
+/**
+ * 默认落在「对局时间线」。
+ *
+ * 这一页的主线是「这一局打成什么样 + 这一局遇到了谁」，其余三个页签（最近对局、
+ * 遇到的玩家、BP 记录）是旁支。页签顺序也按这个主次排，中间还加了一条分隔线，
+ * 所以默认页签必须与排第一的那个一致，否则「点进来看到的」和「排最前的」不是同一个。
+ */
+const tab = ref<"matches" | "encounters" | "timeline" | "bp">("timeline");
 const bp = useQuery({ queryKey: computed(() => ["bp-history", app.mode]), queryFn: backend.bpHistory, enabled: computed(() => app.initialized) });
 const encounters = useQuery({ queryKey: computed(() => ["encounter-history", app.mode]), queryFn: () => backend.encounters(undefined, 100), enabled: computed(() => app.initialized) });
 // 这里只把英雄名映射成 id，走默认区服/分段即可（包一层：vue-query 会把查询上下文当第一个参数）。
@@ -92,14 +100,12 @@ const matchResultTone = (match: MatchSummary) => match.durationMinutes === 0 ? "
 const matchKda = (match: MatchSummary) => `${match.kills}/${match.deaths}/${match.assists}`;
 
 /**
- * 时间线页签的对局选择器。
+ * 最近对局列表：「对局时间线」与「最近对局」两个页签共用同一份。
  *
- * 取的是**本地账号**最近的对局（不传名字就是自己），只在这个页签可见时才请求，
- * 免得历史页一打开就多打一次 LCU。选中的局决定时间线查询的 key。
- */
-/**
- * 最近对局列表：「最近对局」与「对局时间线」两个页签共用同一份，
- * 也只在这两个页签之一可见时才请求，免得历史页一打开就多打一次 LCU。
+ * 取的是**本地账号**最近的对局（不传名字就是自己），也只在这两个页签之一可见时
+ * 才请求。注意默认页签就是「对局时间线」，所以现在**打开历史页就会发这一次请求**
+ * ——这是有意的：先选一局是这一页的第一步，省掉它反而要多一次点击。列出的只是
+ * 对局摘要，不含逐帧明细（明细要选中某一局才拉）。选中的局决定时间线查询的 key。
  */
 const historyMatches = useQuery({
   queryKey: computed(() => ["history-matches", app.mode]),
@@ -128,16 +134,21 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
 
 <template>
   <div class="page-shell history-page">
-    <PageHeader title="历史" eyebrow="LOCAL ARCHIVE" meta="最近的本地对局档案：打过哪些局、都是跟谁打的；这里不保存游戏录像">
+    <PageHeader title="历史" eyebrow="LOCAL ARCHIVE" meta="选一局看它的时间线，以及这一局里遇到的人；数据全部来自本地客户端，不保存游戏录像">
+      <!--
+        页签按主次排：左边两个是这一页的主线（一局打成什么样、这一局遇到谁），
+        右边两个是旁支。中间那条竖线就是用来表示这个分组的——不是装饰。
+      -->
       <div class="history-tabs">
-        <button type="button" :class="{ active: tab === 'matches' }" @click="tab = 'matches'">
-          <CalendarDays :size="14" />最近对局
+        <button type="button" :class="{ active: tab === 'timeline' }" @click="tab = 'timeline'">
+          <TrendingUp :size="14" />对局时间线
         </button>
         <button type="button" :class="{ active: tab === 'encounters' }" @click="tab = 'encounters'">
           <UsersRound :size="14" />遇到的玩家
         </button>
-        <button type="button" :class="{ active: tab === 'timeline' }" @click="tab = 'timeline'">
-          <TrendingUp :size="14" />对局时间线
+        <span class="history-tabs__divider" aria-hidden="true" />
+        <button type="button" :class="{ active: tab === 'matches' }" @click="tab = 'matches'">
+          <CalendarDays :size="14" />最近对局
         </button>
         <button type="button" :class="{ active: tab === 'bp' }" @click="tab = 'bp'">
           <ClipboardList :size="14" />BP 记录
@@ -245,7 +256,7 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
       </div>
     </section>
 
-    <!-- 玩家档案。注意这里必须是 v-else-if：页签有三个，用 v-else 会和
+    <!-- 玩家档案。注意这里必须是 v-else-if：页签不止一个，用 v-else 会和
          「对局时间线」同时渲染，两个区块一起出现。 -->
     <section v-else-if="tab === 'encounters'" class="history-section">
       <header class="history-section__header">
@@ -362,7 +373,7 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
         <span>打完一局后，这里会出现它的经济曲线和关键事件。</span>
       </div>
 
-      <template v-else>
+      <div v-else class="history-timeline-body">
         <div class="timeline-picker" role="tablist" aria-label="选择对局">
           <button
             v-for="match in historyMatches.data.value ?? []"
@@ -394,7 +405,21 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
         </div>
 
         <MatchTimelinePanel v-else-if="timelineQuery.data.value" :timeline="timelineQuery.data.value" :champion-name="championNameOf" />
-      </template>
+
+        <!--
+          这一局的同场玩家。刻意放在时间线**下面**而不是另开一个页签：看着曲线最自然的
+          下一个问题就是「这局是跟谁打的」，这两件事本来就属于同一局。
+          数据不依赖时间线是否取到——逐帧拿不到时（自定义局等）这块照样有内容。
+        -->
+        <div v-if="selectedGameId" class="timeline-met">
+          <header class="timeline-met__head">
+            <UsersRound :size="13" />
+            <strong>这一局遇到的人</strong>
+            <small>来自本地相遇档案；点名字去战绩页看他的完整数据</small>
+          </header>
+          <MatchMetPlayers :allies="metInGame(selectedGameId, 'ally')" :enemies="metInGame(selectedGameId, 'enemy')" @open="openInMatches" />
+        </div>
+      </div>
     </section>
 
     <!--
@@ -440,22 +465,7 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
             </div>
           </header>
 
-          <div class="history-recent__met">
-            <div class="history-met-side">
-              <span class="history-met-side__label">队友 {{ metInGame(match.gameId, 'ally').length }}</span>
-              <div class="history-met-chips">
-                <button v-for="record in metInGame(match.gameId, 'ally')" :key="`ally-${match.gameId}-${record.puuid}`" type="button" class="history-met-chip" :title="riotIdOf(record)" @click="openInMatches(record)">{{ record.gameName }}</button>
-                <span v-if="!metInGame(match.gameId, 'ally').length" class="history-met-empty">未记录</span>
-              </div>
-            </div>
-            <div class="history-met-side history-met-side--enemy">
-              <span class="history-met-side__label">对手 {{ metInGame(match.gameId, 'enemy').length }}</span>
-              <div class="history-met-chips">
-                <button v-for="record in metInGame(match.gameId, 'enemy')" :key="`enemy-${match.gameId}-${record.puuid}`" type="button" class="history-met-chip" :title="riotIdOf(record)" @click="openInMatches(record)">{{ record.gameName }}</button>
-                <span v-if="!metInGame(match.gameId, 'enemy').length" class="history-met-empty">未记录</span>
-              </div>
-            </div>
-          </div>
+          <MatchMetPlayers class="history-recent__met" :allies="metInGame(match.gameId, 'ally')" :enemies="metInGame(match.gameId, 'enemy')" @open="openInMatches" />
         </article>
       </div>
     </section>
@@ -491,6 +501,8 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
 }
 .history-tabs button.active { color: var(--accent); background: var(--accent-soft); }
 .history-tabs button:not(.active):hover { color: var(--text-primary); background: var(--surface-muted); }
+/* 分组竖线：左边是主线页签（时间线 / 遇到的玩家），右边是旁支。 */
+.history-tabs__divider { align-self: stretch; width: 1px; margin: 3px 4px; background: var(--line); }
 
 /* Section */
 .history-section {
@@ -786,19 +798,21 @@ const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄
 .history-recent__stats strong[data-tone="win"] { color: var(--blue); }
 .history-recent__stats strong[data-tone="loss"] { color: var(--red); }
 .history-recent__stats strong[data-tone="unfinished"] { color: var(--amber); }
-.history-recent__met { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; padding: 10px 14px; }
-.history-met-side { min-width: 0; }
-.history-met-side__label { display: block; margin-bottom: 5px; color: var(--text-muted); font-size: 10px; }
-.history-met-chips { display: flex; flex-wrap: wrap; gap: 4px; }
-.history-met-chip { padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--text-primary); background: var(--surface-raised); cursor: pointer; font-size: 10px; transition: border-color 140ms ease, background 140ms ease; }
-.history-met-chip:hover { border-color: var(--accent); background: var(--accent-soft); }
-.history-met-empty { color: var(--text-muted); font-size: 10px; }
+/* 同场玩家的两列圆片现在由 MatchMetPlayers 组件渲染，这里只负责外边距。 */
+.history-recent__met { padding: 10px 14px; }
 
+/* 时间线页签的内容区：统一内边距，选局器 / 曲线 / 同场玩家之间交给 grid gap。 */
+.history-timeline-body { display: grid; gap: 14px; padding: 14px 16px; }
+/* 「这一局遇到的人」：用一条分隔线与上面的曲线分开——上面是走势，下面是名单。 */
+.timeline-met { padding-top: 12px; border-top: 1px solid var(--line); }
+.timeline-met__head { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; }
+.timeline-met__head svg { color: var(--accent); }
+.timeline-met__head strong { color: var(--text-primary); font-size: 12px; }
+.timeline-met__head small { color: var(--text-muted); font-size: 10px; }
 /* 时间线的对局选择器：横向滚动的一排小卡片，选中的那局高亮。 */
 .timeline-picker {
   display: flex;
   gap: 6px;
-  margin-bottom: 12px;
   padding-bottom: 4px;
   overflow-x: auto;
 }
