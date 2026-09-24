@@ -53,10 +53,17 @@ const publishedDate = () => {
   return /^\d{4}-\d{2}-\d{2}/.test(raw) ? raw.slice(0, 10) : "";
 };
 
-/** Release 页面走系统浏览器；`href` 保留是为了右键复制链接 / 无障碍语义。 */
-function openRelease() {
+/**
+ * Release 页面走系统浏览器；`href` 保留是为了右键复制链接 / 无障碍语义。
+ *
+ * 被宿主拒绝时以前是静默的（点了没反应），现在报出来——这条链路依赖
+ * `os.openUrl` 的 builtin_bridge 策略 + 外链白名单两处配置，哪天又漏了就看得出来。
+ */
+async function openRelease() {
   const url = update.value?.url;
-  if (url) void openExternalUrl(url);
+  if (!url) return;
+  if (await openExternalUrl(url)) return;
+  app.reportError("打开系统浏览器失败：外链没有被宿主放行");
 }
 
 onMounted(check);

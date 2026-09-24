@@ -8779,6 +8779,55 @@ test "automation loop only asks for work when an action is armed" {
     try std.testing.expect(Runtime.configWantsAutomation("{\"automation\":{\"enabled\":true,\"advisoryMode\":false,\"aramGrab\":true}}"));
 }
 
+/// `os.openUrl` 放行的外链前缀。
+///
+/// 宿主的 `security.allowsExternalUrl` 只认两种写法：与目标 URL **完全相等**，
+/// 或者**以 `*` 结尾**（把末尾的 `*` 去掉当纯前缀做 `startsWith`）。所以末尾这个
+/// `*` 不能省——写成 `https://github.com/NOBB2333/` 只会匹配这一条字面量。
+/// 与 `app.json` 里那份（打包 / 校验阶段用）保持一致，改一处要同步另一处。
+pub const external_link_allowlist = [_][]const u8{"https://github.com/NOBB2333/*"};
+
+/// 外链策略，交给 `RunOptions.security.navigation.external_links`。
+///
+/// ⚠️ `app.json` 里那份 `security.navigation.external_links` **运行时读不到**：
+/// 清单只在 build / package / 校验阶段被读，`src/runner.zig` 把 `RunOptions.security`
+/// 原样转交给 RuntimeOptions，全程没有任何一处去合并清单里的安全策略。
+/// 换句话说：这份才是真正生效的，漏了就是「点外链毫无反应」。
+pub fn externalLinkPolicy() native_sdk.ExternalLinkPolicy {
+    return .{ .action = .open_system_browser, .allowed_urls = &external_link_allowlist };
+}
+
+test "external link policy admits the project page and the release page" {
+    const policy = externalLinkPolicy();
+    try std.testing.expect(native_sdk.security.allowsExternalUrl(policy, "https://github.com/NOBB2333/LOL-desktop-native"));
+    // 「下载最新 Release」指向 `releases/tag/x.y.z`，路径比前缀更深，必须也能过。
+    try std.testing.expect(native_sdk.security.allowsExternalUrl(policy, "https://github.com/NOBB2333/LOL-desktop-native/releases/tag/v2.5.0"));
+    // 更新检查走的是 `api.github.com`，那个不该被放行（界面上的按钮给的是 html_url）。
+    try std.testing.expect(!native_sdk.security.allowsExternalUrl(policy, "https://api.github.com/repos/NOBB2333/LOL-desktop-native/releases/latest"));
+    try std.testing.expect(!native_sdk.security.allowsExternalUrl(policy, "https://github.com/someone-else/repo"));
+    // 忘了末尾的 `*` 会退化成「只匹配这一条字面量」——正是最容易踩的样子。
+    try std.testing.expect(!native_sdk.security.allowsExternalUrl(
+        .{ .action = .open_system_browser, .allowed_urls = &.{"https://github.com/NOBB2333/"} },
+        "https://github.com/NOBB2333/LOL-desktop-native",
+    ));
+}
+
+test "os.openUrl only opens when an explicit builtin bridge policy lists it" {
+    // `native-sdk.os.*` 在 `runtime/flow.zig` 里拿到 `js_permission = null`，
+    // 进不了 `js_window_api` 那条按权限判断的路（`allowsBuiltinBridgeCommand`
+    // 一见 null 就 return false）。所以**只有显式策略能放行**——默认策略必须是否的。
+    const disabled: native_sdk.BridgePolicy = .{};
+    try std.testing.expect(!disabled.allows("native-sdk.os.openUrl", "zero://app"));
+
+    const origins = [_][]const u8{ "zero://app", "http://127.0.0.1:49173" };
+    const commands = [_]native_sdk.BridgeCommandPolicy{.{ .name = "native-sdk.os.openUrl", .origins = &origins }};
+    const enabled: native_sdk.BridgePolicy = .{ .enabled = true, .commands = &commands };
+    try std.testing.expect(enabled.allows("native-sdk.os.openUrl", "zero://app"));
+    // 开了 enabled 也不会顺带放行别的内建命令：没列出来就是 denied。
+    try std.testing.expect(!enabled.allows("native-sdk.os.showNotification", "zero://app"));
+    try std.testing.expect(!enabled.allows("native-sdk.os.openUrl", "https://evil.example"));
+}
+
 test "runtime persistence paths share one stable data root" {
     var original = Runtime.init();
     try original.setDataPaths("test-data-root");

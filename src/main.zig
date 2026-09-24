@@ -729,9 +729,30 @@ pub fn main(init: std.process.Init) !void {
         // also register the SDK's window-local shortcut table.
         .shortcuts = if (comptime builtin.os.tag == .windows) &[_]native_sdk.Shortcut{} else null,
         .js_window_api = true,
+        // ⚠️ `app.json` 里的 `security.navigation.external_links` **运行时读不到**：
+        // 清单只在 build/package/校验阶段被读，真正生效的是这里的 `RunOptions.security`
+        // （`runner.zig` 原样转交给 RuntimeOptions，全程没人去合并清单那份）。
+        // 不在这里写 external_links，外链就等于 `deny`：点一下什么都不会发生，
+        // 前端 `openExternalUrl` 的 catch 又把错误吞了，从界面上看不出原因。
+        // 白名单前缀本身放在 backend 里，与它的单测同一处真源。
         .security = .{
             .permissions = &.{ "filesystem", "credentials", "clipboard" },
-            .navigation = .{ .allowed_origins = &dev_origins },
+            .navigation = .{
+                .allowed_origins = &dev_origins,
+                .external_links = backend.externalLinkPolicy(),
+            },
+        },
+        // OS 类内建命令（`native-sdk.os.*`）在 `runtime/flow.zig` 里拿到的是
+        // `js_permission = null`，走不进 `js_window_api` 那条按权限判断的宽松路径——
+        // `allowsBuiltinBridgeCommand` 一见 null 就 `return false`。
+        // **只有显式的 builtin_bridge 策略能放行**，否则 `os.openUrl` 一律回
+        // "OS API is not permitted"。策略一并设成 enabled 只会让未列出的内建命令
+        // 保持 denied（与本文档现状一致），列出的这条才放行。
+        .builtin_bridge = .{
+            .enabled = true,
+            .commands = &.{
+                .{ .name = "native-sdk.os.openUrl", .origins = &dev_origins },
+            },
         },
     }, init);
 }

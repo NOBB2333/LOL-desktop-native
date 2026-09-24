@@ -93,9 +93,16 @@ function toggleTheme() {
   app.config.appearance.colorMode = dark.value ? "light" : "dark";
 }
 
-/** 项目地址交给系统浏览器：应用内 WebView 没地址栏，开在里面就出不来了。 */
-function openProjectUrl() {
-  void openExternalUrl(PROJECT_URL);
+/**
+ * 项目地址交给系统浏览器：应用内 WebView 没地址栏，开在里面就出不来了。
+ *
+ * 宿主会按 `os.openUrl` 的策略与外链白名单放行，失败时**什么都不发生**——
+ * 以前这里直接把返回值丢掉，界面上看不出到底是没点到还是被拒了，
+ * 所以现在把失败也报出来（走错误提示队列）。
+ */
+async function openProjectUrl() {
+  if (await openExternalUrl(PROJECT_URL)) return;
+  app.reportError("打开系统浏览器失败：外链没有被宿主放行");
 }
 
 function invalidateMatchHistory() {

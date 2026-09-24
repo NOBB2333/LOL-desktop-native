@@ -27,7 +27,8 @@
     "shortcuts",
     "filesystem",
     "sqlite",
-    "tray"
+    "tray",
+    "open_url"
   ],
   "bridge": {
     "commands": [
