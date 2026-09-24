@@ -311,16 +311,18 @@ function selectFromKeyboard(event: KeyboardEvent) {
             </b>
           </div>
 
-          <!-- 模式 -->
-          <small class="bp-player-card__recent-mode" :title="match.queueName || '未知模式'">
-            {{ match.queueName || "未知模式" }}
-          </small>
+          <!-- 模式与时间。单列时靠 `display: contents` 继续参与外层的单行网格，
+               双列时整块落到第二行（一行放不下四个格子）。 -->
+          <div class="match-meta">
+            <small class="bp-player-card__recent-mode" :title="match.queueName || '未知模式'">
+              {{ match.queueName || "未知模式" }}
+            </small>
 
-          <!-- 时间与耗时 -->
-          <time class="bp-player-card__recent-time" :datetime="match.playedAt" :title="shortDate(match.playedAt)">
-            <span>{{ shortDay(match.playedAt) }}</span>
-            <em>{{ match.durationMinutes }}m</em>
-          </time>
+            <time class="bp-player-card__recent-time" :datetime="match.playedAt" :title="shortDate(match.playedAt)">
+              <span>{{ shortDay(match.playedAt) }}</span>
+              <em>{{ match.durationMinutes }}m</em>
+            </time>
+          </div>
         </button>
       </template>
       <span v-else class="bp-player-card__empty">暂无最近对局</span>
@@ -985,6 +987,65 @@ function selectFromKeyboard(event: KeyboardEvent) {
   padding-right: 2px;
 }
 
+/*
+ * 双列时一张卡只有 ~190px，每格只剩 ~90px。原来的单行四格
+ * （胜负/头像 + KDA + 模式 + 时间）最少要 ~180px，格子互相压字，
+ * 模式和日期干脆叠在一起。所以双列换成两行：
+ *   第一行 胜负/头像（左）+ KDA（右）
+ *   第二行 模式（左）+ 日期时长（右）——整块 `match-meta` 占满一行
+ * 字号各收一档、超出省略；单列时 `.match-meta` 是 `display: contents`，
+ * 四个格子照旧参与外层那条单行网格，什么都不变。
+ */
+.match-meta {
+  display: contents;
+}
+
+.bp-player-card__recent:not(.bp-player-card__recent--single) .recent-match-row {
+  grid-template-areas:
+    "left kda"
+    "meta meta";
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 4px;
+  row-gap: 2px;
+  min-height: 42px;
+  padding: 3px 5px;
+}
+
+.bp-player-card__recent:not(.bp-player-card__recent--single) .match-left {
+  gap: 3px;
+}
+
+.bp-player-card__recent:not(.bp-player-card__recent--single) .match-kda-box {
+  justify-content: flex-end;
+}
+
+.bp-player-card__recent:not(.bp-player-card__recent--single) .match-kda-box b {
+  font-size: 10px;
+}
+
+.bp-player-card__recent:not(.bp-player-card__recent--single) .match-meta {
+  display: flex;
+  grid-area: meta;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  min-width: 0;
+  padding-top: 2px;
+  border-top: 1px dotted color-mix(in srgb, var(--line) 70%, transparent);
+}
+
+.bp-player-card__recent:not(.bp-player-card__recent--single) .bp-player-card__recent-mode {
+  font-size: 9px;
+}
+
+/* 双列里时间必须收成一行：默认是「日期 / 时长」竖着排的，两行会把行高撑起来。 */
+.bp-player-card__recent:not(.bp-player-card__recent--single) .bp-player-card__recent-time {
+  flex-direction: row;
+  align-items: baseline;
+  gap: 3px;
+  font-size: 9px;
+}
+
 /* 6. 常用英雄 */
 .bp-player-card__champions {
   margin-top: 8px;
@@ -1069,52 +1130,10 @@ function selectFromKeyboard(event: KeyboardEvent) {
   border-top: 1px dashed var(--line);
 }
 
-/* 针对双列模式微调：两行排列，保证在狭窄列宽下绝不重叠 */
-@media (min-width: 0px) {
-  .bp-player-card__recent:not(.bp-player-card__recent--single) .recent-match-row {
-    display: flex;
-    flex-direction: column;
-    align-items: stretch;
-    justify-content: center;
-    padding: 3px 5px;
-    gap: 2px;
-    min-height: 38px;
-  }
-
-  .bp-player-card__recent:not(.bp-player-card__recent--single) .match-left {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-  }
-
-  .bp-player-card__recent:not(.bp-player-card__recent--single) .recent-match-row > :first-child {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-
-  .bp-player-card__recent:not(.bp-player-card__recent--single) .match-kda-box {
-    margin-left: auto;
-  }
-
-  .bp-player-card__recent:not(.bp-player-card__recent--single) .recent-match-row > :nth-child(2) {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 4px;
-    padding-top: 1px;
-    border-top: 1px dotted color-mix(in srgb, var(--line) 60%, transparent);
-  }
-
-  .bp-player-card__recent:not(.bp-player-card__recent--single) .bp-player-card__recent-mode {
-    font-size: 9px;
-  }
-
-  .bp-player-card__recent:not(.bp-player-card__recent--single) .bp-player-card__recent-time {
-    flex-direction: row;
-    align-items: baseline;
-    gap: 3px;
-    font-size: 8.5px;
-  }
-}
+/*
+ * 这里原先还有一份双列覆盖（`@media (min-width: 0px)` + `display:flex; column`），
+ * 它排在最末尾，会盖掉「最近对局区域」那段的两行网格：四格被摊成四行堆叠，
+ * 每格只有 ~92px 时行高被撑到 77px，模式和时间还叠在一起——「双列一直显示不对」
+ * 就是它。双列的布局现在只有上面那一处，不要再往末尾追加覆盖规则。
+ */
 </style>
