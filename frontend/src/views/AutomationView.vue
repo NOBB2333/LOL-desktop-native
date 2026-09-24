@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ArrowDown, ArrowUp, Bot, Braces, Keyboard, Play, Plus, ShieldCheck, Sparkles, Trash2, Zap } from "@lucide/vue";
 import { NButton, NInput, NInputNumber, NSelect, NSwitch, useMessage } from "naive-ui";
+import type { SelectOption } from "naive-ui";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 import PageHeader from "../components/PageHeader.vue";
@@ -11,6 +12,7 @@ import { useAppStore } from "../stores/app";
 import type { ShortcutTarget } from "../types/domain";
 import { renderShortcutTemplateExample, shortcutTemplateFields } from "../shortcuts/template";
 import { shortcutTargetLabel, shortcutTargetOptions } from "../shortcuts/targets";
+import { matchesChampionQuery } from "../champions/nicknames";
 
 const app = useAppStore();
 const message = useMessage();
@@ -19,6 +21,15 @@ const message = useMessage();
 const champions = useQuery({ queryKey: computed(() => ["automation-champions", app.mode]), queryFn: () => backend.champions(), enabled: computed(() => app.initialized), staleTime: 3600000 });
 const championOptions = computed(() => (champions.data.value ?? []).map((champion) => ({ label: `${champion.name} · ${champion.alias}`, value: champion.id })));
 const championById = computed(() => new Map((champions.data.value ?? []).map((champion) => [champion.id, champion])));
+/**
+ * 三个候选下拉都是 `filterable`，但 naive-ui 默认只拿 `label` 做子串匹配——
+ * 于是「牛头」搜不到阿利斯塔。这里把匹配交给 `champions/nicknames.ts`
+ * （称号 + 英文名 + 社区俗称），三个下拉共用一份口径。
+ */
+function championFilter(pattern: string, option: SelectOption): boolean {
+  const champion = championById.value.get(Number(option.value));
+  return champion ? matchesChampionQuery(champion, pattern) : false;
+}
 const automationRunning = ref(false);
 const recordingShortcutId = ref<string | null>(null);
 const debugShortcutId = ref<string | null>(null);
@@ -288,7 +299,7 @@ const targetLabel = (target: ShortcutTarget) => shortcutTargetLabel(target);
                 <span class="pool-label__title">自动选人候选</span>
                 <small class="pool-label__hint">按顺序尝试；一号位不可用时继续尝试下一位</small>
               </label>
-              <NSelect v-model:value="app.config.automation.pickChampionIds" multiple filterable :options="championOptions" placeholder="选择 1–3 个备选英雄" />
+              <NSelect v-model:value="app.config.automation.pickChampionIds" multiple filterable :filter="championFilter" :options="championOptions" placeholder="选择 1–3 个备选英雄（可按俗称搜：牛头 / 奶妈）" />
               <div class="champion-list">
                 <article v-for="(id, index) in app.config.automation.pickChampionIds" :key="`pick-${id}`" class="champion-item">
                   <span class="champion-item__order">{{ index + 1 }}</span>
@@ -310,7 +321,7 @@ const targetLabel = (target: ShortcutTarget) => shortcutTargetLabel(target);
                 <span class="pool-label__title">自动禁用候选</span>
                 <small class="pool-label__hint">每次动作只提交一个仍可用的英雄</small>
               </label>
-              <NSelect v-model:value="app.config.automation.banChampionIds" multiple filterable :options="championOptions" placeholder="选择多个禁用备选" />
+              <NSelect v-model:value="app.config.automation.banChampionIds" multiple filterable :filter="championFilter" :options="championOptions" placeholder="选择多个禁用备选" />
               <div class="champion-list">
                 <article v-for="(id, index) in app.config.automation.banChampionIds" :key="`ban-${id}`" class="champion-item">
                   <span class="champion-item__order champion-item__order--ban">{{ index + 1 }}</span>
@@ -332,7 +343,7 @@ const targetLabel = (target: ShortcutTarget) => shortcutTargetLabel(target);
                 <span class="pool-label__title">大乱斗抢人候选</span>
                 <small class="pool-label__hint">极地 / 海克斯大乱斗共用；只会在替补席上出现时才换过去</small>
               </label>
-              <NSelect v-model:value="app.config.automation.aramChampionIds" multiple filterable :options="championOptions" placeholder="按优先级选择想要的英雄" />
+              <NSelect v-model:value="app.config.automation.aramChampionIds" multiple filterable :filter="championFilter" :options="championOptions" placeholder="按优先级选择想要的英雄" />
               <div class="champion-list">
                 <article v-for="(id, index) in app.config.automation.aramChampionIds" :key="`aram-${id}`" class="champion-item">
                   <span class="champion-item__order champion-item__order--aram">{{ index + 1 }}</span>

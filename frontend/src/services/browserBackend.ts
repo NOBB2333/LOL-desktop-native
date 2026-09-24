@@ -13,6 +13,7 @@ import { isNative } from "./native";
 import {
   createFixtureJunglePath,
   createFixtureLobby,
+  createFixturePlayerStats,
   createFixtureRoomLobby,
   createFixtureMatchTimeline,
   fixtureBootstrap,
@@ -54,6 +55,7 @@ import type {
   MatchSummary,
   MatchTimeline,
   PlayerProfile,
+  PlayerStatSummary,
   ReleaseUpdate,
   RestoreFriendResult,
   ShortcutValidation,
@@ -309,6 +311,9 @@ export const browserBackend = {
   },
   champions(): ChampionOverview[] {
     return structuredClone(fixtureChampions);
+  },
+  playerStats(puuids: string[]): PlayerStatSummary[] {
+    return createFixturePlayerStats(puuids);
   },
   matchDetail(gameId: number): MatchSummary {
     const match = fixtureMatches.find((item) => item.gameId === gameId);

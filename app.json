@@ -152,6 +152,13 @@
         ]
       },
       {
+        "name": "lol.get_player_stats",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
         "name": "lol.get_friends",
         "origins": [
           "zero://app",

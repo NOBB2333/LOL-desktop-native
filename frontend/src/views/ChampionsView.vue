@@ -9,6 +9,7 @@ import PageHeader from "../components/PageHeader.vue";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import { championImage, percent } from "../utils/format";
+import { NICKNAME_CHAMPION_COUNT, matchesChampionQuery } from "../champions/nicknames";
 import {
   OPGG_REGION_STORAGE_KEY,
   OPGG_TIER_STORAGE_KEY,
@@ -82,8 +83,9 @@ const roleLabels: Record<string, string> = { TOP: "上路", JUNGLE: "打野", MI
 const roleLabel = (value: string) => roleLabels[value.toUpperCase()] ?? value;
 const roles = computed(() => [{ label: "全部位置", value: "all" }, ...Array.from(new Set(rows.value.flatMap((champion) => champion.roles))).filter(Boolean).map((value) => ({ label: roleLabel(value), value }))]);
 const filtered = computed(() => rows.value.filter((champion) => {
-  const query = search.value.trim().toLowerCase();
-  return (!query || champion.name.toLowerCase().includes(query) || champion.alias.toLowerCase().includes(query)) && (tier.value === "all" || champion.tier === tier.value || champion.tier.startsWith(tier.value)) && (role.value === "all" || champion.roles.includes(role.value));
+  // 匹配口径收口在 `champions/nicknames.ts`：称号 + 英文名 + **社区俗称**（牛头/奶妈/龙龟…）。
+  // 俗称不在任何接口里（LCU 只给 name + alias），所以那份表是本地维护的。
+  return matchesChampionQuery(champion, search.value) && (tier.value === "all" || champion.tier === tier.value || champion.tier.startsWith(tier.value)) && (role.value === "all" || champion.roles.includes(role.value));
 }).sort((left, right) => {
   if (sort.value === "name") return left.name.localeCompare(right.name, "zh-CN");
   if (sort.value === "tier") return tierOrder(left.tier) - tierOrder(right.tier) || right.winRate - left.winRate;
@@ -110,7 +112,7 @@ async function refresh() { await champions.refetch(); message.success("英雄数
 <template>
   <div class="page-shell champions-page champions-page--dense">
     <PageHeader title="英雄" eyebrow="CHAMPION DATA" meta="统计来自 OP.GG；英雄、装备和图标优先读取 LCU / SQLite 缓存">
-      <div class="champions-toolbar"><NInput v-model:value="search" size="small" placeholder="搜索英雄或别名" clearable><template #prefix><Search :size="14" /></template></NInput><span class="champions-toolbar__scope">统计口径<em v-if="statsRegionFollowed">跟随本机</em></span><NSelect :value="statsRegion" class="champion-region" size="small" :options="opggRegionOptions" :title="statsRegionFollowed ? '默认跟随本机登录大区；手动选一次就固定下来' : '已在手动选择中'" @update:value="chooseRegion" /><NSelect v-model:value="statsTier" class="champion-stats-tier" size="small" :options="opggTierOptions" /><NSelect v-model:value="tier" size="small" :options="[{ label: '全部梯队', value: 'all' }, { label: 'T1', value: 'T1' }, { label: 'T2', value: 'T2' }, { label: 'T3', value: 'T3' }, { label: 'T4', value: 'T4' }, { label: 'T5', value: 'T5' }]" /><NSelect v-model:value="role" size="small" :options="roles" /><NSelect v-model:value="sort" class="champion-sort" size="small" :options="sortOptions" /><div class="view-toggle" aria-label="英雄视图"><button type="button" :class="{ active: viewMode === 'list' }" title="列表视图" @click="setView('list')"><List :size="15" /></button><button type="button" :class="{ active: viewMode === 'grid' }" title="网格视图" @click="setView('grid')"><Grid2X2 :size="15" /></button></div><NButton quaternary size="small" :loading="champions.isFetching.value" @click="refresh"><template #icon><RefreshCw :size="14" /></template>刷新</NButton></div>
+      <div class="champions-toolbar"><NInput v-model:value="search" size="small" :title="`支持社区俗称：牛头 / 奶妈 / 龙龟 / 文森特……（已收录 ${NICKNAME_CHAMPION_COUNT} 个英雄）`" placeholder="搜索英雄、称号或俗称" clearable><template #prefix><Search :size="14" /></template></NInput><span class="champions-toolbar__scope">统计口径<em v-if="statsRegionFollowed">跟随本机</em></span><NSelect :value="statsRegion" class="champion-region" size="small" :options="opggRegionOptions" :title="statsRegionFollowed ? '默认跟随本机登录大区；手动选一次就固定下来' : '已在手动选择中'" @update:value="chooseRegion" /><NSelect v-model:value="statsTier" class="champion-stats-tier" size="small" :options="opggTierOptions" /><NSelect v-model:value="tier" size="small" :options="[{ label: '全部梯队', value: 'all' }, { label: 'T1', value: 'T1' }, { label: 'T2', value: 'T2' }, { label: 'T3', value: 'T3' }, { label: 'T4', value: 'T4' }, { label: 'T5', value: 'T5' }]" /><NSelect v-model:value="role" size="small" :options="roles" /><NSelect v-model:value="sort" class="champion-sort" size="small" :options="sortOptions" /><div class="view-toggle" aria-label="英雄视图"><button type="button" :class="{ active: viewMode === 'list' }" title="列表视图" @click="setView('list')"><List :size="15" /></button><button type="button" :class="{ active: viewMode === 'grid' }" title="网格视图" @click="setView('grid')"><Grid2X2 :size="15" /></button></div><NButton quaternary size="small" :loading="champions.isFetching.value" @click="refresh"><template #icon><RefreshCw :size="14" /></template>刷新</NButton></div>
     </PageHeader>
     <LoadingState v-if="champions.isLoading.value" label="正在加载英雄统计" />
     <template v-else>

@@ -19,6 +19,7 @@ const events_ipc = @import("backend/events_ipc.zig");
 const player_tags_ipc = @import("backend/player_tags_ipc.zig");
 const friends_ipc = @import("backend/friends_ipc.zig");
 const match_timeline = @import("backend/timeline.zig");
+const player_stats = @import("backend/player_stats.zig");
 const launcher_ipc = @import("backend/launcher_ipc.zig");
 const assets_ipc = @import("backend/assets_ipc.zig");
 const claim_ipc = @import("backend/claim_ipc.zig");
@@ -278,6 +279,8 @@ pub const command_table = [_]CommandSpec{
     .{ .name = "lol.get_champions", .lane = .query },
     .{ .name = "lol.get_asset", .lane = .query },
     .{ .name = "lol.get_encounters", .lane = .query },
+    // 每人两次 LCU 往返，走 query 通道按需触发；上限见 backend/player_stats.zig。
+    .{ .name = "lol.get_player_stats", .lane = .query },
     .{ .name = "lol.get_friends", .lane = .query },
     .{ .name = "lol.get_friend_last_game", .lane = .query },
     .{ .name = "lol.delete_friend", .lane = .action },
@@ -673,6 +676,7 @@ pub const Runtime = struct {
             .{ .name = "lol.get_champions", .context = self, .invoke_fn = assets_ipc.getChampions },
             .{ .name = "lol.get_asset", .context = self, .invoke_fn = assets_ipc.getAsset },
             .{ .name = "lol.get_encounters", .context = self, .invoke_fn = getEncounters },
+            .{ .name = "lol.get_player_stats", .context = self, .invoke_fn = player_stats.getPlayerStats },
             .{ .name = "lol.get_friends", .context = self, .invoke_fn = friends_ipc.getFriends },
             .{ .name = "lol.get_friend_last_game", .context = self, .invoke_fn = friends_ipc.getFriendLastGame },
             .{ .name = "lol.delete_friend", .context = self, .invoke_fn = friends_ipc.deleteFriend },
@@ -5118,7 +5122,7 @@ fn identityNumericId(value: std.json.Value) i64 {
     return 0;
 }
 
-fn isNumericIdentity(value: []const u8) bool {
+pub fn isNumericIdentity(value: []const u8) bool {
     if (value.len == 0) return false;
     for (value) |character| if (!std.ascii.isDigit(character)) return false;
     return true;
@@ -5349,10 +5353,27 @@ fn writeNullableInt(writer: *std.Io.Writer, value: std.json.Value, name: []const
 
 /// 从召唤师对象里取等级。LCU 用缺字段或 0 表示「没拿到」，两种都归成 null，
 /// 免得界面上出现「等级 0」这种明显不对的数字。
-fn summonerLevelFromJson(value: std.json.Value) ?i64 {
+pub fn summonerLevelFromJson(value: std.json.Value) ?i64 {
     if (value != .object) return null;
     const level = jsonInt(value, "summonerLevel");
     return if (level > 0) level else null;
+}
+
+/// 单个玩家的等级/段位输出片段（`player_stats.zig` 的 `get_player_stats` 与
+/// `searchSummoner` 共用同一个形状，两处不许漂）。
+///
+/// `ranked` 为空、或该队列没打 / 未定级时写 `null`——这是「没这个数据」，
+/// 前端要显示「—」，不要写成 0 或「无段位」（那是另一个含义）。
+pub fn writePlayerStat(writer: *std.Io.Writer, puuid: []const u8, ranked: ?std.json.Value, level: ?i64) !void {
+    try writer.writeAll("{\"puuid\":");
+    try jsonString(writer, puuid);
+    try writer.writeAll(",\"summonerLevel\":");
+    if (level) |value| try writer.print("{d}", .{value}) else try writer.writeAll("null");
+    try writer.writeAll(",\"soloRank\":");
+    if (ranked) |value| try writeRank(writer, value, "RANKED_SOLO_5x5") else try writer.writeAll("null");
+    try writer.writeAll(",\"flexRank\":");
+    if (ranked) |value| try writeRank(writer, value, "RANKED_FLEX_SR") else try writer.writeAll("null");
+    try writer.writeAll("}");
 }
 
 fn writeRank(writer: *std.Io.Writer, ranked: std.json.Value, queue_type: []const u8) !void {
@@ -6151,7 +6172,7 @@ fn writeEncounterProfileFields(writer: *std.Io.Writer, summary: EncounterSummary
     if (summary.latest_len > 0) try jsonString(writer, summary.latestValue()) else try writer.writeAll("null");
 }
 
-fn firstJsonValue(value: std.json.Value) std.json.Value {
+pub fn firstJsonValue(value: std.json.Value) std.json.Value {
     return if (value == .array and value.array.items.len > 0) value.array.items[0] else value;
 }
 

@@ -41,6 +41,21 @@ export interface RankQueueSummary {
   losses: number;
 }
 
+/**
+ * 某个 puuid 的等级与段位（后端 `lol.get_player_stats` 按人取）。
+ *
+ * 三个字段都可能为 `null`，含义各不相同，界面上一律显示「—」、不要用 0 兜底：
+ * - `summonerLevel`：LCU 没有这个召唤师（跨区 / 改名）时为 null。
+ * - `soloRank` / `flexRank`：该赛季没打这个队列、或战绩隐藏时为 null。
+ *   这是「没打」而不是「无段位」。
+ */
+export interface PlayerStatSummary {
+  puuid: string;
+  summonerLevel: number | null;
+  soloRank: RankQueueSummary | null;
+  flexRank: RankQueueSummary | null;
+}
+
 export interface RecentMatch {
   gameId: number;
   queueId?: number;

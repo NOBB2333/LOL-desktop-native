@@ -22,6 +22,7 @@ import type {
   MatchTimelineFrame,
   MatchTimelineParticipant,
   PlayerProfile,
+  PlayerStatSummary,
   RecentMatch,
   RuneSummary,
   SpellSummary,
@@ -292,13 +293,27 @@ export function createFixtureRoomLobby(rankedOnly: boolean): LiveLobby {
   return value;
 }
 
+/**
+ * 「我」在每局用的英雄。三处必须用同一份：对局列表的本行、十人详情里的座位 0、
+ * 相遇记录的 selfChampion —— 各写各的就会出现「列表说我玩了狐狸、详情里座位 0
+ * 却是剑魔」这种自相矛盾的预览（用户看到只会以为功能坏了）。
+ */
+const SELF_CHAMPION_BY_MATCH = ["九尾妖狐", "发条魔灵", "诡术妖姬", "岩雀", "九尾妖狐", "辛德拉", "九尾妖狐", "阿卡丽", "九尾妖狐", "发条魔灵"] as const;
+const CHAMPION_IDS: Record<string, number> = { "九尾妖狐": 103, "发条魔灵": 61, "诡术妖姬": 7, "岩雀": 163, "辛德拉": 134, "阿卡丽": 84 };
+
 function matchParticipants(index: number, win: boolean): MatchParticipant[] {
+  const selfChampionName = SELF_CHAMPION_BY_MATCH[index] ?? "九尾妖狐";
   return champions.map(([championId, championName, , role], slot) => ({
-    puuid: `match-${index}-player-${slot}`,
-    gameName: slot < 5 ? `我方玩家${slot + 1}` : `敌方玩家${slot - 4}`,
+    // ⚠️ puuid / 名字必须与大厅（`allyNames` / `enemyNames`）用同一套——相遇档案和
+    // 「关系记录」都按这些 puuid 关联。各写各的会让预览里「这一局遇到谁」「遇到过 N 次」
+    // 永远 join 不上，看起来就像功能没做（前面已经因为同样的问题返工过一次）。
+    // 座位 0 正好是「我」（`allyNames[0]`），所以相遇档案（`ally.slice(1)`）天然不含自己。
+    puuid: slot < 5 ? `fixture-ally-${slot}` : `fixture-enemy-${slot - 5}`,
+    gameName: (slot < 5 ? allyNames : enemyNames)[slot % 5][0],
     isBot: false,
-    championId,
-    championName,
+    // 座位 0 = 我，英雄用这一局真实的那只（见上面的 `SELF_CHAMPION_BY_MATCH`）。
+    championId: slot === 0 ? CHAMPION_IDS[selfChampionName] ?? championId : championId,
+    championName: slot === 0 ? selfChampionName : championName,
     side: slot < 5 ? "ally" : "enemy",
     position: role,
     kills: slot === 2 ? 9 : 3 + ((slot + index) % 5),
@@ -334,9 +349,9 @@ const fixtureBanDetails: BanSummary[] = [
   { id: 412, name: "魂锁典狱长", iconUrl: "./fixtures/champions/Thresh.png", side: "enemy" },
 ];
 
-export const fixtureMatches: MatchSummary[] = ["九尾妖狐", "发条魔灵", "诡术妖姬", "岩雀", "九尾妖狐", "辛德拉", "九尾妖狐", "阿卡丽", "九尾妖狐", "发条魔灵"].map((championName, index) => {
+export const fixtureMatches: MatchSummary[] = SELF_CHAMPION_BY_MATCH.map((championName, index) => {
   const win = ![2, 5, 6, 9].includes(index);
-  const championId = { "九尾妖狐": 103, "发条魔灵": 61, "诡术妖姬": 7, "岩雀": 163, "辛德拉": 134, "阿卡丽": 84 }[championName] ?? 103;
+  const championId = CHAMPION_IDS[championName] ?? 103;
   const kills = index === 0 ? 9 : index === 1 ? 4 : index === 2 ? 7 : 6;
   const deaths = index === 0 ? 2 : index === 1 ? 3 : index === 2 ? 8 : 4;
   const assists = index === 0 ? 11 : index === 1 ? 16 : index === 2 ? 5 : 9;
@@ -760,4 +775,35 @@ export function createFixtureMatchTimeline(gameId: number): MatchTimeline {
   ].filter((item) => item.seconds <= durationSeconds);
 
   return { gameId, durationSeconds, participants, frames, events };
+}
+
+/**
+ * 预览用的「召唤师等级 / 段位」。
+ *
+ * 大厅那十个人本来就是同一批对局里的人，所以优先复用他们的等级与段位（值也和
+ * 实时页一致）；不在大厅里的 puuid 按字符和造一份**稳定**的值——不能用随机数，
+ * 否则每次刷新界面上的段位都在跳，看着像坏了。
+ */
+export function createFixturePlayerStats(puuids: string[]): PlayerStatSummary[] {
+  const roster = [...fixtureLobby.ally, ...fixtureLobby.enemy];
+  return puuids.map((puuid) => {
+    const known = roster.find((player) => player.puuid === puuid);
+    if (known) {
+      return {
+        puuid,
+        summonerLevel: known.summonerLevel ?? null,
+        soloRank: known.soloRank ?? null,
+        flexRank: known.flexRank ?? null,
+      };
+    }
+    const seed = [...puuid].reduce((sum, char) => sum + char.charCodeAt(0), 0);
+    const tier = ["GOLD", "PLATINUM", "EMERALD", "DIAMOND"][seed % 4] ?? "GOLD";
+    const division = ["I", "II", "III", "IV"][seed % 4] ?? "IV";
+    return {
+      puuid,
+      summonerLevel: 120 + (seed % 400),
+      soloRank: { queueType: "RANKED_SOLO_5x5", tier, division, leaguePoints: 10 + (seed % 90), wins: 40 + (seed % 60), losses: 35 + (seed % 50) },
+      flexRank: null,
+    };
+  });
 }

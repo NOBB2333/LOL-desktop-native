@@ -29,6 +29,7 @@ import type {
   LiveLobby,
   MatchSummary,
   MatchTimeline,
+  PlayerStatSummary,
   ReleaseUpdate,
   RestoreFriendResult,
   ShortcutValidation,
@@ -38,6 +39,14 @@ import type {
 import { createShortcutSendQueue } from "../shortcuts/sendQueue";
 
 const assetRequests = new Map<string, Promise<AssetPayload>>();
+
+/**
+ * `playerStats` 一次最多问几个人。
+ *
+ * 每人要两次 LCU 往返（段位 + 召唤师），所以这个数是**暴力上限**，不是「越多越好」。
+ * 10 = 一局十个人，正好是我们唯一的用法（展开的那一局）。后端有同名上限，两边要一致。
+ */
+export const PLAYER_STATS_LIMIT = 10;
 
 /** 是否运行在原生宿主里（而非浏览器预览）。UI 用它决定要不要起轮询、拉原生资源。 */
 export const isTauri = isNative;
@@ -244,6 +253,24 @@ export const backend = {
       selfPuuid: selfPuuid?.trim() || null,
     });
     return response.tags ?? {};
+  },
+  /**
+   * 一批 puuid 的召唤师等级与段位（单双排 / 灵活）。
+   *
+   * 每人要两次 LCU 往返，所以**只对界面上真的会展示的一批人**调用（目前只有
+   * 「展开的那一局的十个人」），别拿它去批量扫历史对局。没有的 puuid 照样返回、
+   * 三个字段都是 `null`，调用方要按「没这个数据」显示「—」，不要写成 0。
+   * `selfPuuid` 与 `matchDetail` 同义：账号归属校验，换号后旧结果一律拒绝。
+   */
+  async playerStats(puuids: string[], selfPuuid = ""): Promise<PlayerStatSummary[]> {
+    const targets = [...new Set(puuids.map((puuid) => puuid?.trim() ?? "").filter(Boolean))].slice(0, PLAYER_STATS_LIMIT);
+    if (!targets.length) return [];
+    if (usesFixtureData()) return browserBackend.playerStats(targets);
+    const response = await command<{ players?: PlayerStatSummary[] }>("get_player_stats", {
+      puuids: targets,
+      selfPuuid: selfPuuid?.trim() || null,
+    });
+    return response.players ?? [];
   },
   /** 覆盖写入某位玩家的备注，返回清洗后的结果。 */
   async updatePlayerTag(puuid: string, notes: string[], selfPuuid?: string | null): Promise<{ puuid: string; notes: string[]; updatedAt: number }> {

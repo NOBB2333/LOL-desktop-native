@@ -19,6 +19,9 @@ export interface RelationshipGame {
   side: "ally" | "enemy";
   championId: number;
   championName: string;
+  /** 这一局**我**用的英雄；旧记录可能缺（缺了界面显示「未记录」）。 */
+  selfChampionId?: number;
+  selfChampionName?: string;
   kills: number;
   deaths: number;
   assists: number;
@@ -78,6 +81,9 @@ function toGame(record: EncounterRecord): RelationshipGame {
     side: record.side === "ally" ? "ally" : "enemy",
     championId: record.championId,
     championName: record.championName,
+    // 「他玩了什么，我玩了什么」要成对出现：我的英雄在同一行记录里就有。
+    selfChampionId: record.selfChampionId,
+    selfChampionName: record.selfChampionName,
     queueName: record.queueName ?? "",
     encounteredAt: record.encounteredAt,
     won: won(record),

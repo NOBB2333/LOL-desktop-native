@@ -5,12 +5,11 @@ import { computed, ref, watch } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 import { useRoute, useRouter } from "vue-router";
 import AssetIcon from "../components/AssetIcon.vue";
-import MatchDetailPanel from "../components/MatchDetailPanel.vue";
-import MatchMetPlayers from "../components/MatchMetPlayers.vue";
+import MatchDeepDetail from "../components/MatchDeepDetail.vue";
 import PageHeader from "../components/PageHeader.vue";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
-import type { EncounterRecord, MatchSummary } from "../types/domain";
+import type { MatchSummary } from "../types/domain";
 import { aggregateRelationships, lastSeenLabel, relationLabel } from "../encounters/relationships";
 import { scorePlayerName } from "../matches/localPlayers";
 import { championImage, relativeTime, roleName } from "../utils/format";
@@ -19,12 +18,13 @@ import { championImage, relativeTime, roleName } from "../utils/format";
  * 历史页只有两件事：**对局**和**人**。
  *
  * 这里原来有四个页签（最近对局 / 遇到的玩家 / 对局时间线 / BP 记录）。按用户要求收成两个：
- * - 「对局」= 原来的「最近对局」+「对局时间线」合并，展开一局就能看到这一局**发生了什么**
- *   （首杀 / 每波团 / 事件流）以及**跟谁打的**。原来那半页经济差曲线被去掉了——
- *   每分钟一帧的宏观走势回答不了「这局发生了什么」，事件才回答得了。
- * - 「人」= 首页「关系记录」那批人的详细版（同一套聚合口径，见 `encounters/relationships.ts`）。
+ * - 「对局」= 展开一局就是**完整详情**（`MatchDeepDetail`）：十人对位柱状图
+ *   （输出 / 承伤 / 经济 / 补刀，来自 `get_match_detail` 的十人数据）、首杀 / 每波团 / 事件流。
+ *   原来那块「同场的人」十个头像被对位面板收编——见过的人直接在名字旁标「遇到过 N」。
+ * - 「人」= 首页「关系记录」那批人的详细版。每行先给最简的「他玩了什么 / 我玩了什么」，
+ *   再点某一局可以**再展开全局对局信息**（同一个 `MatchDeepDetail`，视角切到他）。
  *
- * 换句话说：「那一局」和「那个人」是两个入口，点进去都能查到对局细节。
+ * 换句话说：「那一局」和「那个人」是两个入口，点进去看到的是同一套对局细节。
  */
 const app = useAppStore();
 const route = useRoute();
@@ -66,29 +66,24 @@ function toggleMatch(gameId: number) {
   expandedGameId.value = expandedGameId.value === gameId ? 0 : gameId;
 }
 
-/**
- * 逐帧明细按需拉：**只有展开的那一局**才请求，并且逐局落盘缓存（后端 `matchTimeline`）。
- * 详情里的事件与团战都从这份数据算出来，所以没有它就没有详情可看。
- */
-const detailQuery = useQuery({
-  queryKey: computed(() => ["match-timeline", app.mode, expandedGameId.value]),
-  queryFn: () => backend.matchTimeline(expandedGameId.value, app.connection.puuid ?? ""),
-  enabled: computed(() => expandedGameId.value > 0),
-});
+/** 当前登录账号：`MatchDeepDetail` 用它做账号归属校验与「我」的定位。 */
+const selfPuuid = computed(() => app.connection.puuid ?? "");
 
-/** 原始相遇记录按对局归堆，给「这一局跟谁打的」用。 */
-const encountersByGame = computed(() => {
-  const map = new Map<number, EncounterRecord[]>();
+/**
+ * puuid → 相遇过的**不同对局数**，给对位面板的「遇到过 N」角标用。
+ * 按 gameId 去重（同一人同局理论上只有一行，但旧数据可能重复，别把次数吹大）。
+ * 这个值覆盖整个本地档案，所以「对局」页签展开任意一局都能正确标注。
+ */
+const encounterCounts = computed(() => {
+  const byPuuid = new Map<string, Set<number>>();
   for (const record of encounters.data.value ?? []) {
-    if (record.liveSnapshot || !(record.gameId > 0)) continue;
-    const list = map.get(record.gameId);
-    if (list) list.push(record);
-    else map.set(record.gameId, [record]);
+    if (record.liveSnapshot || !(record.puuid?.trim())) continue;
+    const games = byPuuid.get(record.puuid) ?? new Set<number>();
+    if (record.gameId > 0) games.add(record.gameId);
+    byPuuid.set(record.puuid, games);
   }
-  return map;
+  return Object.fromEntries([...byPuuid].map(([puuid, games]) => [puuid, games.size]));
 });
-const metInGame = (gameId: number, side: "ally" | "enemy") =>
-  (encountersByGame.value.get(gameId) ?? []).filter((record) => (side === "ally" ? record.side === "ally" : record.side !== "ally"));
 
 const matchResultTone = (match: MatchSummary) => match.durationMinutes === 0 ? "unfinished" : match.result === "胜利" ? "win" : "loss";
 const matchKda = (match: MatchSummary) => `${match.kills}/${match.deaths}/${match.assists}`;
@@ -115,6 +110,17 @@ const sortedAggregates = computed(() => {
 const expandedPuuid = ref("");
 function togglePlayer(puuid: string) {
   expandedPuuid.value = expandedPuuid.value === puuid ? "" : puuid;
+}
+
+/**
+ * 「人」页签里再往下钻一层：展开的玩家下面，某一行对局可以再点开
+ * 全局对局信息（十人对位 + 事件流）。键 = puuid + gameId，换人就收起。
+ */
+const expandedGameKey = ref("");
+const gameKeyOf = (puuid: string, gameId: number) => `${puuid}-${gameId}`;
+function toggleGame(puuid: string, gameId: number) {
+  const key = gameKeyOf(puuid, gameId);
+  expandedGameKey.value = expandedGameKey.value === key ? "" : key;
 }
 
 /** `名字#标签`；没有标签时退化成只用名字（与战绩页的查询口径一致）。 */
@@ -191,21 +197,17 @@ watch(
             <ChevronDown :size="14" class="match-card__caret" />
           </button>
 
-          <!-- 展开才是重点：默认只给一行摘要，细节按需加载（逐帧数据要走一次客户端）。 -->
+          <!--
+            展开才是重点：默认只给一行摘要。细节整块交给 `MatchDeepDetail`——
+            十人对位、逐帧事件、等级段位三份数据各自独立加载，哪份到了画哪块。
+          -->
           <div v-if="expandedGameId === match.gameId" class="match-card__body">
-            <section class="match-card__met">
-              <h4>同场的人 <small>来自本地相遇档案</small></h4>
-              <MatchMetPlayers :allies="metInGame(match.gameId, 'ally')" :enemies="metInGame(match.gameId, 'enemy')" @open="openInMatches" />
-            </section>
-
-            <div v-if="detailQuery.isPending.value" class="match-card__state">
-              <NSpin size="small" />
-              <span>正在解析逐帧数据（第一次读一局要向客户端取一次明细）</span>
-            </div>
-            <div v-else-if="detailQuery.isError.value" class="match-card__state">
-              <span>这一局拿不到逐帧数据：自定义对局、重开局、或客户端还没缓存明细时会这样。上面「同场的人」不受影响。</span>
-            </div>
-            <MatchDetailPanel v-else-if="detailQuery.data.value" :timeline="detailQuery.data.value" :champion-name-of="championNameOf" />
+            <MatchDeepDetail
+              :game-id="match.gameId"
+              :self-puuid="selfPuuid"
+              :encounter-counts="encounterCounts"
+              :champion-name-of="championNameOf"
+            />
           </div>
         </article>
       </div>
@@ -217,7 +219,7 @@ watch(
         <div>
           <span class="eyebrow">PEOPLE</span>
           <h2>遇到过的人</h2>
-          <p>与首页「关系记录」同一批人、同一套口径；点一行展开逐局细节，或直接去战绩页看他的完整数据。</p>
+          <p>展开一行先看最简的「他玩什么 / 我玩什么」；再点某一局，还能看那一局的全局对局信息。</p>
         </div>
         <div class="history-archive-tools">
           <NInput v-model:value="playerQuery" size="small" clearable placeholder="按名字模糊筛选"><template #prefix><Search :size="14" /></template></NInput>
@@ -280,26 +282,50 @@ watch(
             <ChevronDown :size="14" class="encounter-caret" />
           </button>
 
-          <!-- 展开 = 逐局细节：和他的、我的 KDA 并排，外加胜负、模式与时间。 -->
+          <!--
+            展开 = 逐局细节。每行先回答最简的问题：他玩什么 / 我玩什么、两边 KDA、胜负、模式时间。
+            行本身可再点：点开就在行下面挂 `MatchDeepDetail`（十人对位 + 事件流），视角是他。
+          -->
           <div v-if="expandedPuuid === aggregate.puuid" class="encounter-detail">
             <div class="encounter-detail__head">
               <span />
-              <span />
               <span>英雄</span>
+              <span>我玩的</span>
               <span>他</span>
               <span>我</span>
               <span>结果</span>
               <span>模式 / 时间</span>
+              <span />
             </div>
-            <div v-for="game in aggregate.games" :key="`${aggregate.puuid}-${game.gameId}`" class="encounter-detail__row">
-              <span class="encounter-detail__side" :data-side="game.side">{{ game.side === 'ally' ? '队友' : '对手' }}</span>
-              <AssetIcon kind="champion" :id="championIdFor(game.championName, game.championId)" :name="game.championName" :fallback-url="championImage(championIdFor(game.championName, game.championId))" size="xs" />
-              <b>{{ game.championName || '未记录英雄' }}</b>
-              <span class="encounter-detail__kda">他 {{ game.kills }}/{{ game.deaths }}/{{ game.assists }}</span>
-              <span class="encounter-detail__self">我 {{ game.selfKills }}/{{ game.selfDeaths }}/{{ game.selfAssists }}</span>
-              <span class="encounter-detail__result" :data-win="game.won === null ? 'unknown' : String(game.won)">{{ game.won === null ? '未知' : game.won ? '胜利' : '失败' }}</span>
-              <time>{{ game.queueName || '未知模式' }} · {{ relativeTime(game.encounteredAt) }}</time>
-            </div>
+            <template v-for="game in aggregate.games" :key="`${aggregate.puuid}-${game.gameId}`">
+              <button type="button" class="encounter-detail__row" :class="{ 'is-open': expandedGameKey === gameKeyOf(aggregate.puuid, game.gameId) }" :aria-expanded="expandedGameKey === gameKeyOf(aggregate.puuid, game.gameId)" @click="toggleGame(aggregate.puuid, game.gameId)">
+                <span class="encounter-detail__side" :data-side="game.side">{{ game.side === 'ally' ? '队友' : '对手' }}</span>
+                <span class="encounter-detail__champ" :title="game.championName || undefined">
+                  <AssetIcon kind="champion" :id="championIdFor(game.championName, game.championId)" :name="game.championName" :fallback-url="championImage(championIdFor(game.championName, game.championId))" size="xs" />
+                  <b>{{ game.championName || '未记录英雄' }}</b>
+                </span>
+                <span class="encounter-detail__champ" :title="game.selfChampionName || '本局没记录到我用的英雄'">
+                  <AssetIcon v-if="game.selfChampionId" kind="champion" :id="game.selfChampionId" :name="game.selfChampionName" :fallback-url="championImage(game.selfChampionId)" size="xs" />
+                  <b>{{ game.selfChampionName || '未记录' }}</b>
+                </span>
+                <span class="encounter-detail__kda">他 {{ game.kills }}/{{ game.deaths }}/{{ game.assists }}</span>
+                <span class="encounter-detail__self">我 {{ game.selfKills }}/{{ game.selfDeaths }}/{{ game.selfAssists }}</span>
+                <span class="encounter-detail__result" :data-win="game.won === null ? 'unknown' : String(game.won)">{{ game.won === null ? '未知' : game.won ? '胜利' : '失败' }}</span>
+                <time>{{ game.queueName || '未知模式' }} · {{ relativeTime(game.encounteredAt) }}</time>
+                <ChevronDown :size="12" class="encounter-detail__caret" />
+              </button>
+
+              <!-- 再往下钻一层：这一局的全局对局信息。targetPuuid 传他，面板视角跟着切。 -->
+              <div v-if="expandedGameKey === gameKeyOf(aggregate.puuid, game.gameId)" class="encounter-detail__deep">
+                <MatchDeepDetail
+                  :game-id="game.gameId"
+                  :target-puuid="aggregate.puuid"
+                  :self-puuid="selfPuuid"
+                  :encounter-counts="encounterCounts"
+                  :champion-name-of="championNameOf"
+                />
+              </div>
+            </template>
             <div class="encounter-detail__foot">
               <NButton size="tiny" secondary @click.stop="openInMatches(aggregate)"><template #icon><ArrowUpRight :size="12" /></template>在战绩页查看 {{ riotIdOf(aggregate) }}</NButton>
             </div>
@@ -357,9 +383,6 @@ watch(
 .match-card__caret { color: var(--text-muted); transition: transform .15s; }
 .match-card.is-open .match-card__caret { transform: rotate(180deg); }
 .match-card__body { display: grid; gap: 14px; padding: 12px 14px 14px; border-top: 1px solid var(--line); background: var(--surface); }
-.match-card__met h4 { display: flex; align-items: baseline; gap: 7px; margin: 0 0 8px; font-size: 12px; font-weight: 600; }
-.match-card__met h4 small { color: var(--text-muted); font-size: 9px; font-weight: 400; }
-.match-card__state { display: flex; align-items: center; gap: 8px; padding: 12px; border: 1px dashed var(--line); color: var(--text-muted); font-size: 10px; line-height: 1.6; }
 
 /* 遇到玩家 */
 .encounter-table { overflow-x: auto; }

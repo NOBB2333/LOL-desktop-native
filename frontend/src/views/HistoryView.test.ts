@@ -48,6 +48,15 @@ vi.mock("../services/backend", async () => {
         timelineRequests.push(gameId);
         return createFixtureMatchTimeline(gameId);
       },
+      // 展开区的十人对位面板走完整详情（fixture 的 participants 就挂在 match 上），
+      // 等级段位是另一条命令——这里给个最小实现，够面板渲染「Lv.N」就行。
+      matchDetail: async (gameId: number) => {
+        const found = fixtureMatches.find((item) => item.gameId === gameId);
+        if (!found) throw new Error("该对局的完整详情不可用");
+        return structuredClone(found);
+      },
+      playerStats: async (puuids: string[]) =>
+        puuids.map((puuid, index) => ({ puuid, summonerLevel: 120 + index, soloRank: null, flexRank: null })),
     },
   };
 });
@@ -154,28 +163,26 @@ describe("HistoryView", () => {
     for (const badge of ["首杀", "三杀", "双杀", "团1", "团2", "团3"]) expect(badges).toContain(badge);
   });
 
-  it("展开区里同时给出「同场的人」，点名字去战绩页", async () => {
+  it("展开区给十人对位柱状图（而不是十个头像），逐帧明细照常渲染", async () => {
     const wrapper = mountView();
     await settle();
-    pushedRoutes.length = 0;
 
     await wrapper.get(".match-card__head").trigger("click");
     await settle();
 
-    const met = wrapper.get(".match-card__met");
-    expect(met.text()).toContain("同场的人");
-    const labels = met.findAll(".met-players__label").map((item) => item.text());
-    expect(labels[0]).toContain("队友 4");
-    expect(labels[1]).toContain("对手 5");
-    // fixture 的相遇记录覆盖最近三局，第一局应该全部 join 得上（一个都不能显示「未记录」）。
-    expect(met.findAll(".met-players__chip")).toHaveLength(9);
+    // 十人对位：fixture 里每个人都有位置，所以按五路配对成 5 组。
+    const lineup = wrapper.get(".lineup");
+    expect(wrapper.findAll(".duel")).toHaveLength(5);
+    // 对比口径可切：输出 / 承伤 / 经济 / 补刀。
+    expect(lineup.findAll(".lineup__metrics button").map((item) => item.text())).toEqual(["输出", "承伤", "经济", "补刀"]);
+    // 本地相遇档案里见过的人要带「遇到过 N」角标——原「同场的人」的价值被这块收编。
+    expect(lineup.text()).toContain("遇到过");
 
-    const expected = fixtureEncounters.filter((record) => record.gameId === fixtureMatches[0].gameId);
-    await met.get(".met-players__chip").trigger("click");
-    await flushPromises();
-    expect(pushedRoutes).toHaveLength(1);
-    expect(pushedRoutes[0].path).toBe("/matches");
-    expect(pushedRoutes[0].query?.summoner).toContain(expected[0].gameName);
+    // 逐帧明细（首杀 / 每波团 / 事件流）不受影响。
+    const timeline = createFixtureMatchTimeline(fixtureMatches[0].gameId);
+    const summary = wrapper.get(".match-detail__summary").text();
+    expect(summary).toContain("首杀");
+    expect(wrapper.findAll(".match-event")).toHaveLength(timeline.events.length);
   });
 
   it("「人」页签按玩家聚合成一行，展开后能看到逐局细节，并能跳战绩页", async () => {
@@ -210,6 +217,32 @@ describe("HistoryView", () => {
     expect(pushedRoutes).toHaveLength(1);
     expect(pushedRoutes[0].path).toBe("/matches");
     expect(pushedRoutes[0].query?.summoner).toContain(rowName);
+  });
+
+  it("「人」页签展开的某一行还能再点开全局对局信息", async () => {
+    const wrapper = mountView();
+    await settle();
+
+    await tab(wrapper, "人").trigger("click");
+    await settle();
+    await wrapper.get(".encounter-table__row").trigger("click");
+    await settle();
+
+    // 逐局行先给最简对照（他 / 我各一列英雄），此时还没有更深的详情。
+    expect(wrapper.findAll(".encounter-detail__row")).toHaveLength(3);
+    expect(wrapper.find(".encounter-detail__deep").exists()).toBe(false);
+
+    await wrapper.get(".encounter-detail__row").trigger("click");
+    await settle();
+
+    // 点开的行下面挂出十人对位 + 事件流——和「对局」页签展开看到的是同一套。
+    const deep = wrapper.get(".encounter-detail__deep");
+    expect(deep.findAll(".duel")).toHaveLength(5);
+    expect(deep.find(".match-detail__summary").exists()).toBe(true);
+    // 再点一次收起。
+    await wrapper.get(".encounter-detail__row").trigger("click");
+    await settle();
+    expect(wrapper.find(".encounter-detail__deep").exists()).toBe(false);
   });
 
   it("首页「关系记录」的深链：切到「人」并直接把那一行展开", async () => {
