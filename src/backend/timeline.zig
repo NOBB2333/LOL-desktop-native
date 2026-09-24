@@ -134,6 +134,11 @@ fn writeFrames(writer: *std.Io.Writer, frames: std.json.Value) !void {
 /// 关键事件。事件的 `team` 一律表示**做这件事的一方**（推塔/拿龙/击杀方），
 /// 这样前端只需要一个「我方/敌方」的判断；丢失方由对面推出来，不必依赖
 /// Riot 对 `teamId` 的含糊定义。能查到 killerId 就用它，否则按 raw `teamId` 反推。
+///
+/// 每条事件带 `posX/posY` 与助攻**名单**（`assistIds`）。前者是地图定位的唯一来源，
+/// 后者用来把「谁参与了这波」按人去重——「每波团」这个概念 Riot 没有现成字段，
+/// 是靠击杀事件在时间与位置上聚类出来的（前端 `matches/teamfights.ts`），
+/// 所以这两项必须原样带出来，不能在后端就压成计数。
 fn writeEvents(writer: *std.Io.Writer, frames: std.json.Value, participants: [10]Participant) !void {
     var written: usize = 0;
     for (frames.array.items) |frame| {
@@ -168,6 +173,17 @@ fn writeEvents(writer: *std.Io.Writer, frames: std.json.Value, participants: [10
             try writer.print("{d}", .{championOf(killer_id, participants)});
             try writer.writeAll(",\"victimChampionId\":");
             try writer.print("{d}", .{championOf(intField(event, "victimId"), participants)});
+            // 助攻**名单**（不只是个数）：「这波团谁在」要按人去重，光有总数算不出来。
+            try writer.writeAll(",\"assistIds\":");
+            try writeIntArray(writer, event, "assistingParticipantIds");
+            // 事件发生的位置。击杀/拿龙/推塔事件都带 `position`，是「这波团打在哪」的
+            // 唯一来源——帧里也有 `position`，但那是 60 秒一帧，粒度太粗指不了团战。
+            // 个别事件没有 position（例如被小兵推掉的塔），写 0 由前端当「位置未知」。
+            const position = nestedObject(event, "position");
+            try writer.writeAll(",\"posX\":");
+            try writer.print("{d}", .{if (position) |value| intField(value, "x") else 0});
+            try writer.writeAll(",\"posY\":");
+            try writer.print("{d}", .{if (position) |value| intField(value, "y") else 0});
             try writer.writeAll(",\"monsterType\":");
             try writeString(writer, stringField(event, "monsterType"));
             try writer.writeAll(",\"monsterSubType\":");
@@ -276,6 +292,24 @@ fn arrayLength(value: std.json.Value, name: []const u8) i64 {
     return @intCast(field.array.items.len);
 }
 
+/// 把整数数组原样写出去（目前只用于 `assistingParticipantIds`）。
+/// 取不到或不是数组时写 `[]`——前端只依赖「是数组」这一条，不用再判空。
+fn writeIntArray(writer: *std.Io.Writer, value: std.json.Value, name: []const u8) !void {
+    const field = arrayField(value, name) orelse return writer.writeAll("[]");
+    try writer.writeByte('[');
+    for (field.array.items, 0..) |entry, index| {
+        if (index > 0) try writer.writeByte(',');
+        const number: i64 = switch (entry) {
+            .integer => |item| item,
+            .float => |item| @intFromFloat(item),
+            .string => |text| std.fmt.parseInt(i64, text, 10) catch 0,
+            else => 0,
+        };
+        try writer.print("{d}", .{number});
+    }
+    try writer.writeByte(']');
+}
+
 // ---- 测试 ----------------------------------------------------------------
 
 const game_fixture =
@@ -292,8 +326,8 @@ fn timelineFixture() []const u8 {
         \\{"timestamp":0,"participantFrames":{"1":{"totalGold":500,"minionsKilled":0,"jungleMinionsKilled":0},"6":{"totalGold":500,"minionsKilled":0,"jungleMinionsKilled":0}},"events":[]},
         \\{"timestamp":60000,"participantFrames":{"1":{"totalGold":1500,"minionsKilled":10,"jungleMinionsKilled":2},"2":{"totalGold":1200,"minionsKilled":5,"jungleMinionsKilled":0},"6":{"totalGold":1400,"minionsKilled":12,"jungleMinionsKilled":0},"7":{"totalGold":900,"minionsKilled":3,"jungleMinionsKilled":0}},"events":[]},
         \\{"timestamp":120000,"participantFrames":{"1":{"totalGold":2600,"minionsKilled":20,"jungleMinionsKilled":4},"2":{"totalGold":2100,"minionsKilled":12,"jungleMinionsKilled":0},"6":{"totalGold":2500,"minionsKilled":24,"jungleMinionsKilled":0},"7":{"totalGold":1600,"minionsKilled":8,"jungleMinionsKilled":0}},"events":[
-        \\{"type":"CHAMPION_KILL","timestamp":115000,"killerId":1,"victimId":7,"assistingParticipantIds":[2]},
-        \\{"type":"ELITE_MONSTER_KILL","timestamp":118000,"killerId":6,"killerTeamId":200,"monsterType":"DRAGON","monsterSubType":"FIRE_DRAGON"},
+        \\{"type":"CHAMPION_KILL","timestamp":115000,"killerId":1,"victimId":7,"assistingParticipantIds":[2],"position":{"x":7500,"y":4200}},
+        \\{"type":"ELITE_MONSTER_KILL","timestamp":118000,"killerId":6,"killerTeamId":200,"monsterType":"DRAGON","monsterSubType":"FIRE_DRAGON","position":{"x":9900,"y":4400}},
         \\{"type":"BUILDING_KILL","timestamp":119000,"killerId":1,"teamId":200,"buildingType":"TOWER_BUILDING","towerType":"OUTER_TURRET","laneType":"BOT_LANE"},
         \\{"type":"SKILL_LEVEL_UP","timestamp":119500,"participantId":1,"skillSlot":1}]}]}
     ;
@@ -348,17 +382,48 @@ test "keeps only timeline-relevant events and derives the acting team" {
     try std.testing.expectEqual(@as(i64, 64), intField(kill, "killerChampionId"));
     try std.testing.expectEqual(@as(i64, 222), intField(kill, "victimChampionId"));
     try std.testing.expectEqual(@as(i64, 1), intField(kill, "assistCount"));
+    // 助攻名单要原样带出来：团战聚类按人去重，只靠 assistCount 算不出参战名单。
+    const assists = arrayField(kill, "assistIds") orelse return error.MissingAssists;
+    try std.testing.expectEqual(@as(usize, 1), assists.array.items.len);
+    try std.testing.expectEqual(@as(i64, 2), assists.array.items[0].integer);
+    try std.testing.expectEqual(@as(i64, 7500), intField(kill, "posX"));
+    try std.testing.expectEqual(@as(i64, 4200), intField(kill, "posY"));
 
     const monster = events.array.items[1];
     try std.testing.expectEqualStrings("ELITE_MONSTER_KILL", stringField(monster, "type"));
     try std.testing.expectEqual(@as(i64, 200), intField(monster, "team"));
     try std.testing.expectEqualStrings("FIRE_DRAGON", stringField(monster, "monsterSubType"));
+    try std.testing.expectEqual(@as(i64, 9900), intField(monster, "posX"));
+    try std.testing.expectEqual(@as(i64, 4400), intField(monster, "posY"));
 
     const building = events.array.items[2];
     try std.testing.expectEqualStrings("BUILDING_KILL", stringField(building, "type"));
     // 推塔方是 1 号（蓝方），哪怕 raw teamId 写的是 200（被推的一方）。
     try std.testing.expectEqual(@as(i64, 100), intField(building, "team"));
     try std.testing.expectEqualStrings("OUTER_TURRET", stringField(building, "towerType"));
+    // 没有 position 的事件写 0（前端当「位置未知」），助攻同理写空数组。
+    try std.testing.expectEqual(@as(i64, 0), intField(building, "posX"));
+    try std.testing.expectEqual(@as(i64, 0), intField(building, "posY"));
+    try std.testing.expectEqual(@as(usize, 0), arrayField(building, "assistIds").?.array.items.len);
+}
+
+test "dirty position and assist fields never break an event" {
+    // 真实数据里 `position` 有时是 null、`assistingParticipantIds` 有时整个键都没有。
+    // 这两种都不能让事件写坏或少写字段——前端只依赖「字段一定在」。
+    var buffer: [4096]u8 = undefined;
+    const timeline =
+        \\{"frames":[{"timestamp":60000,"participantFrames":{"1":{"totalGold":1,"minionsKilled":0,"jungleMinionsKilled":0}},"events":[
+        \\{"type":"CHAMPION_KILL","timestamp":61000,"killerId":1,"victimId":6,"assistingParticipantIds":"oops","position":null}]}]}
+    ;
+    const json = try writeTimeline(game_fixture, timeline, &buffer);
+    var parsed = try parseForTest(json);
+    defer parsed.deinit();
+    const events = arrayField(parsed.value, "events") orelse return error.MissingEvents;
+    try std.testing.expectEqual(@as(usize, 1), events.array.items.len);
+    const kill = events.array.items[0];
+    try std.testing.expectEqual(@as(usize, 0), arrayField(kill, "assistIds").?.array.items.len);
+    try std.testing.expectEqual(@as(i64, 0), intField(kill, "posX"));
+    try std.testing.expectEqual(@as(i64, 0), intField(kill, "posY"));
 }
 
 test "falls back to the raw teamId's opposite when no champion destroyed the building" {
@@ -376,8 +441,7 @@ test "falls back to the raw teamId's opposite when no champion destroyed the bui
     try std.testing.expectEqual(@as(i64, 200), intField(events.array.items[0], "team"));
 }
 
-test "rejects a payload without frames" {
-    var buffer: [1024]u8 = undefined;
+test "rejects a payload without frames" {    var buffer: [1024]u8 = undefined;
     try std.testing.expectError(error.TimelineUnavailable, writeTimeline(game_fixture, "{\"frames\":[]}", &buffer));
     try std.testing.expectError(error.TimelineUnavailable, writeTimeline(game_fixture, "{}", &buffer));
 }

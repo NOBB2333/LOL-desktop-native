@@ -24,3 +24,6 @@ zig-out/
 # 这些东西只在本地调试时产生，不该进版本库。
 frontend/.verify/
 /.verify/
+
+# 校验脚本的重定向日志（`vue-tsc` 前台跑会被超时 SIGTERM，所以一律写文件再看）。
+frontend/.tsc.log

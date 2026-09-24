@@ -650,12 +650,16 @@ export function createFixtureMatchTimeline(gameId: number): MatchTimeline {
   const durationSeconds = minutes * 60;
   // 谁笑到最后由 gameId 决定，这样不同对局的曲线不会长得一模一样。
   const blueEdge = seed % 2 === 0 ? 1 : -1;
-  const champions = [64, 103, 12, 222, 99, 24, 105, 40, 1, 111];
-  const participants: MatchTimelineParticipant[] = champions.map((championId, index) => ({
+  // 用本文件其它 fixture 的**同一份**英雄目录：英雄 id 必须能在 `fixtureChampions`
+  // 里查到，否则历史页会把它们渲染成「英雄 #24」这种占位文本——预览看起来就像坏了。
+  const roster = champions.map(([id]) => id);
+  const participants: MatchTimelineParticipant[] = roster.map((championId, index) => ({
     participantId: index + 1,
     team: index < 5 ? 100 : 200,
     championId,
   }));
+  /** 座位号 → 英雄 id。事件的英雄**一律由座位号推**，不手写。 */
+  const championOf = (participantId: number) => roster[participantId - 1] ?? 0;
 
   // 队内经济分配：越靠前的座位越像 C 位，辅助拿最少。
   const goldShares = [0.24, 0.22, 0.21, 0.19, 0.14];
@@ -678,39 +682,81 @@ export function createFixtureMatchTimeline(gameId: number): MatchTimeline {
     });
   }
 
+  /**
+   * 几个点位的近似坐标（mapId 11 的 `0..14820 × 0..14881` 域，取自 `live/gameMap.ts`
+   * 的营地坐标与真实点位）。有了它们，预览里「这波团打在哪」才会落在图上说得通的位置
+   * ——蓝方基地在**左下**、红方在**右上**，y 轴越大地图越靠上。
+   */
+  const spot = {
+    mid: { x: 7400, y: 7400 },
+    dragon: { x: 9866, y: 4410 },
+    baron: { x: 5000, y: 9900 },
+    blueTop: { x: 1600, y: 11300 },
+    redBot: { x: 13200, y: 3400 },
+  };
+
   const timelineEvent = (
     base: Pick<MatchTimelineEvent, "type" | "seconds" | "team"> & Partial<MatchTimelineEvent>,
-  ): MatchTimelineEvent => ({
-    killerId: 0,
-    victimId: 0,
-    assistCount: 0,
-    killerChampionId: 0,
-    victimChampionId: 0,
-    monsterType: "",
-    monsterSubType: "",
-    buildingType: "",
-    towerType: "",
-    laneType: "",
-    ...base,
-  });
+  ): MatchTimelineEvent => {
+    const event: MatchTimelineEvent = {
+      killerId: 0,
+      victimId: 0,
+      assistCount: 0,
+      // 助攻名单与位置是「每波团」的地基（`matches/teamfights.ts`）。fixture 必须一起给，
+      // 否则预览里团战永远聚不出来——看不到的效果等于没做。
+      assistIds: [],
+      killerChampionId: 0,
+      victimChampionId: 0,
+      posX: 0,
+      posY: 0,
+      monsterType: "",
+      monsterSubType: "",
+      buildingType: "",
+      towerType: "",
+      laneType: "",
+      ...base,
+    };
+    // 英雄 id 由座位号推出来，**不手写**：手写迟早会和 participants 对不上，
+    // 而那种错在界面上只表现为「英雄 #24」，很难一眼看出是 fixture 的问题。
+    if (!event.killerChampionId && event.killerId > 0) event.killerChampionId = championOf(event.killerId);
+    if (!event.victimChampionId && event.victimId > 0) event.victimChampionId = championOf(event.victimId);
+    return event;
+  };
 
   // 脚本时间点固定，靠 `filter` 按这局的实际时长裁掉没打到的部分。
+  //
+  // 三波团是**刻意设计**的（604 / 1188 / 1450 秒，都在最短一局 24 分钟之内，
+  // 所以每局预览都至少能看到一波）：
+  //   ① 中路   蓝 3 : 1 红，1 号拿下三杀
+  //   ② 红方下路 蓝 1 : 2 红（这波红方赢，避免团战全都是蓝方赢）
+  //   ③ 大龙坑 蓝 3 : 0 红
+  // 232 秒那次单杀**不算团战**（1 换 1、参与者 2 人），正好当反例。
   const events: MatchTimelineEvent[] = [
-    timelineEvent({ type: "CHAMPION_KILL", seconds: 232, team: 200, killerId: 6, victimId: 1, killerChampionId: 24, victimChampionId: 64 }),
-    timelineEvent({ type: "TURRET_PLATE_DESTROYED", seconds: 341, team: 200, killerId: 7, killerChampionId: 40, laneType: "TOP_LANE" }),
-    timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 352, team: 100, killerId: 2, killerChampionId: 103, monsterType: "DRAGON", monsterSubType: "FIRE_DRAGON" }),
-    timelineEvent({ type: "BUILDING_KILL", seconds: 528, team: 200, killerId: 7, killerChampionId: 40, buildingType: "TOWER_BUILDING", towerType: "OUTER_TURRET", laneType: "TOP_LANE" }),
-    timelineEvent({ type: "CHAMPION_KILL", seconds: 604, team: 100, killerId: 1, victimId: 8, assistCount: 2, killerChampionId: 64, victimChampionId: 1 }),
-    timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 611, team: 100, killerId: 2, killerChampionId: 103, monsterType: "RIFTHERALD" }),
-    timelineEvent({ type: "BUILDING_KILL", seconds: 902, team: 100, killerId: 1, killerChampionId: 64, buildingType: "TOWER_BUILDING", towerType: "OUTER_TURRET", laneType: "MID_LANE" }),
-    timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 968, team: 200, killerId: 6, killerChampionId: 24, monsterType: "DRAGON", monsterSubType: "OCEAN_DRAGON" }),
-    timelineEvent({ type: "CHAMPION_KILL", seconds: 1188, team: 100, killerId: 3, victimId: 9, assistCount: 1, killerChampionId: 12, victimChampionId: 105 }),
-    timelineEvent({ type: "BUILDING_KILL", seconds: 1264, team: 100, killerId: 3, killerChampionId: 12, buildingType: "TOWER_BUILDING", towerType: "INNER_TURRET", laneType: "MID_LANE" }),
-    timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 1288, team: 100, killerId: 2, killerChampionId: 103, monsterType: "BARON_NASHOR" }),
-    timelineEvent({ type: "BUILDING_KILL", seconds: 1502, team: 100, killerId: 4, killerChampionId: 222, buildingType: "INHIBITOR_BUILDING", laneType: "MID_LANE" }),
-    timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 1596, team: 100, killerId: 2, killerChampionId: 103, monsterType: "DRAGON", monsterSubType: "ELDER_DRAGON" }),
-    timelineEvent({ type: "CHAMPION_KILL", seconds: 1704, team: 100, killerId: 1, victimId: 6, assistCount: 3, killerChampionId: 64, victimChampionId: 24 }),
-    timelineEvent({ type: "BUILDING_KILL", seconds: 1810, team: 100, killerId: 5, killerChampionId: 99, buildingType: "TOWER_BUILDING", towerType: "BASE_TURRET", laneType: "MID_LANE" }),
+    timelineEvent({ type: "CHAMPION_KILL", seconds: 232, team: 200, killerId: 6, victimId: 1, ...spot.blueTop }),
+    timelineEvent({ type: "TURRET_PLATE_DESTROYED", seconds: 341, team: 200, killerId: 7, laneType: "TOP_LANE", ...spot.blueTop }),
+    timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 352, team: 100, killerId: 2, monsterType: "DRAGON", monsterSubType: "FIRE_DRAGON", ...spot.dragon }),
+    timelineEvent({ type: "BUILDING_KILL", seconds: 528, team: 200, killerId: 7, buildingType: "TOWER_BUILDING", towerType: "OUTER_TURRET", laneType: "TOP_LANE", ...spot.blueTop }),
+    // ① 中路团：1 号三杀
+    timelineEvent({ type: "CHAMPION_KILL", seconds: 604, team: 100, killerId: 1, victimId: 8, assistCount: 2, assistIds: [2, 3], posX: 7250, posY: 7350 }),
+    timelineEvent({ type: "CHAMPION_KILL", seconds: 609, team: 100, killerId: 1, victimId: 6, assistCount: 1, assistIds: [3], posX: 7400, posY: 7400 }),
+    timelineEvent({ type: "CHAMPION_KILL", seconds: 614, team: 100, killerId: 1, victimId: 7, assistCount: 2, assistIds: [2, 4], posX: 7520, posY: 7460 }),
+    timelineEvent({ type: "CHAMPION_KILL", seconds: 619, team: 200, killerId: 8, victimId: 3, assistCount: 1, assistIds: [6], posX: 7480, posY: 7290 }),
+    timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 660, team: 100, killerId: 2, monsterType: "RIFTHERALD", ...spot.baron }),
+    timelineEvent({ type: "BUILDING_KILL", seconds: 902, team: 100, killerId: 1, buildingType: "TOWER_BUILDING", towerType: "OUTER_TURRET", laneType: "MID_LANE", ...spot.mid }),
+    timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 968, team: 200, killerId: 6, monsterType: "DRAGON", monsterSubType: "OCEAN_DRAGON", ...spot.dragon }),
+    // ② 红方下路团（这波红方赢）
+    timelineEvent({ type: "CHAMPION_KILL", seconds: 1188, team: 200, killerId: 8, victimId: 4, assistCount: 2, assistIds: [9, 10], posX: 13100, posY: 3450 }),
+    timelineEvent({ type: "CHAMPION_KILL", seconds: 1196, team: 200, killerId: 9, victimId: 2, assistCount: 1, assistIds: [8], posX: 13250, posY: 3380 }),
+    timelineEvent({ type: "CHAMPION_KILL", seconds: 1204, team: 100, killerId: 3, victimId: 9, assistCount: 2, assistIds: [1, 4], posX: 13340, posY: 3520 }),
+    timelineEvent({ type: "BUILDING_KILL", seconds: 1264, team: 100, killerId: 3, buildingType: "TOWER_BUILDING", towerType: "INNER_TURRET", laneType: "MID_LANE", ...spot.mid }),
+    timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 1288, team: 100, killerId: 2, monsterType: "BARON_NASHOR", ...spot.baron }),
+    // ③ 大龙坑团（蓝方 3 : 0，2 号双杀）
+    timelineEvent({ type: "CHAMPION_KILL", seconds: 1450, team: 100, killerId: 1, victimId: 6, assistCount: 2, assistIds: [2, 3], posX: 5050, posY: 9850 }),
+    timelineEvent({ type: "CHAMPION_KILL", seconds: 1454, team: 100, killerId: 2, victimId: 7, assistCount: 1, assistIds: [1], posX: 4920, posY: 9960 }),
+    timelineEvent({ type: "CHAMPION_KILL", seconds: 1458, team: 100, killerId: 2, victimId: 8, assistCount: 2, assistIds: [1, 3], posX: 5180, posY: 10080 }),
+    timelineEvent({ type: "BUILDING_KILL", seconds: 1502, team: 100, killerId: 4, buildingType: "INHIBITOR_BUILDING", laneType: "MID_LANE", ...spot.mid }),
+    timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 1596, team: 100, killerId: 2, monsterType: "DRAGON", monsterSubType: "ELDER_DRAGON", ...spot.dragon }),
+    timelineEvent({ type: "BUILDING_KILL", seconds: 1810, team: 100, killerId: 5, buildingType: "TOWER_BUILDING", towerType: "BASE_TURRET", laneType: "MID_LANE", ...spot.mid }),
   ].filter((item) => item.seconds <= durationSeconds);
 
   return { gameId, durationSeconds, participants, frames, events };

@@ -277,8 +277,16 @@ export interface MatchTimelineEvent {
   killerId: number;
   victimId: number;
   assistCount: number;
+  /** 助攻者的 participantId 名单（1..10）。后端原样带出，用来把「谁参与了」按人去重。 */
+  assistIds: number[];
   killerChampionId: number;
   victimChampionId: number;
+  /**
+   * 事件发生的位置（游戏坐标，mapId 11 的 0..14820 × 0..14881 域）。
+   * 0/0 表示这一条没有位置（例如被小兵推掉的塔）——**不能**当成「在左上角」。
+   */
+  posX: number;
+  posY: number;
   monsterType: string;
   monsterSubType: string;
   buildingType: string;
