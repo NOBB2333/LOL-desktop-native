@@ -251,12 +251,25 @@ onBeforeUnmount(() => {
           将从 League 客户端删除选中的好友。客户端侧不可撤销，但本地会留一份记录放进下方回收站，可以据此重新发好友申请。
         </NPopconfirm>
       </div>
-      <!--
-        按 ID 观战。客户端里「观战」有两条路线：好友路线要 spectatorKey（只有对方
-        在线且正在对局时才由客户端下发），观察者模式则**不带密钥**。所以观战不必
-        被好友列表绑死——输入 Riot ID 就能看非好友。
-      -->
-      <div class="friends-toolbar-row friends-toolbar-row--spectate">
+    </section>
+
+    <!--
+      按 ID 观战。客户端里「观战」有两条路线：好友路线要 spectatorKey（只有对方
+      在线且正在对局时才由客户端下发），观察者模式则**不带密钥**。所以观战不必
+      被好友列表绑死——输入 Riot ID 就能看非好友。
+
+      刻意从上面的工具栏里**拆出来**单独成块：它和下面的好友列表是两条平行入口
+      ——一个是手动输入、谁都能看，一个是点列表行尾的按钮、只能看好友。混在同一行
+      工具栏里分不出哪个管哪个。后端链路其实是同一条，区别只在多一步「先把
+      Riot ID 解析成 puuid」。
+    -->
+    <section class="friends-spectate-any">
+      <div class="friends-spectate-any__head">
+        <span class="friends-spectate-any__icon"><Eye :size="14" /></span>
+        <strong>观战任意玩家</strong>
+        <span class="friends-spectate-any__tag">不是好友也能看</span>
+      </div>
+      <div class="friends-spectate-any__row">
         <NInput
           v-model:value="spectateQuery"
           clearable
@@ -266,11 +279,12 @@ onBeforeUnmount(() => {
           @keyup.enter="spectateById"
         ><template #prefix><Eye :size="14" /></template></NInput>
         <NButton size="small" type="primary" secondary :loading="spectatingById" :disabled="!spectateQuery.trim() || spectatingById || spectateUnavailable" @click="spectateById">观战</NButton>
-        <small>不要求是好友；需要对方正在对局中且允许被观战，只能解析当前大区的玩家。</small>
       </div>
+      <p class="friends-spectate-any__hint">回车即可。需要对方正在对局中且允许被观战；本地只能解析当前大区的玩家。</p>
     </section>
 
     <section class="friends-table" :class="{ loading }">
+      <div class="friends-list-label"><UserRound :size="13" /><strong>好友列表</strong><small>点行尾的「观战」直接看这位好友</small></div>
       <header>
         <span class="friends-select-all"><NCheckbox :checked="allVisibleSelected" :indeterminate="selectedCount > 0 && !allVisibleSelected" :aria-label="allVisibleSelected ? '取消全选' : '全选当前好友'" @update:checked="toggleAllVisible" /></span>
         <span>好友分组</span><span>状态</span><span>最后对局日期</span><span>成为好友时间</span><span>操作</span>
@@ -329,14 +343,21 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .friends-page { max-width: 1240px; }
-.friends-toolbar { display: grid; gap: 8px; padding: 10px 12px; border: 1px solid var(--line); border-bottom: 0; background: var(--surface-muted); }
+.friends-toolbar { display: grid; gap: 8px; padding: 10px 12px; border: 1px solid var(--line); background: var(--surface-muted); }
 .friends-toolbar-row { display: flex; align-items: center; gap: 8px; }
 .friends-toolbar-row .n-input { width: min(360px, 100%); }
 .friends-toolbar-row:first-child .n-input { margin-right: auto; }
-.friends-toolbar-row--spectate { padding-top: 8px; border-top: 1px dashed var(--line); }
-.friends-toolbar-row--spectate .n-input { margin-right: 0; }
-.friends-toolbar-row--spectate small { color: var(--text-muted); font-size: 9px; }
-.friends-table { border: 1px solid var(--line); background: var(--surface); transition: opacity .15s; }.friends-table.loading { opacity: .72; }
+/* 「观战任意玩家」独立成块：虚线 + 强调色底，明确是「手动输入」入口，与好友列表分开。 */
+.friends-spectate-any { display: grid; gap: 7px; margin-top: 10px; padding: 10px 12px; border: 1px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); background: color-mix(in srgb, var(--accent-soft) 55%, var(--surface)); }
+.friends-spectate-any__head { display: flex; align-items: center; gap: 7px; }
+.friends-spectate-any__icon { display: grid; place-items: center; width: 22px; height: 22px; color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.friends-spectate-any__head strong { color: var(--text-primary); font-size: 11px; }
+.friends-spectate-any__tag { padding: 2px 6px; color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); font-size: 9px; }
+.friends-spectate-any__row { display: flex; align-items: center; gap: 8px; }
+.friends-spectate-any__row .n-input { width: min(360px, 100%); }
+.friends-spectate-any__hint { margin: 0; color: var(--text-muted); font-size: 9px; }
+.friends-table { margin-top: 10px; border: 1px solid var(--line); background: var(--surface); transition: opacity .15s; }.friends-table.loading { opacity: .72; }
+.friends-list-label { display: flex; align-items: center; gap: 7px; min-height: 30px; padding: 0 12px; border-bottom: 1px solid var(--line); color: var(--text-secondary); background: color-mix(in srgb, var(--surface-muted) 60%, var(--surface)); }.friends-list-label strong { color: var(--text-primary); font-size: 11px; }.friends-list-label small { color: var(--text-muted); font-size: 9px; }
 .friends-table > header, .friend-row { display: grid; grid-template-columns: 32px minmax(220px, 1.4fr) 100px minmax(150px, 1fr) minmax(150px, 1fr) auto; align-items: center; gap: 10px; }
 .friends-table > header { min-height: 34px; padding: 0 12px; border-bottom: 1px solid var(--line); color: var(--text-muted); background: var(--surface-muted); font-size: 9px; }
 .friends-select-all { display: flex; align-items: center; }
@@ -366,5 +387,5 @@ onBeforeUnmount(() => {
 .friends-bin__identity strong small { color: var(--text-muted); font-size: 9px; font-weight: 500; }
 .friends-bin__identity time { color: var(--text-muted); font-size: 9px; }
 .friends-bin__empty { margin: 0; padding: 18px 12px; color: var(--text-muted); font-size: 10px; text-align: center; }
-@media (max-width: 900px) { .friends-toolbar-row { align-items: stretch; flex-wrap: wrap; }.friends-toolbar-row .n-input { width: 100%; }.friends-toolbar-row:first-child .n-input { margin-right: 0; }.friends-table { overflow-x: auto; }.friends-table > header, .friend-row { min-width: 860px; }.friend-group { min-width: 836px; }.friends-bin > summary > small { display: none; }.friends-bin__body li { grid-template-columns: 26px minmax(0, 1fr) auto; }.friends-bin__body li .n-popconfirm { display: none; } }
+@media (max-width: 900px) { .friends-toolbar-row { align-items: stretch; flex-wrap: wrap; }.friends-toolbar-row .n-input { width: 100%; }.friends-toolbar-row:first-child .n-input { margin-right: 0; }.friends-spectate-any__row { align-items: stretch; flex-wrap: wrap; }.friends-spectate-any__row .n-input { width: 100%; }.friends-table { overflow-x: auto; }.friends-table > header, .friend-row { min-width: 860px; }.friend-group { min-width: 836px; }.friends-bin > summary > small { display: none; }.friends-bin__body li { grid-template-columns: 26px minmax(0, 1fr) auto; }.friends-bin__body li .n-popconfirm { display: none; } }
 </style>
