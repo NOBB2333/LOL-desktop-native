@@ -29,6 +29,8 @@ import type {
   TeamSummary,
 } from "../types/domain";
 import { defaultPlayerTagSettings } from "../tags/settings";
+// 阵营常量只此一份：fixture 与界面必须用同一对值，各写各的迟早对不上。
+import { TEAM_BLUE, TEAM_RED } from "../matches/lineup";
 import type { JungleCamp } from "../live/gameMap";
 import { playerSignals, teamSignals } from "../tags/signals";
 
@@ -52,12 +54,25 @@ const ranks = [["DIAMOND", "II", 67], ["EMERALD", "I", 82], ["DIAMOND", "III", 4
 const fixtureStatus = () => ({ source: "fixture" as const, fetchedAt: new Date(now).toISOString(), expiresAt: null, isStale: false, error: null });
 
 function itemsFor(championName: string): ItemSummary[] {
+  // 终局 6 件（含鞋），按英雄定位给真实装备 id——预览里观战面板的装备格
+  // 就是从这份来的，给 3 件或通用装会一眼假。
   const names: Record<string, [string, number][]> = {
-    "九尾妖狐": [["卢登的伙伴", 6655], ["影焰", 4645], ["法师之靴", 3020]],
-    "发条魔灵": [["大天使之杖", 3003], ["灭世者的死亡之帽", 3089], ["法师之靴", 3020]],
-    "诡术妖姬": [["火箭腰带", 3152], ["暗影烈焰", 4645], ["法师之靴", 3020]],
+    "暗裔剑魔": [["星蚀", 6692], ["焚天", 6610], ["死亡之舞", 6333], ["铁板靴", 3047], ["斯特拉克的挑战护手", 3053], ["自然之力", 4401]],
+    "盲僧": [["星蚀", 6692], ["黑色切割者", 3071], ["死亡之舞", 6333], ["铁板靴", 3047], ["玛莫提乌斯之噬", 3156], ["守护天使", 3026]],
+    "九尾妖狐": [["卢登的伙伴", 6655], ["影焰", 4645], ["中娅沙漏", 3157], ["法师之靴", 3020], ["灭世者的死亡之帽", 3089], ["虚空之杖", 3135]],
+    "发条魔灵": [["大天使之杖", 3003], ["影焰", 4645], ["中娅沙漏", 3157], ["法师之靴", 3020], ["灭世者的死亡之帽", 3089], ["虚空之杖", 3135]],
+    "诡术妖姬": [["卢登的伙伴", 6655], ["风暴狂涌", 4646], ["影焰", 4645], ["法师之靴", 3020], ["中娅沙漏", 3157], ["灭世者的死亡之帽", 3089]],
+    "岩雀": [["卢登的伙伴", 6655], ["影焰", 4645], ["中娅沙漏", 3157], ["法师之靴", 3020], ["灭世者的死亡之帽", 3089], ["虚空之杖", 3135]],
+    "辛德拉": [["卢登的伙伴", 6655], ["影焰", 4645], ["中娅沙漏", 3157], ["法师之靴", 3020], ["灭世者的死亡之帽", 3089], ["虚空之杖", 3135]],
+    "阿卡丽": [["海克斯科技火箭腰带", 3152], ["影焰", 4645], ["中娅沙漏", 3157], ["法师之靴", 3020], ["灭世者的死亡之帽", 3089], ["虚空之杖", 3135]],
+    "暴走萝莉": [["海妖杀手", 6672], ["幻影之舞", 3046], ["无尽之刃", 3031], ["狂战士胫甲", 3006], ["多米尼克领主的致意", 3036], ["饮血剑", 3072]],
+    "魂锁典狱长": [["钢铁烈阳之匣", 3190], ["骑士之誓", 3109], ["水银之靴", 3111], ["基克的聚合", 3050], ["荆棘之甲", 3075], ["救赎", 3107]],
+    "青钢影": [["三相之力", 3078], ["贪欲九头蛇", 3074], ["死亡之舞", 6333], ["铁板靴", 3047], ["斯特拉克的挑战护手", 3053], ["守护天使", 3026]],
+    "狂野女猎手": [["巫妖之祸", 3100], ["影焰", 4645], ["中娅沙漏", 3157], ["法师之靴", 3020], ["灭世者的死亡之帽", 3089], ["虚空之杖", 3135]],
+    "虚空之女": [["海妖杀手", 6672], ["鬼索的狂暴之刃", 3124], ["纳什之牙", 3115], ["狂战士胫甲", 3006], ["中娅沙漏", 3157], ["灭世者的死亡之帽", 3089]],
+    "深海泰坦": [["钢铁烈阳之匣", 3190], ["骑士之誓", 3109], ["铁板靴", 3047], ["荆棘之甲", 3075], ["基克的聚合", 3050], ["深渊面具", 8020]],
   };
-  return (names[championName] ?? [["中娅沙漏", 3157], ["明朗之靴", 3158], ["灭世者的死亡之帽", 3089]]).map(([name, id]) => ({ id, name, iconUrl: `https://ddragon.leagueoflegends.com/cdn/16.16.1/img/item/${id}.png` }));
+  return (names[championName] ?? [["卢登的伙伴", 6655], ["影焰", 4645], ["中娅沙漏", 3157], ["法师之靴", 3020], ["灭世者的死亡之帽", 3089], ["虚空之杖", 3135]]).map(([name, id]) => ({ id, name, iconUrl: `https://ddragon.leagueoflegends.com/cdn/16.16.1/img/item/${id}.png` }));
 }
 
 function spellsFor(index: number): SpellSummary[] {
@@ -301,44 +316,100 @@ export function createFixtureRoomLobby(rankedOnly: boolean): LiveLobby {
 const SELF_CHAMPION_BY_MATCH = ["九尾妖狐", "发条魔灵", "诡术妖姬", "岩雀", "九尾妖狐", "辛德拉", "九尾妖狐", "阿卡丽", "九尾妖狐", "发条魔灵"] as const;
 const CHAMPION_IDS: Record<string, number> = { "九尾妖狐": 103, "发条魔灵": 61, "诡术妖姬": 7, "岩雀": 163, "辛德拉": 134, "阿卡丽": 84 };
 
-function matchParticipants(index: number, win: boolean): MatchParticipant[] {
+/**
+ * 每个位置的十人数据基线（按 26 分钟的对局估）。
+ *
+ * 原来这五项都是 `125 + slot * 12` / `10500 + slot * 1100` 这种**等差数列**：五个人整齐地
+ * 排成一档一档，战绩详情里切到伤害就是一列完美的斜线，补刀更是辅助和中单差不多——位置
+ * 完全没体现，一眼就假。改成按位置取基线：辅助补刀/输出最低、视野最高；adc 补刀与输出
+ * 最高；上单承伤最高。数值量级也与逐帧金币对得上（一队 26 分钟约 10 万输出 / 5.4 万经济）。
+ */
+const ROLE_BASELINE: Record<string, { cs: number; damage: number; taken: number; heal: number; vision: number; gold: number }> = {
+  TOP: { cs: 207, damage: 21300, taken: 26900, heal: 1500, vision: 26, gold: 11400 },
+  JUNGLE: { cs: 168, damage: 18600, taken: 24800, heal: 1200, vision: 32, gold: 11000 },
+  MIDDLE: { cs: 239, damage: 28200, taken: 18100, heal: 900, vision: 22, gold: 12800 },
+  BOTTOM: { cs: 252, damage: 30200, taken: 16200, heal: 1000, vision: 19, gold: 13400 },
+  UTILITY: { cs: 39, damage: 8700, taken: 17400, heal: 4400, vision: 55, gold: 8700 },
+};
+
+/**
+ * 确定性扰动（**不要**用 `Math.random`）：同样的 (局号, 座位) 永远得到同一个值，
+ * 预览才可复现、截图对比才有意义。叠上它之后五个人不再排成一条直线。
+ */
+function wobble(index: number, slot: number, seed: number, span: number) {
+  return ((index * 7 + slot * 13 + seed * 5) % (span * 2 + 1)) - span;
+}
+
+function matchParticipants(index: number, win: boolean, selfTeam: number = TEAM_BLUE): MatchParticipant[] {
   const selfChampionName = SELF_CHAMPION_BY_MATCH[index] ?? "九尾妖狐";
-  return champions.map(([championId, championName, , role], slot) => ({
-    // ⚠️ puuid / 名字必须与大厅（`allyNames` / `enemyNames`）用同一套——相遇档案和
-    // 「关系记录」都按这些 puuid 关联。各写各的会让预览里「这一局遇到谁」「遇到过 N 次」
-    // 永远 join 不上，看起来就像功能没做（前面已经因为同样的问题返工过一次）。
-    // 座位 0 正好是「我」（`allyNames[0]`），所以相遇档案（`ally.slice(1)`）天然不含自己。
-    puuid: slot < 5 ? `fixture-ally-${slot}` : `fixture-enemy-${slot - 5}`,
-    gameName: (slot < 5 ? allyNames : enemyNames)[slot % 5][0],
-    isBot: false,
-    // 座位 0 = 我，英雄用这一局真实的那只（见上面的 `SELF_CHAMPION_BY_MATCH`）。
-    championId: slot === 0 ? CHAMPION_IDS[selfChampionName] ?? championId : championId,
-    championName: slot === 0 ? selfChampionName : championName,
-    side: slot < 5 ? "ally" : "enemy",
-    position: role,
-    kills: slot === 2 ? 9 : 3 + ((slot + index) % 5),
-    deaths: slot === 2 ? 2 : 4 + ((slot + index) % 4),
-    assists: 5 + ((slot * 2 + index) % 9),
-    damageDealt: 10500 + slot * 1100 + index * 200,
-    damageTaken: 8500 + slot * 900 + index * 150,
-    goldEarned: 10800 + slot * 420 + index * 190,
-    cs: 125 + slot * 12 + index * 3,
-    win: slot < 5 ? win : !win,
-    items: itemsFor(championName),
-    summonerSpells: spellsFor(slot + index),
-    runes: runesFor(slot + index),
-    heal: 1200 + slot * 90 + index * 20,
-    damageShare: 0.12 + (slot % 5) * 0.035,
-    damageTakenShare: 0.12 + ((slot + 2) % 5) * 0.03,
-    killParticipation: 0.28 + ((slot + index) % 5) * 0.08,
-    towerDamage: 700 + slot * 180 + index * 40,
-    turretKills: slot % 3,
-    wardsPlaced: 8 + slot * 2 + index,
-    wardsKilled: 2 + (slot % 4),
-    visionScore: 18 + slot * 4 + index,
-    visionWardsBought: slot % 3,
-    sightWardsBought: slot % 2,
-  }));
+  // 每个位置的数据基线（按 26 分钟的对局估）。见上面 `ROLE_BASELINE` 的说明。
+  // 先把十个人的原始数值算出来，再算两队总量——「团队占比」必须拿**实际生成的**总量做分母，
+  // 写死常数在叠加扰动之后就对不上了（战绩详情里那一列五个人加起来不是 100%，一眼假）。
+  const dealt = (slot: number, role: string) => (ROLE_BASELINE[role] ?? ROLE_BASELINE.MIDDLE).damage + wobble(index, slot, 1, 2600);
+  const taken = (slot: number, role: string) => (ROLE_BASELINE[role] ?? ROLE_BASELINE.MIDDLE).taken + wobble(index, slot, 2, 2100);
+  const teamSum = (of: (slot: number, role: string) => number, ally: boolean) => champions.reduce((sum, [, , , role], slot) => sum + ((slot < 5) === ally ? of(slot, role) : 0), 0);
+  const damageTotal = { ally: teamSum(dealt, true), enemy: teamSum(dealt, false) };
+  const takenTotal = { ally: teamSum(taken, true), enemy: teamSum(taken, false) };
+
+  const participants: MatchParticipant[] = champions.map(([championId, championName, , role], slot) => {
+    const base = ROLE_BASELINE[role] ?? ROLE_BASELINE.MIDDLE;
+    const ally = slot < 5;
+    const damageDealt = dealt(slot, role);
+    const damageTaken = taken(slot, role);
+    return {
+      // ⚠️ puuid / 名字必须与大厅（`allyNames` / `enemyNames`）用同一套——相遇档案和
+      // 「关系记录」都按这些 puuid 关联。各写各的会让预览里「这一局遇到谁」「遇到过 N 次」
+      // 永远 join 不上，看起来就像功能没做（前面已经因为同样的问题返工过一次）。
+      // 座位 0 正好是「我」（`allyNames[0]`），所以相遇档案（`ally.slice(1)`）天然不含自己。
+      puuid: slot < 5 ? `fixture-ally-${slot}` : `fixture-enemy-${slot - 5}`,
+      gameName: (slot < 5 ? allyNames : enemyNames)[slot % 5][0],
+      isBot: false,
+      // 座位 0 = 我，英雄用这一局真实的那只（见上面的 `SELF_CHAMPION_BY_MATCH`）。
+      championId: slot === 0 ? CHAMPION_IDS[selfChampionName] ?? championId : championId,
+      championName: slot === 0 ? selfChampionName : championName,
+      side: ally ? "ally" : "enemy",
+      // 绝对阵营：与后端 DTO 同构（100 蓝 / 200 红）。`side` 与 `team` 是**两套坐标**
+      // ——我打红方时自己的 `side` 还是 "ally" 却属于 200，配对必须走 `team`。
+      // 默认把我放在蓝方，两个字段恰好同向；`?selfSide=red` 会把我放到 200，
+      // 复现真机上「两个字段不同向」的形状（预览里能一眼看出配对有没有写错）。
+      team: ally ? selfTeam : selfTeam === TEAM_BLUE ? TEAM_RED : TEAM_BLUE,
+      position: role,
+      kills: slot === 2 ? 9 : 3 + ((slot + index) % 5),
+      deaths: slot === 2 ? 2 : 4 + ((slot + index) % 4),
+      assists: 5 + ((slot * 2 + index) % 9),
+      damageDealt,
+      damageTaken,
+      goldEarned: base.gold + wobble(index, slot, 3, 700),
+      cs: base.cs + wobble(index, slot, 4, 17),
+      win: ally ? win : !win,
+      items: itemsFor(championName),
+      summonerSpells: spellsFor(slot + index),
+      runes: runesFor(slot + index),
+      heal: base.heal + wobble(index, slot, 5, 380),
+      damageShare: Number((damageDealt / damageTotal[ally ? "ally" : "enemy"]).toFixed(3)),
+      damageTakenShare: Number((damageTaken / takenTotal[ally ? "ally" : "enemy"]).toFixed(3)),
+      killParticipation: 0.28 + ((slot + index) % 5) * 0.08,
+      towerDamage: 700 + slot * 180 + index * 40,
+      turretKills: slot % 3,
+      wardsPlaced: (role === "UTILITY" ? 26 : 8) + slot * 2 + index,
+      wardsKilled: (role === "UTILITY" ? 6 : 2) + (slot % 4),
+      visionScore: base.vision + wobble(index, slot, 6, 5),
+      visionWardsBought: role === "UTILITY" ? 5 : slot % 3,
+      sightWardsBought: slot % 2,
+    };
+  });
+
+  // 座位 0 被换成「我」的英雄后，可能与本队中路撞成**同队重复英雄**（当前 fixture 里
+  // 我玩九尾妖狐时就会撞上原阵容的中路）。同队重复在真实对局里不存在，一眼就假；
+  // 跨队重复在匹配/极地里是允许的，所以直接把双方中路对调就消掉了。
+  const allyMid = participants[2];
+  const enemyMid = participants[7];
+  if (allyMid && enemyMid && allyMid.championId === participants[0].championId) {
+    [allyMid.championId, enemyMid.championId] = [enemyMid.championId, allyMid.championId];
+    [allyMid.championName, enemyMid.championName] = [enemyMid.championName, allyMid.championName];
+  }
+  // 队内一路一人，中路对调后也不该出现两个打同一个英雄的队友。
+  return participants;
 }
 
 const fixtureBanDetails: BanSummary[] = [
@@ -349,7 +420,15 @@ const fixtureBanDetails: BanSummary[] = [
   { id: 412, name: "魂锁典狱长", iconUrl: "./fixtures/champions/Thresh.png", side: "enemy" },
 ];
 
-export const fixtureMatches: MatchSummary[] = SELF_CHAMPION_BY_MATCH.map((championName, index) => {
+/**
+ * 造一局的十人详情。
+ *
+ * `selfTeam` 是**主视角所在的绝对阵营**（100 蓝 / 200 红），默认蓝方。它只影响
+ * `side` / `team` 这对坐标，不影响胜负与数值——真机上换个边不会让 KDA 变样，
+ * 变的只是「谁在我的队里」。
+ */
+function buildFixtureMatch(index: number, selfTeam: number = TEAM_BLUE): MatchSummary {
+  const championName = SELF_CHAMPION_BY_MATCH[index] ?? "九尾妖狐";
   const win = ![2, 5, 6, 9].includes(index);
   const championId = CHAMPION_IDS[championName] ?? 103;
   const kills = index === 0 ? 9 : index === 1 ? 4 : index === 2 ? 7 : 6;
@@ -385,13 +464,29 @@ export const fixtureMatches: MatchSummary[] = SELF_CHAMPION_BY_MATCH.map((champi
     performance: index === 0 || index === 4 ? "carry" : win && index === 1 ? "carried" : !win && deaths >= 7 ? "struggling" : "solid",
     mvp: index === 0 || index === 4 ? "MVP" : index === 2 ? "SVP" : null,
     teamKills: 38 + (index % 4),
-    participants: matchParticipants(index, win),
+    participants: matchParticipants(index, win, selfTeam),
     bans: ["青钢影", "盲僧", "亚索", "阿卡丽", "锤石"],
     banDetails: fixtureBanDetails,
     playedAt: new Date(now - (index * 11 + 2) * 3600000).toISOString(),
     dataStatus: fixtureStatus(),
   };
-});
+}
+
+export const fixtureMatches: MatchSummary[] = SELF_CHAMPION_BY_MATCH.map((_, index) => buildFixtureMatch(index));
+
+/**
+ * 同一局、但主视角落在**指定阵营**的十人详情，`?selfSide=red` 走这条。
+ *
+ * 存在的理由和 `?frameDamage=0` 一样：fixture 默认把我放在蓝方，`side`（我方/敌方）
+ * 与 `team`（100/200）恰好同向，于是「拿 `side` 去配时间线座位」这条错误规则在预览里
+ * **永远是对的**——真机红方局会全线错位（每个人 KDA 000、装备空白），预览却一片正常。
+ * 有了这一条，配对写错时预览自己就能露馅。
+ */
+export function createFixtureMatchDetail(gameId: number, options: { selfTeam?: number } = {}): MatchSummary | undefined {
+  const index = fixtureMatches.findIndex((item) => item.gameId === gameId);
+  if (index < 0) return undefined;
+  return buildFixtureMatch(index, options.selfTeam ?? TEAM_BLUE);
+}
 
 export const fixtureChampions: ChampionOverview[] = champions.map(([id, name, alias, role], index) => ({
   id, name, alias, abilities: ["被动技能", "技能 Q", "技能 W", "技能 E", "技能 R"], roles: [role], tier: index < 3 ? "S" : index < 7 ? "A" : "B",
@@ -659,43 +754,59 @@ export function createFixtureJunglePath(puuid: string, gameIds: number[]): Jungl
  * **确定但会随对局变化**的数据：经济曲线带一次翻盘拐点，事件列表覆盖四类关键事件。
  * 不补这个 fixture，「对局时间线」页签在预览里永远是空的。
  */
-export function createFixtureMatchTimeline(gameId: number): MatchTimeline {
+/** 十项全 0：`frameDamage: false` 时冒充「客户端帧里没有伤害字段」。每次给一份新的，
+ *  免得所有帧共享同一个数组（下游哪怕只是排序/切片也容易被连带影响）。 */
+const zeroFrameValues = () => Array.from({ length: 10 }, () => 0);
+
+export function createFixtureMatchTimeline(gameId: number, options: { frameDamage?: boolean; selfTeam?: number } = {}): MatchTimeline {
   const seed = Math.abs(Math.trunc(gameId)) % 997;
   const minutes = 24 + (seed % 14);
   const durationSeconds = minutes * 60;
   // 谁笑到最后由 gameId 决定，这样不同对局的曲线不会长得一模一样。
   const blueEdge = seed % 2 === 0 ? 1 : -1;
-  // 用本文件其它 fixture 的**同一份**英雄目录：英雄 id 必须能在 `fixtureChampions`
-  // 里查到，否则历史页会把它们渲染成「英雄 #24」这种占位文本——预览看起来就像坏了。
-  const roster = champions.map(([id]) => id);
+  /**
+   * 主视角所在的绝对阵营。座位 1..5 是**主视角那一队**（roster 前五个按 ally 取），
+   * 所以它们的 `team` 就是这个值，不是写死的 100——真机红方局里正是这个不一致
+   * 让「拿 side 配座位」全线配空。帧里的 `blueGold` / `blueCs` 是**绝对颜色**，
+   * 主视角在红方时必须取后五个座位，不能再默认前五个是蓝。
+   */
+  const selfTeam = options.selfTeam ?? TEAM_BLUE;
+  const otherTeam = selfTeam === TEAM_BLUE ? TEAM_RED : TEAM_BLUE;
+  const alliesAreBlue = selfTeam === TEAM_BLUE;
+  // 英雄目录必须与「十人详情」（`fixtureMatches`）同一份：观战面板按「英雄 + 阵营」
+  // 配对入座，各写各的就会出现「剑魔没有名字、没有装备」这种配对失败的空行（真踩过）。
+  const match = createFixtureMatchDetail(gameId, { selfTeam });
+  const roster = match
+    ? [...match.participants.filter((player) => player.side === "ally"), ...match.participants.filter((player) => player.side === "enemy")].map((player) => player.championId)
+    : champions.map(([id]) => id);
   const participants: MatchTimelineParticipant[] = roster.map((championId, index) => ({
     participantId: index + 1,
-    team: index < 5 ? 100 : 200,
+    team: index < 5 ? selfTeam : otherTeam,
     championId,
   }));
   /** 座位号 → 英雄 id。事件的英雄**一律由座位号推**，不手写。 */
   const championOf = (participantId: number) => roster[participantId - 1] ?? 0;
 
-  // 队内经济分配：越靠前的座位越像 C 位，辅助拿最少。
-  const goldShares = [0.24, 0.22, 0.21, 0.19, 0.14];
-  const frames: MatchTimelineFrame[] = [];
-  for (let minute = 1; minute <= minutes; minute += 1) {
-    const ramp = minute / minutes;
-    // 开局 40% 处两条线交叉：前半段红方领先，后半段蓝方反超（或反过来）。
-    const swing = blueEdge * (ramp - 0.4) * 9200;
-    const blueGold = 2500 + minute * 1350 + Math.round(swing);
-    const redGold = 2500 + minute * 1330 - Math.round(swing);
-    const gold = goldShares.map((share, index) => Math.round((index < 5 ? blueGold : redGold) * share));
-    frames.push({
-      minute,
-      blueGold,
-      redGold,
-      goldDiff: blueGold - redGold,
-      blueCs: Math.round(minute * 28.5),
-      redCs: Math.round(minute * 27.2),
-      gold,
-    });
-  }
+  // 座位（每队 0..4）固定对应 上/野/中/下/辅：经济速率、分均伤害、升级快慢都按它来，
+  // 预览才不会出现「辅助比 C 位有钱」「打野等级全场最高」这种一眼假。
+  const LANE_RATES = [
+    { gold: 385, damage: 780, taken: 640, level: 0.66 }, // 上（前排，承伤最高）
+    { gold: 360, damage: 620, taken: 560, level: 0.6 }, // 野
+    { gold: 400, damage: 950, taken: 520, level: 0.66 }, // 中
+    { gold: 405, damage: 1000, taken: 480, level: 0.64 }, // 下
+    { gold: 235, damage: 380, taken: 440, level: 0.5 }, // 辅
+  ] as const;
+
+  /**
+   * 每个座位的「个人状态」系数（输出 / 承伤各一组，±8%），按 (局号, 座位) 确定性生成。
+   *
+   * 少了它，两队同位置的分均速率完全一样（都是 `LANE_RATES[index % 5]`），对线期一擦游标
+   * 就会看到**双方出现一模一样的伤害数字**（6746 / 6408 / 4182…），实时伤害榜两列长得像
+   * 复制粘贴，一眼假数据。幅度刻意收在 ±8%：再大就会盖过相邻位置之间本来就只差 5%
+   * （中 950 / 下 1000）的差距，把「下路 > 中路 > 上单 > 打野 > 辅助」的顺序翻掉。
+   */
+  const formOut = Array.from({ length: 10 }, (_, index) => 0.92 + ((seed + index * 37) % 17) / 100);
+  const formIn = Array.from({ length: 10 }, (_, index) => 0.93 + ((seed + index * 53) % 15) / 100);
 
   /**
    * 几个点位的近似坐标（mapId 11 的 `0..14820 × 0..14881` 域，取自 `live/gameMap.ts`
@@ -772,7 +883,105 @@ export function createFixtureMatchTimeline(gameId: number): MatchTimeline {
     timelineEvent({ type: "BUILDING_KILL", seconds: 1502, team: 100, killerId: 4, buildingType: "INHIBITOR_BUILDING", laneType: "MID_LANE", ...spot.mid }),
     timelineEvent({ type: "ELITE_MONSTER_KILL", seconds: 1596, team: 100, killerId: 2, monsterType: "DRAGON", monsterSubType: "ELDER_DRAGON", ...spot.dragon }),
     timelineEvent({ type: "BUILDING_KILL", seconds: 1810, team: 100, killerId: 5, buildingType: "TOWER_BUILDING", towerType: "BASE_TURRET", laneType: "MID_LANE", ...spot.mid }),
-  ].filter((item) => item.seconds <= durationSeconds);
+  ]
+    .filter((item) => item.seconds <= durationSeconds)
+    // 事件里的 `team` 是「做事的一方」的**绝对阵营**。上面那串时间点全是按
+    // 「座位 1..5 = 蓝方」写的（看 killerId 就知道），主视角在红方时整体翻转；
+    // 不翻的话击杀记录会整片挂到对手那边。
+    .map((item) => ({ ...item, team: item.team === TEAM_BLUE ? selfTeam : otherTeam }));
+
+  // 击杀（含三波团）的伤害爆点：累计进「事发分钟」的帧里，这样「团后帧 − 团前帧」
+  // 就是这波团每人实际打了多少伤害——「每波团」伤害柱状图的原料。
+  const damageBursts = Array.from({ length: 10 }, () => 0);
+  const takenBursts = Array.from({ length: 10 }, () => 0);
+  const burstAt = (participantId: number, minute: number, kind: "damage" | "taken") => {
+    let burst = 0;
+    for (const event of events) {
+      if (event.type !== "CHAMPION_KILL" || Math.ceil(event.seconds / 60) !== minute) continue;
+      // 打出伤害的是击杀方与助攻方，挨打的是被击杀的那个——两个指标刚好互补。
+      if (event.killerId === participantId) burst += kind === "damage" ? 1500 : 700;
+      if (event.victimId === participantId) burst += kind === "damage" ? 800 : 1400;
+      if (event.assistIds.includes(participantId)) burst += kind === "damage" ? 600 : 500;
+    }
+    return burst;
+  };
+
+  /**
+   * 走位锚点（mapId 11 的 `0..14820 × 0..14881` 域，蓝方基地在**左下**、红方在右上）。
+   * 每条分路一条「对线期守自己路、中期开始向中路/资源区靠」的确定性轨迹，加一点
+   * 正弦抖动——上一版十个人全绕中路随机晃，预览里一眼假。
+   */
+  const laneAnchor = (slot: number, ramp: number, blue: boolean) => {
+    const roam = Math.max(0, (ramp - 0.5) / 0.5); // 0 = 对线期 → 1 = 终局抱团
+    const anchors = [
+      { x: 2600, y: 12400 }, // 上
+      { x: 4200, y: 9600 }, // 野（基准点，下面再叠加绕圈）
+      { x: 6900, y: 7900 }, // 中
+      { x: 12300, y: 2700 }, // 下
+      { x: 11800, y: 3200 }, // 辅
+    ];
+    const anchor = anchors[slot] ?? anchors[2];
+    const mid = { x: 7400, y: 7400 };
+    const x = anchor.x + (mid.x - anchor.x) * roam * 0.6;
+    const y = anchor.y + (mid.y - anchor.y) * roam * 0.6;
+    return blue ? { x, y } : { x: 14820 - x, y: 14881 - y };
+  };
+
+  const frames: MatchTimelineFrame[] = [];
+  for (let minute = 1; minute <= minutes; minute += 1) {
+    const ramp = minute / minutes;
+    // 开局 35% 后领先方开始滚雪球：一侧速率加成、一侧衰减，曲线平滑交叉一次。
+    const swing = Math.max(0, (ramp - 0.35) / 0.65);
+    // ⚠️ 必须是 **10 项**（participantId 1..10 各一项）——`MatchTimelineFrame.gold`
+    // 的契约就是十项。曾经写成 5 项，红方五人的金币全是 0，预览像坏了。
+    const gold = Array.from({ length: 10 }, (_, index) => {
+      const lane = LANE_RATES[index % 5];
+      const side = index < 5 ? 1 : -1;
+      return Math.round((500 + lane.gold * minute) * (1 + blueEdge * side * swing * 0.1));
+    });
+    // `blueGold` / `redGold` 是**绝对颜色**的队总经济：座位 1..5 是主视角那一队，
+    // 主视角在红方时它们才是红队的钱。
+    const blueGold = (alliesAreBlue ? gold.slice(0, 5) : gold.slice(5)).reduce((sum, value) => sum + value, 0);
+    const redGold = (alliesAreBlue ? gold.slice(5) : gold.slice(0, 5)).reduce((sum, value) => sum + value, 0);
+    for (let id = 1; id <= 10; id += 1) {
+      damageBursts[id - 1] += burstAt(id, minute, "damage");
+      takenBursts[id - 1] += burstAt(id, minute, "taken");
+    }
+    const level = Array.from({ length: 10 }, (_, index) => Math.min(18, 1 + Math.floor(minute * LANE_RATES[index % 5].level)));
+    // `frameDamage: false` = **真机形状**：客户端（TENCENT 客户端实测）的分钟帧里只有
+    // 金币 / 等级 / 补刀 / 位置，逐分钟伤害字段压根不存在。默认 true 保留「有伤害」那
+    // 一路，是为了让「到此刻累计」这条路径在预览与单测里仍然可走；真机形状用
+    // `?frameDamage=0` 打开（见 `services/browserBackend.ts`）。
+    const damage = options.frameDamage === false
+      ? zeroFrameValues()
+      : Array.from({ length: 10 }, (_, index) => Math.round(LANE_RATES[index % 5].damage * minute * (1 + 0.15 * ramp) * formOut[index]) + damageBursts[index]);
+    const taken = options.frameDamage === false
+      ? zeroFrameValues()
+      : Array.from({ length: 10 }, (_, index) => Math.round(LANE_RATES[index % 5].taken * minute * (1 + 0.12 * ramp) * formIn[index]) + takenBursts[index]);
+    const positions = Array.from({ length: 10 }, (_, index) => {
+      // 第三个参数是「蓝方基地在左下」的那套坐标；座位 1..5 是主视角那一队，
+      // 所以 `blue` 得看主视角在不在蓝方，不能恒等于 `index < 5`。
+      const anchor = laneAnchor(index % 5, ramp, (index < 5) === alliesAreBlue);
+      const jitter = Math.sin(minute * 2.1 + index * 3.7) * 380;
+      // 打野在对线期也按半区绕圈，不能钉在一个点上。
+      const jungleWander = index % 5 === 1 && ramp < 0.55 ? Math.sin(minute * 0.9) * 2400 : 0;
+      return { x: Math.round(anchor.x + jitter + jungleWander), y: Math.round(anchor.y - jitter * 0.7 + jungleWander * 0.5) };
+    });
+    frames.push({
+      minute,
+      blueGold,
+      redGold,
+      goldDiff: blueGold - redGold,
+      // 基数 1 不能动，翻转的只是「领先方雪球」那一项的方向。
+      blueCs: Math.round(minute * 31.5 * (1 + (alliesAreBlue ? 1 : -1) * blueEdge * swing * 0.06)),
+      redCs: Math.round(minute * 31.5 * (1 - (alliesAreBlue ? 1 : -1) * blueEdge * swing * 0.06)),
+      gold,
+      level,
+      damage,
+      taken,
+      positions,
+    });
+  }
 
   return { gameId, durationSeconds, participants, frames, events };
 }

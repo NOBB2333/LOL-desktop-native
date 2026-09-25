@@ -2988,6 +2988,34 @@ fn fetchSgpHistoryWithContext(client: lcu.Client, context: JungleSgpContext, tar
     return client.getBearerUrl(url, context.token, sgp_user_agent);
 }
 
+/// 取一局的 SGP `DETAILS` 原文；拿不到（离线 / 区服不在白名单 / 没有 entitlement）返回 null，
+/// 调用方按「这一局没有伤害数据」降级，不当成错误。
+///
+/// 平台标识直接读本地那份对局详情里的 `platformId`，省掉一次 ranked / lobby 往返。
+/// 这份响应里嵌着 **match-v5 的完整时间线**（含每座位的 `damageStats` 与 `ITEM_PURCHASED`
+/// 等事件），是本地裁剪版 `game-timelines` 拿不到伤害的唯一来源 —— 详见
+/// `backend/timeline.zig` 的 `sgpTimelineFrames`。
+pub fn fetchSgpMatchDetails(client: lcu.Client, game_json: []const u8, game_id: i64) ?[]u8 {
+    if (game_id <= 0 or game_json.len == 0) return null;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const game = std.json.parseFromSliceLeaky(std.json.Value, allocator, game_json, .{}) catch return null;
+    const platform_id = jsonField(game, "platformId");
+    const host = sgpHost(platform_id) orelse return null;
+
+    const entitlement_json = client.get("/entitlements/v1/token") catch return null;
+    defer std.heap.page_allocator.free(entitlement_json);
+    const entitlement = std.json.parseFromSliceLeaky(std.json.Value, allocator, entitlement_json, .{}) catch return null;
+    const token = jsonField(entitlement, "accessToken");
+    if (token.len == 0) return null;
+
+    var url_buffer: [2048]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buffer, "https://{s}/match-history-query/v1/products/lol/{s}_{d}/DETAILS", .{ host, platform_id, game_id }) catch return null;
+    return client.getBearerUrl(url, token, sgp_user_agent) catch null;
+}
+
 pub fn fetchSgpHistory(client: lcu.Client, current: std.json.Value, lcu_history_json: []const u8, target_puuid: []const u8, start: usize, count: usize) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -4525,6 +4553,11 @@ fn writeParticipant(writer: *std.Io.Writer, participant: std.json.Value, self_te
     try jsonString(writer, champion_name);
     try writer.writeAll(",\"side\":");
     try jsonString(writer, if (team_id == self_team_id) "ally" else "enemy");
+    // 绝对阵营（100 蓝 / 200 红）。`side` 是**相对视角**的（ally = 这一局视角方的队），
+    // 只够回答「我方/敌方」；而时间线的座位带的是绝对阵营，两者配对时用它才配得上
+    // ——视角方在红方时 `side:"ally"` 的其实是 200，拿 side 去比就把十个人全配对失败
+    // （表现为每个人 KDA 都是 0/0/0、装备与对塔伤害整片空白）。
+    try writer.print(",\"team\":{d}", .{team_id});
     try writer.writeAll(",\"position\":");
     try jsonString(writer, position);
     try writer.print(",\"kills\":{d},\"deaths\":{d},\"assists\":{d},\"damageDealt\":{d},\"damageTaken\":{d},\"goldEarned\":{d},\"cs\":{d},\"win\":{},\"items\":", .{ kills, deaths, assists, damage, taken, gold, cs, win });
@@ -8588,6 +8621,30 @@ test "does not assign an unmatched participant to another player" {
     try std.testing.expect(missing == .null);
     const single = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "[{\"puuid\":\"one\"}]", .{});
     try std.testing.expectEqualStrings("one", jsonField(participantForPuuid(game, single, "missing"), "puuid"));
+}
+
+test "participant dto keeps an absolute team alongside the relative side" {
+    // 视角方（self）在**红方**：他自己那行 side 是相对的 "ally"，但它属于 200。
+    // 前端把「时间线座位(绝对 100/200)」和「十人详情」配对，只认 side 就一定配错
+    // ——十个座位全落空，界面上就是每人 KDA 0/0/0、装备与对塔伤害整片空白。
+    const input = "{\"games\":{\"games\":[{\"gameId\":7,\"gameDuration\":1800,\"participantIdentities\":[" ++
+        "{\"participantId\":1,\"player\":{\"puuid\":\"self\"}},{\"participantId\":2,\"player\":{\"puuid\":\"mate\"}},{\"participantId\":3,\"player\":{\"puuid\":\"foe\"}}]," ++
+        "\"participants\":[" ++
+        "{\"participantId\":1,\"teamId\":200,\"championId\":103,\"stats\":{\"kills\":5,\"deaths\":1,\"assists\":2,\"item0\":3157}}," ++
+        "{\"participantId\":2,\"teamId\":200,\"championId\":64,\"stats\":{\"kills\":1,\"deaths\":3,\"assists\":7}}," ++
+        "{\"participantId\":3,\"teamId\":100,\"championId\":99,\"stats\":{\"kills\":0,\"deaths\":9,\"assists\":0}}]}]}}";
+    var output: [8192]u8 = undefined;
+    const result = try matchHistoryDtoPage(input, "[]", "self", 0, 1, &output);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    const parts = parsed.value.array.items[0].object.get("participants").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), parts.len);
+    try std.testing.expectEqual(@as(i64, 200), jsonInt(parts[0], "team"));
+    try std.testing.expectEqualStrings("ally", jsonField(parts[0], "side"));
+    try std.testing.expectEqual(@as(i64, 200), jsonInt(parts[1], "team"));
+    try std.testing.expectEqualStrings("ally", jsonField(parts[1], "side"));
+    try std.testing.expectEqual(@as(i64, 100), jsonInt(parts[2], "team"));
+    try std.testing.expectEqualStrings("enemy", jsonField(parts[2], "side"));
 }
 
 test "derives encounter records from match participants" {

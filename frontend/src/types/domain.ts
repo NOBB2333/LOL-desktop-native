@@ -149,6 +149,15 @@ export interface MatchParticipant {
   championId: number;
   championName: string;
   side: "ally" | "enemy" | string;
+  /**
+   * **绝对**阵营：100 = 蓝方、200 = 红方。
+   *
+   * 与 `side` 的区别要记牢：`side` 是相对这一局视角方的（看别人的历史时，`ally`
+   * 指的是**他**那一队）。跟时间线座位（带绝对 100/200）配对时必须用这个字段，
+   * 用 `side` 在「视角方在红方」的对局里会把十个人全配空。
+   * 老缓存里可能没有该字段，配对代码要留相对 `side` 的兜底。
+   */
+  team?: number;
   position: string;
   kills: number;
   deaths: number;
@@ -281,6 +290,14 @@ export interface MatchTimelineFrame {
   redCs: number;
   /** 10 项，按 participantId 1..10 顺序，缺座位补 0。 */
   gold: number[];
+  /** 10 项；这一分钟各人的英雄等级（观战式等级徽标用），缺座位补 0。 */
+  level: number[];
+  /** 10 项；这一分钟各人的**累计对英雄伤害**（每波团伤害 = 团后帧减团前帧），缺座位/缺字段补 0。 */
+  damage: number[];
+  /** 10 项；这一分钟各人的**累计承受伤害**（每波团承伤同理），缺座位/缺字段补 0。 */
+  taken: number[];
+  /** 10 项；这一分钟各人的地图位置（观战「小人到处跑」用），0/0 = 该帧没有位置。 */
+  positions: { x: number; y: number }[];
 }
 
 export interface MatchTimelineEvent {

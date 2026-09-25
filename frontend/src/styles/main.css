@@ -29,6 +29,10 @@
   --accent-soft: #e4f5f0;
   --amber: #b45309;
   --amber-soft: #fff1df;
+  /* 金币色：只给「金币图标」这类图形用。和 --amber 分开是因为 amber 在暖色主题里
+     是「警告」，而金币是个中性的读数标记，压在蓝/红两队色之间不能被读成告警。 */
+  --gold: #a97a12;
+  --gold-soft: #fbf1d7;
   --green: #15803d;
   --green-soft: #eaf7ed;
   --red: #c2413a;
@@ -68,6 +72,9 @@
   --line-strong: #4b4c46;
   --accent-soft: #3b2e20;
   --amber-soft: #3b2e20;
+  /* 深色下金色要提亮，否则 #a97a12 压在 #242522 上只有 ~2.6:1，金币看着像脏点。 */
+  --gold: #e3b341;
+  --gold-soft: #3a3018;
   --green-soft: #183126;
   --red-soft: #3b2423;
   --blue-soft: #202e3d;

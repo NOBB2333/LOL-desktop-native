@@ -13,9 +13,10 @@ import { isNative } from "./native";
 import {
   createFixtureJunglePath,
   createFixtureLobby,
+  createFixtureMatchDetail,
+  createFixtureMatchTimeline,
   createFixturePlayerStats,
   createFixtureRoomLobby,
-  createFixtureMatchTimeline,
   fixtureBootstrap,
   fixtureBpHistory,
   fixtureChampions,
@@ -29,6 +30,7 @@ import {
   fixtureMatches,
 } from "../fixtures/data";
 import { visibleMatches } from "../matches/filters";
+import { TEAM_BLUE, TEAM_RED } from "../matches/lineup";
 import { roleName } from "../utils/format";
 import { shortcutPrimaryTag, shortcutRiskLabels, shortcutStreakLabel } from "../tags/signals";
 import { shortcutTemplateKeys } from "../shortcuts/template";
@@ -95,6 +97,19 @@ if (storedConfig) {
 /** 当前是否必须走模拟实现：没有原生桥，或数据模式不是 live。 */
 export function usesFixtureData(): boolean {
   return !isNative() || browserState.mode !== "live";
+}
+
+/**
+ * 预览开关：`?selfSide=red` 把主视角放到**红方**。
+ *
+ * fixture 默认把「我」放在蓝方，于是 `side`（我方 / 敌方）与 `team`（100 / 200）恰好
+ * 同向，而真机上这是两套坐标——我打红方时自己那行的 `side` 仍是 `ally`、`team` 却是 200。
+ * 曾经因此把「拿 side 去配时间线座位」写错而预览里完全看不出来，真机红方局却是
+ * 「每个人 KDA 000、装备整片空白」。开了这个开关，那条路径在预览里就看得见了。
+ */
+function previewSelfTeam(): number {
+  if (typeof location === "undefined") return TEAM_BLUE;
+  return new URLSearchParams(location.search).get("selfSide") === "red" ? TEAM_RED : TEAM_BLUE;
 }
 
 /**
@@ -271,8 +286,16 @@ export const browserBackend = {
     // 参数已由门面清洗（去重、截断到 10 场），这里只负责造数据。
     return createFixtureJunglePath(puuid, gameIds);
   },
+  /**
+   * 预览用的逐帧明细。
+   *
+   * `?frameDamage=0` 走**真机形状**：客户端（TENCENT 实机实测）的分钟帧里没有伤害字段，
+   * 「本波输出 / 本波承伤 / 十人第二行的输出两项」在真机上就是算不出来、要降级成全场总账。
+   * 不开这个开关就看不到那条降级路径，很容易把「预览里好好的」当成「真机也没问题」。
+   */
   matchTimeline(gameId: number): MatchTimeline {
-    return createFixtureMatchTimeline(gameId);
+    const noDamage = typeof location !== "undefined" && new URLSearchParams(location.search).get("frameDamage") === "0";
+    return createFixtureMatchTimeline(gameId, { frameDamage: !noDamage, selfTeam: previewSelfTeam() });
   },
   matches(page: number, pageSize: number): MatchSummary[] {
     const source = visibleMatches(fixtureMatches, browserState.config.providers.hideUnfinishedMatches, browserState.config.providers.rankedOnly);
@@ -316,7 +339,7 @@ export const browserBackend = {
     return createFixturePlayerStats(puuids);
   },
   matchDetail(gameId: number): MatchSummary {
-    const match = fixtureMatches.find((item) => item.gameId === gameId);
+    const match = createFixtureMatchDetail(gameId, { selfTeam: previewSelfTeam() });
     if (!match) throw new Error("该对局的完整详情不可用");
     return structuredClone(match);
   },

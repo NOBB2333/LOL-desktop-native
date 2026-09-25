@@ -284,7 +284,8 @@ watch(
 
           <!--
             展开 = 逐局细节。每行先回答最简的问题：他玩什么 / 我玩什么、两边 KDA、胜负、模式时间。
-            行本身可再点：点开就在行下面挂 `MatchDeepDetail`（十人对位 + 事件流），视角是他。
+            整行都可以点（悬停有底色反馈，不用额外的下拉箭头指路），点开就在行下面挂
+            `MatchDeepDetail`（十人对位 + 事件流），视角是他。
           -->
           <div v-if="expandedPuuid === aggregate.puuid" class="encounter-detail">
             <div class="encounter-detail__head">
@@ -295,7 +296,6 @@ watch(
               <span>我</span>
               <span>结果</span>
               <span>模式 / 时间</span>
-              <span />
             </div>
             <template v-for="game in aggregate.games" :key="`${aggregate.puuid}-${game.gameId}`">
               <button type="button" class="encounter-detail__row" :class="{ 'is-open': expandedGameKey === gameKeyOf(aggregate.puuid, game.gameId) }" :aria-expanded="expandedGameKey === gameKeyOf(aggregate.puuid, game.gameId)" @click="toggleGame(aggregate.puuid, game.gameId)">
@@ -312,7 +312,6 @@ watch(
                 <span class="encounter-detail__self">我 {{ game.selfKills }}/{{ game.selfDeaths }}/{{ game.selfAssists }}</span>
                 <span class="encounter-detail__result" :data-win="game.won === null ? 'unknown' : String(game.won)">{{ game.won === null ? '未知' : game.won ? '胜利' : '失败' }}</span>
                 <time>{{ game.queueName || '未知模式' }} · {{ relativeTime(game.encounteredAt) }}</time>
-                <ChevronDown :size="12" class="encounter-detail__caret" />
               </button>
 
               <!-- 再往下钻一层：这一局的全局对局信息。targetPuuid 传他，面板视角跟着切。 -->
@@ -410,10 +409,17 @@ watch(
 .encounter-caret { color: var(--text-muted); transition: transform .15s; }
 .encounter-table__row.is-open .encounter-caret { transform: rotate(180deg); }
 /* 展开区：紧跟在那一行下面，读起来仍然属于同一个玩家。 */
-.encounter-detail { display: grid; gap: 6px; padding: 10px 16px 12px; border-bottom: 1px solid var(--line); background: var(--surface-muted); }
-.encounter-detail__head, .encounter-detail__row { display: grid; grid-template-columns: 50px 22px minmax(96px, 1fr) 100px 100px 50px minmax(120px, 1fr); align-items: center; gap: 8px; min-width: 720px; font-size: 11px; }
-/* 表头只在展开区里出现一次，说明每一列是什么（否则「他/我」两列 KDA 要猜）。 */
-.encounter-detail__head { color: var(--text-muted); font-size: 10px; }
+.encounter-detail { display: grid; gap: 4px; padding: 10px 16px 12px; border-bottom: 1px solid var(--line); background: var(--surface-muted); }
+/* 逐局行是整行可点的按钮（悬停/展开态反馈），不放下拉箭头——箭头长得像下拉框，误导。 */
+.encounter-detail__head, .encounter-detail__row { display: grid; grid-template-columns: 50px minmax(104px, 1.1fr) minmax(104px, 1fr) 92px 92px 46px minmax(120px, 1fr); align-items: center; gap: 8px; min-width: 760px; font-size: 11px; }
+/* 表头只在展开区里出现一次，说明每一列是什么（否则「他 / 我 / 我玩的」只能猜）。
+   水平内边距 = 数据行（按钮）的 border 1px + padding 4px，两边列线才对得齐。 */
+.encounter-detail__head { padding: 2px 5px; color: var(--text-muted); font-size: 10px; }
+.encounter-detail__row { width: 100%; padding: 5px 4px; border: 1px solid transparent; border-radius: 5px; color: inherit; background: transparent; cursor: pointer; font: inherit; font-size: 11px; text-align: left; transition: background .1s, border-color .1s; }
+.encounter-detail__row:hover { background: var(--surface); }
+.encounter-detail__row.is-open { border-color: var(--line); background: var(--surface); }
+.encounter-detail__champ { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.encounter-detail__champ b { overflow: hidden; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
 .encounter-detail__side { padding: 1px 6px; border-radius: 3px; background: var(--surface); color: var(--text-secondary); font-size: 10px; text-align: center; }
 .encounter-detail__side[data-side="ally"] { color: var(--blue); }
 .encounter-detail__side[data-side="enemy"] { color: var(--red); }
@@ -421,8 +427,10 @@ watch(
 .encounter-detail__result[data-win="true"] { color: var(--blue); }
 .encounter-detail__result[data-win="false"] { color: var(--red); }
 .encounter-detail__result[data-win="unknown"] { color: var(--text-muted); }
-.encounter-detail__row time { color: var(--text-muted); }
-.encounter-detail__foot { display: flex; justify-content: flex-end; }
+.encounter-detail__row time { overflow: hidden; color: var(--text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+/* 再钻一层：那一局的全局对局信息，缩进一点表明它属于上面那行。 */
+.encounter-detail__deep { margin: 2px 0 4px 50px; padding: 10px; border: 1px dashed var(--line); border-radius: 6px; background: var(--surface); }
+.encounter-detail__foot { display: flex; justify-content: flex-end; margin-top: 6px; }
 
 /* 排序切换：两个小按钮，选中的那个用强调色。 */
 .history-sort { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
