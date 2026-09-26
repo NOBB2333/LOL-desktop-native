@@ -417,8 +417,8 @@ export const browserBackend = {
    */
   checkUpdate(): ReleaseUpdate | null {
     return {
-      version: "2.6.0",
-      title: "桌上英雄联盟 Native v2.6.0",
+      version: "2.7.0",
+      title: "桌上英雄联盟 Native v2.7.0",
       publishedAt: "2026-09-20T12:00:00Z",
       url: "https://github.com/NOBB2333/LOL-desktop-native/releases",
       notes: "预览数据：这里显示的是 Release 说明的前一段内容。\n支持多行。",
