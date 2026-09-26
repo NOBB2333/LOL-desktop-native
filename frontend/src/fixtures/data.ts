@@ -159,7 +159,8 @@ function makePlayer(index: number, ally: boolean, rankedOnly = false): PlayerPro
     { championId: champions[(index + 1) % 5][0], championName: champions[(index + 1) % 5][1], games: 31, wins: 18, winRate: 0.58 },
     { championId: champions[(index + 2) % 5][0], championName: champions[(index + 2) % 5][1], games: 19, wins: 10, winRate: 0.53 },
   ];
-  const averageParticipation = matches.reduce((sum, match) => sum + match.killParticipation, 0) / matches.length;
+  // fixture 里每一局都有真参团率（不是后端那种「整队数据缺失」），`?? 0` 只是满足类型。
+  const averageParticipation = matches.reduce((sum, match) => sum + (match.killParticipation ?? 0), 0) / matches.length;
   const averageCsPerMinute = matches.reduce((sum, match) => sum + match.cs / Math.max(1, match.durationMinutes), 0) / matches.length;
   const averageEarlyTakedowns = role === "JUNGLE" ? matches.reduce((sum, match) => sum + (match.takedownsFirstXMinutes ?? 0), 0) / matches.length : null;
   const averageObjectiveTakedowns = role === "JUNGLE" ? matches.reduce((sum, match) => sum + (match.dragonTakedowns ?? 0) + (match.baronTakedowns ?? 0) + (match.riftHeraldTakedowns ?? 0), 0) / matches.length : null;

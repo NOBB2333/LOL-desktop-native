@@ -4379,6 +4379,11 @@ fn writeOptionalRatio(writer: *std.Io.Writer, value: ?f64) !void {
     if (value) |number| try writer.print("{d:.4}", .{number}) else try writer.writeAll("null");
 }
 
+/// 写出一个可空的整数：有值写整数，无值写 `null`（「不知道」和「是 0」要分得开）。
+fn writeOptionalInt(writer: *std.Io.Writer, value: ?i64) !void {
+    if (value) |number| try writer.print("{d}", .{number}) else try writer.writeAll("null");
+}
+
 /// 读一个 ping 计数。SGP 的战绩明细把 ping 统计直接放在 participant 顶层
 /// （AK 读的就是 `p.enemyMissingPings`）；LCU 的 match-history 没有这些字段，
 /// 此时返回 `null`，前端会把整条「消失信号」标签一起隐藏。
@@ -4590,7 +4595,11 @@ fn writeParticipant(writer: *std.Io.Writer, participant: std.json.Value, self_te
     const damage = statInt(participant, "totalDamageDealtToChampions");
     const taken = statInt(participant, "totalDamageTaken");
     const gold = statInt(participant, "goldEarned");
-    const cs = statInt(participant, "totalMinionsKilled") + statInt(participant, "neutralMinionsKilledToTeamJungle");
+    // ⚠️ LCU 的字段叫 `neutralMinionsKilled`（= 自家 + 敌方野怪的总数）。
+    // 早先这里写的是 `neutralMinionsKilledToTeamJungle` —— 那个键在客户端响应里
+    // **根本不存在**（真实键是 `neutralMinionsKilledTeamJungle`），`statInt` 恒返回 0，
+    // 于是所有打野的补刀都被算成「只有线上兵」，少掉全部野怪。
+    const cs = statInt(participant, "totalMinionsKilled") + statInt(participant, "neutralMinionsKilled");
     const win = statBool(participant, "win");
     const team_id = jsonInt(participant, "teamId");
     const team_damage = teamStat(all_participants, team_id, "totalDamageDealtToChampions");
@@ -4660,6 +4669,12 @@ fn participantPosition(participant: std.json.Value) []const u8 {
     return lane;
 }
 
+/// 写出装备栏。LCU 把装备放在 `stats.item0…item6`（`statInt` 会先看 `stats` 再看顶层，
+/// 两种形状都认），其中 **0–5 是装备、6 是饰品/视野位**。
+///
+/// `slot` 必须一起写出：早先只给非空项、不带格子号，前端只能按下标顺位渲染，
+/// 于是「卖掉一件鞋」这种中间空一格的情况会让后面的装备整体前移 —— 最后那格
+/// 也就认不出是饰品了。带上 `slot` 才能画出固定的 6+1 个格子。
 fn writeItems(writer: *std.Io.Writer, participant: std.json.Value) !void {
     try writer.writeByte('[');
     var first = true;
@@ -4670,7 +4685,7 @@ fn writeItems(writer: *std.Io.Writer, participant: std.json.Value) !void {
         if (id <= 0) continue;
         if (!first) try writer.writeByte(',');
         first = false;
-        try writer.print("{{\"id\":{d},\"name\":\"\",\"iconUrl\":\"\"}}", .{id});
+        try writer.print("{{\"id\":{d},\"slot\":{d},\"name\":\"\",\"iconUrl\":\"\"}}", .{ id, index });
     }
     try writer.writeByte(']');
 }
@@ -4782,24 +4797,53 @@ fn summonerSpellName(value: std.json.Value) []const u8 {
     return "";
 }
 
+/// 写出该 participant 的符文。
+///
+/// 两个数据源的形状完全不同，**必须都认**：
+/// - SGP / match-v5（`DETAILS`、`SUMMARY`）：`perks.styles[].selections[].perk`，
+///   每个 selection 自带所属的 `style`。
+/// - LCU（`/lol-match-history/v1/games/{id}` 与战绩列表接口）：**没有 `perks` 这个对象**，
+///   符文放在 `stats.perk0…perk5`（0 号是基石，1–3 属主系，4–5 属副系），
+///   主/副系的样式在 `stats.perkPrimaryStyle` / `stats.perkSubStyle`。
+///
+/// ⚠️ 只认第一种的旧实现在真实客户端上恒为空数组 —— 界面上就表现为**每个人都是「无符文」**，
+/// 包括召唤师峡谷这种符文必定存在的对局（2026-09-26 直连 LCU 实测：50/50 局
+/// `perks` 字段缺失、`perk0…perk5` 有真值，例如 `8465/8463/8473/8453/8345/8347`）。
 fn writeRunes(writer: *std.Io.Writer, participant: std.json.Value) !void {
     try writer.writeByte('[');
     var first = true;
+    const Emitter = struct {
+        writer: *std.Io.Writer,
+        first: *bool,
+
+        fn emit(self: @This(), id: i64, style_id: i64) !void {
+            if (id <= 0) return;
+            if (!self.first.*) try self.writer.writeByte(',');
+            self.first.* = false;
+            try self.writer.print("{{\"id\":{d},\"name\":\"\",\"style\":\"{d}\",\"iconUrl\":\"\"}}", .{ id, style_id });
+        }
+    };
+    const emitter = Emitter{ .writer = writer, .first = &first };
     if (nestedObject(participant, "perks")) |perks| if (perks.object.get("styles")) |styles| if (styles == .array) {
         for (styles.array.items) |style| {
             if (style != .object) continue;
             const style_id = jsonInt(style, "style");
             const selections = style.object.get("selections") orelse continue;
             if (selections != .array) continue;
-            for (selections.array.items) |selection| {
-                const id = jsonInt(selection, "perk");
-                if (id <= 0) continue;
-                if (!first) try writer.writeByte(',');
-                first = false;
-                try writer.print("{{\"id\":{d},\"name\":\"\",\"style\":\"{d}\",\"iconUrl\":\"\"}}", .{ id, style_id });
-            }
+            for (selections.array.items) |selection| try emitter.emit(jsonInt(selection, "perk"), style_id);
         }
     };
+    // 只在上面一条都没取到时才走 LCU 形状，避免两种形状同时存在时写出 12 个符文。
+    if (first) {
+        const primary_style = statInt(participant, "perkPrimaryStyle");
+        const sub_style = statInt(participant, "perkSubStyle");
+        for (0..6) |index| {
+            var field_buffer: [16]u8 = undefined;
+            const field = try std.fmt.bufPrint(&field_buffer, "perk{d}", .{index});
+            // 0–3 是主系（含基石），4–5 是副系。样式只影响图标分组，不影响这是哪枚符文。
+            try emitter.emit(statInt(participant, field), if (index < 4) primary_style else sub_style);
+        }
+    }
     try writer.writeByte(']');
 }
 
@@ -4921,7 +4965,7 @@ fn matchHistoryDtoPageWithFilters(json: []const u8, catalog_json: []const u8, se
         const damage = if (first_participant != .null) statInt(first_participant, "totalDamageDealtToChampions") else 0;
         const taken = if (first_participant != .null) statInt(first_participant, "totalDamageTaken") else 0;
         const gold = if (first_participant != .null) statInt(first_participant, "goldEarned") else 0;
-        const cs = if (first_participant != .null) statInt(first_participant, "totalMinionsKilled") + statInt(first_participant, "neutralMinionsKilledToTeamJungle") else 0;
+        const cs = if (first_participant != .null) statInt(first_participant, "totalMinionsKilled") + statInt(first_participant, "neutralMinionsKilled") else 0;
         const champion_id = if (first_participant != .null) jsonInt(first_participant, "championId") else 0;
         const champion_name = if (first_participant != .null) catalogChampionName(catalog, champion_id, jsonField(first_participant, "championName")) else "未知英雄";
         const position = if (first_participant != .null) participantPosition(first_participant) else "";
@@ -4929,11 +4973,19 @@ fn matchHistoryDtoPageWithFilters(json: []const u8, catalog_json: []const u8, se
         const team_damage = teamStat(participants, self_team_id, "totalDamageDealtToChampions");
         const team_taken = teamStat(participants, self_team_id, "totalDamageTaken");
         const team_kills = teamStat(participants, self_team_id, "kills");
+        // ⚠️ **战绩列表接口每局只带查询者一条 participants**（2026-09-26 实测：本机缓存
+        // 里 50/50 局都是 1 条），此时 `teamStat` 加出来的「队伍击杀」就是自己一个人的
+        // 击杀数，而参团率的分子是 (击杀 + 助攻) —— 恒 ≥ 分母，被钳到 1.0，于是**每局
+        // 都显示 100% 参团**（只有 0 击杀的局显示 0%）。`teams[]` 里也没有击杀数可以补。
+        // 队伍人数不足 1 队人时这些队伍级指标一律写 `null`：界面显示「—」，
+        // 而不是给一个看起来煞有介事的假 100%。口径与 `teamShare` / `has_team` 一致。
+        const team_size = teamParticipantCount(participants, self_team_id);
+        const has_team = first_participant != .null and team_size > 1;
         const damage_share = ratio(damage, team_damage);
         const taken_share = ratio(taken, team_taken);
-        const kill_participation = killParticipationRatio(kills, assists, team_kills);
+        const kill_participation: ?f64 = if (has_team) killParticipationRatio(kills, assists, team_kills) else null;
         const performance = matchPerformance(win, kills, deaths, assists, damage_share);
-        const is_mvp = first_participant != .null and teamParticipantCount(participants, self_team_id) >= 2 and
+        const is_mvp = has_team and
             participantScore(first_participant, team_damage) >= bestTeamScore(participants, self_team_id, team_damage);
         try writer.print("{{\"gameId\":{d},\"championId\":{d},\"championName\":", .{ game_id, champion_id });
         try jsonString(&writer, champion_name);
@@ -4950,11 +5002,17 @@ fn matchHistoryDtoPageWithFilters(json: []const u8, catalog_json: []const u8, se
         try writeSummonerSpells(&writer, first_participant);
         try writer.writeAll(",\"runes\":");
         try writeRunes(&writer, first_participant);
-        try writer.print(",\"damageDealt\":{d},\"damageTaken\":{d},\"damageTakenShare\":{d:.4},\"heal\":{d},\"goldEarned\":{d},\"cs\":{d},\"towerDamage\":{d},\"turretKills\":{d},\"towerLeader\":{s},\"damageShare\":{d:.4},\"killParticipation\":{d:.4},\"performance\":", .{ damage, taken, taken_share, statInt(first_participant, "totalHeal"), gold, cs, statInt(first_participant, "damageDealtToTurrets"), statInt(first_participant, "turretKills"), if (towerLeader(participants, first_participant)) "true" else "false", damage_share, kill_participation });
+        try writer.print(",\"damageDealt\":{d},\"damageTaken\":{d},\"damageTakenShare\":{d:.4},\"heal\":{d},\"goldEarned\":{d},\"cs\":{d},\"towerDamage\":{d},\"turretKills\":{d},\"towerLeader\":{s},\"damageShare\":{d:.4},\"killParticipation\":", .{ damage, taken, taken_share, statInt(first_participant, "totalHeal"), gold, cs, statInt(first_participant, "damageDealtToTurrets"), statInt(first_participant, "turretKills"), if (towerLeader(participants, first_participant)) "true" else "false", damage_share });
+        try writeOptionalRatio(&writer, kill_participation);
+        try writer.writeAll(",\"performance\":");
         try jsonString(&writer, performance);
         try writer.writeAll(",\"mvp\":");
         if (is_mvp and duration > 0) try jsonString(&writer, if (win) "MVP" else "SVP") else try writer.writeAll("null");
-        try writer.print(",\"teamKills\":{d},\"participants\":", .{team_kills});
+        try writer.writeAll(",\"teamKills\":");
+        try writeOptionalInt(&writer, if (has_team) team_kills else null);
+        try writer.writeAll(",\"teamSize\":");
+        try writeOptionalInt(&writer, if (has_team) @as(i64, @intCast(team_size)) else null);
+        try writer.writeAll(",\"participants\":");
         try writer.writeByte('[');
         if (participants) |value| if (value == .array) {
             var participant_first = true;
@@ -6432,7 +6490,7 @@ fn writeRecentMatchesFiltered(writer: *std.Io.Writer, history_json: []const u8, 
             if (explicit_damage_share > 1) explicit_damage_share / 100.0 else explicit_damage_share
         else
             ratio(damage, team_damage);
-        const kill_participation = killParticipationRatio(kills, assists, team_kills);
+        const kill_participation: ?f64 = if (has_team) killParticipationRatio(kills, assists, team_kills) else null;
         const performance = matchPerformance(statBool(participant, "win"), kills, deaths, assists, damage_share);
         const is_mvp = teamParticipantCount(participants, team_id) >= 2 and
             participantScore(participant, team_damage) >= bestTeamScore(participants, team_id, team_damage);
@@ -6448,7 +6506,8 @@ fn writeRecentMatchesFiltered(writer: *std.Io.Writer, history_json: []const u8, 
         try writeSummonerSpells(writer, participant);
         try writer.writeAll(",\"runes\":");
         try writeRunes(writer, participant);
-        try writer.print(",\"damageDealt\":{d},\"damageTaken\":{d},\"heal\":{d},\"goldEarned\":{d},\"cs\":{d},\"damageShare\":{d:.4},\"killParticipation\":{d:.4}", .{ damage, taken, statInt(participant, "totalHeal"), gold, cs, damage_share, kill_participation });
+        try writer.print(",\"damageDealt\":{d},\"damageTaken\":{d},\"heal\":{d},\"goldEarned\":{d},\"cs\":{d},\"damageShare\":{d:.4},\"killParticipation\":", .{ damage, taken, statInt(participant, "totalHeal"), gold, cs, damage_share });
+        try writeOptionalRatio(writer, kill_participation);
         // 队伍占比与队伍总量：AK 的场均标签（承伤/经济/补刀/视野占比）与 Akari 评分
         // 都吃这几个数。缺十人明细时写 `null`，前端会把该局排除在样本外。
         try writer.writeAll(",\"damageTakenShare\":");
@@ -8239,6 +8298,92 @@ test "does not label a single-participant history row as MVP or SVP" {
     var output: [16 * 1024]u8 = undefined;
     const result = try matchHistoryDtoPage(input, "[]", "self", 0, 10, &output);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"mvp\":null") != null);
+}
+
+// 战绩列表接口每局只带查询者一条 participants，`teamStat` 加出来的「队伍击杀」就是
+// 自己的击杀数，参团率因此恒被钳到 100%。这条用例锁住：队伍人数不足时写 `null`。
+// 自己的击杀数，参团率因此恒被钳到 100%。这条用例锁住：队伍人数不足时写 `null`。
+test "team-relative metrics are null while the history payload only carries the queried player" {
+    const input = "{\"games\":[{\"gameId\":46,\"gameDuration\":1800,\"queueId\":420,\"participants\":[{\"puuid\":\"self\",\"teamId\":100,\"championId\":64,\"kills\":6,\"deaths\":4,\"assists\":9,\"totalDamageDealtToChampions\":21000,\"win\":true}]}]}";
+    var output: [16 * 1024]u8 = undefined;
+    const result = try matchHistoryDtoPage(input, "[]", "self", 0, 10, &output);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"killParticipation\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"teamKills\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"teamSize\":null") != null);
+}
+
+test "computes kill participation against real team kills once the squad is present" {
+    const input = "{\"games\":[{\"gameId\":47,\"gameDuration\":1800,\"queueId\":420,\"participants\":[" ++
+        "{\"puuid\":\"self\",\"teamId\":100,\"championId\":64,\"kills\":6,\"deaths\":4,\"assists\":9,\"totalDamageDealtToChampions\":21000,\"win\":true}," ++
+        "{\"puuid\":\"mate\",\"teamId\":100,\"championId\":103,\"kills\":5,\"deaths\":6,\"assists\":7,\"totalDamageDealtToChampions\":19000,\"win\":true}," ++
+        "{\"puuid\":\"foe\",\"teamId\":200,\"championId\":86,\"kills\":3,\"deaths\":8,\"assists\":2,\"totalDamageDealtToChampions\":11000,\"win\":false}]}]}";
+    var output: [16 * 1024]u8 = undefined;
+    const result = try matchHistoryDtoPage(input, "[]", "self", 0, 10, &output);
+    // (6 + 9) / (6 + 5) = 1.3636… → 钳到 1.0
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"killParticipation\":1.0000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"teamKills\":11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"teamSize\":2") != null);
+}
+
+// 真实客户端（LCU）的 participant **没有 `perks` 对象**，符文在 `stats.perk0…perk5`
+// （样式在 `perkPrimaryStyle` / `perkSubStyle`）。只认 match-v5 形状会让界面上
+// 十个人全是「无符文」。这条用例用一台真实机器的取值锁住两条分支。
+// （样式在 `perkPrimaryStyle` / `perkSubStyle`）。只认 match-v5 形状会让界面上
+// 十个人全是「无符文」。这条用例用一台真实机器的取值锁住两条分支。
+// 十个人全是「无符文」。这条用例用一台真实机器的取值锁住两条分支。
+test "reads runes from LCU stat perks when the participant has no perks object" {
+    const participant = "{\"championId\":103,\"stats\":{\"perk0\":8465,\"perk1\":8463,\"perk2\":8473,\"perk3\":8453,\"perk4\":8345,\"perk5\":8347,\"perkPrimaryStyle\":8400,\"perkSubStyle\":8300}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, participant, .{});
+    defer parsed.deinit();
+    var output: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    try writeRunes(&writer, parsed.value);
+    const result = writer.buffered();
+    try std.testing.expectEqualStrings(
+        "[{\"id\":8465,\"name\":\"\",\"style\":\"8400\",\"iconUrl\":\"\"},{\"id\":8463,\"name\":\"\",\"style\":\"8400\",\"iconUrl\":\"\"},{\"id\":8473,\"name\":\"\",\"style\":\"8400\",\"iconUrl\":\"\"},{\"id\":8453,\"name\":\"\",\"style\":\"8400\",\"iconUrl\":\"\"},{\"id\":8345,\"name\":\"\",\"style\":\"8300\",\"iconUrl\":\"\"},{\"id\":8347,\"name\":\"\",\"style\":\"8300\",\"iconUrl\":\"\"}]",
+        result,
+    );
+}
+
+test "still reads SGP match-v5 perk styles first" {
+    const participant = "{\"perks\":{\"styles\":[{\"style\":8200,\"selections\":[{\"perk\":8229},{\"perk\":8226}]},{\"style\":8100,\"selections\":[{\"perk\":8304}]}]},\"stats\":{\"perk0\":8465,\"perkPrimaryStyle\":8400}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, participant, .{});
+    defer parsed.deinit();
+    var output: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    try writeRunes(&writer, parsed.value);
+    const result = writer.buffered();
+    try std.testing.expectEqualStrings(
+        "[{\"id\":8229,\"name\":\"\",\"style\":\"8200\",\"iconUrl\":\"\"},{\"id\":8226,\"name\":\"\",\"style\":\"8200\",\"iconUrl\":\"\"},{\"id\":8304,\"name\":\"\",\"style\":\"8100\",\"iconUrl\":\"\"}]",
+        result,
+    );
+}
+
+test "emits no runes when neither shape is present" {
+    const participant = "{\"championId\":103,\"stats\":{\"perk0\":0,\"perkPrimaryStyle\":0}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, participant, .{});
+    defer parsed.deinit();
+    var output: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    try writeRunes(&writer, parsed.value);
+    try std.testing.expectEqualStrings("[]", writer.buffered());
+}
+
+// 空装备格不能靠数组下标猜：卖掉一件鞋之后，后面的装备必须留在自己原来的格子里，
+// 最后一格（6）才是饰品。前端要按 `slot` 画固定的 6+1 个格子。
+// 最后一格（6）才是饰品。前端要按 `slot` 画固定的 6+1 个格子。
+test "items carry their client slot index" {
+    const participant = "{\"stats\":{\"item0\":3089,\"item1\":0,\"item2\":3020,\"item6\":3340}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, participant, .{});
+    defer parsed.deinit();
+    var output: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    try writeItems(&writer, parsed.value);
+    const result = writer.buffered();
+    try std.testing.expectEqualStrings(
+        "[{\"id\":3089,\"slot\":0,\"name\":\"\",\"iconUrl\":\"\"},{\"id\":3020,\"slot\":2,\"name\":\"\",\"iconUrl\":\"\"},{\"id\":3340,\"slot\":6,\"name\":\"\",\"iconUrl\":\"\"}]",
+        result,
+    );
 }
 
 test "maps Tencent platform ids to SGP hosts" {

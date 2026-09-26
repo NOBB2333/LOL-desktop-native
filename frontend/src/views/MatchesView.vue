@@ -11,7 +11,7 @@ import PageHeader from "../components/PageHeader.vue";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { MatchSummary, RankQueueSummary, SummonerSearchCandidate, SummonerSearchResult } from "../types/domain";
-import { championImage, rankName, roleName, shortDate } from "../utils/format";
+import { championImage, percentOrDash, rankName, roleName, shortDate } from "../utils/format";
 import { localPlayerRiotId, searchLocalPlayers } from "../matches/localPlayers";
 import { matchHistoryQueryKey } from "../matches/query";
 import { useMatchDetail } from "../composables/useMatchDetail";
@@ -322,7 +322,7 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
             <button v-for="match in filtered" :key="match.gameId" class="history-index-row" :class="[`history-index-row--${resultClass(match)}`, { active: selectedMatch?.gameId === match.gameId } ]" type="button" @click="selectMatch(match)">
               <div class="history-index-row__top"><span>{{ shortDate(match.playedAt) }}</span><strong>{{ resultLabel(match) }}</strong></div>
               <div class="history-index-row__main"><AssetIcon kind="champion" :id="match.championId" :name="match.championName" :fallback-url="championImage(match.championId)" size="md" /><span><b>{{ match.championName }}</b><small>{{ match.queueName }} · {{ roleName(match.position) }}</small></span><em>{{ kda(match) }}</em><ChevronRight :size="14" /></div>
-              <div class="history-index-row__foot"><span>{{ match.durationMinutes ? `${match.durationMinutes} 分钟` : "训练 / 未完成" }}</span><span v-if="mvpLabel(match)" class="history-index-row__mvp" :data-mvp="mvpLabel(match)" title="本地评分模型生成，并非 Riot 官方字段"><Trophy :size="12" />{{ mvpLabel(match) }}</span><span>{{ Math.round(match.killParticipation * 100) }}% 参团</span></div>
+              <div class="history-index-row__foot"><span>{{ match.durationMinutes ? `${match.durationMinutes} 分钟` : "训练 / 未完成" }}</span><span v-if="mvpLabel(match)" class="history-index-row__mvp" :data-mvp="mvpLabel(match)" title="本地评分模型生成，并非 Riot 官方字段"><Trophy :size="12" />{{ mvpLabel(match) }}</span><span>{{ percentOrDash(match.killParticipation) }} 参团</span></div>
             </button>
             <div v-if="!filtered.length" class="empty-state">没有匹配的对局</div>
           </div>

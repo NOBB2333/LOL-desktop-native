@@ -40,6 +40,54 @@
 - 另外：`timeline.role` 的 `SUPPORT`（不带 `DUO_` 前缀）也要判成 `UTILITY`，旧口径只认
   `DUO_SUPPORT` 会把辅助错报成下路。
 
+## 十人明细（`MatchDetailCard` 展开区）与队伍级指标（勿推翻）
+
+- **列表接口每局只带查询者一条 `participants`**（09-26 直接从本机缓存的原始 LCU 响应复核：
+  50/50 局都是 1 条；`useMatchDetail` 的注释里记的是 32/32）。因此：
+  - `teamStat(participants, team, "kills")` 加出来的「队伍击杀」= **自己的击杀数**，
+    而参团率分子是 `kills + assists` → 恒 ≥ 分母 → 被 `@min(..., 1.0)` 钳成 **100%**。
+    表现就是**列表里几乎每局都写「100% 参团」**（只有 0 击杀的局显示 0%），
+    场均值也跟着假高。`teams[]` 里**没有击杀数**可以补（只有 `towerKills/dragonKills/…`），
+    所以拿不到整队数据时**只能写 `null`**。
+  - 后端：`matchHistoryDtoPageWithFilters` 与 `writeRecentMatchesFiltered` 都用
+    `has_team = 队伍人数 > 1` 同时闸住 `killParticipation` / `teamKills` / `teamSize`
+    （`writeOptionalRatio` / `writeOptionalInt`）。`MatchSummary.teamKills`、
+    `RecentMatch.killParticipation` 等类型是 `number | null`。
+  - 前端展示一律走 `percentOrDash`（`utils/format.ts`）→ 显示「—」。
+    **不要**再写 `?? 0` 或直接 `Math.round(x * 100)`：那会把「不知道」画成一个数字。
+    `tags/facts.ts` 的 `singleAkariInput` 也把 `killParticipation === null` 当成
+    「这局队伍数据不足」整局排除。
+- **符文有两个完全不同的形状，必须都认**（只认一种就会出现「每个人都是无符文」）：
+  - SGP / match-v5（`DETAILS`、`SUMMARY`）：`perks.styles[].selections[].perk`，
+    每个 selection 自带 `style`。
+  - LCU（`/lol-match-history/v1/games/{id}` 与列表接口）：**没有 `perks` 对象**，
+    符文在 `stats.perk0…perk5`（0 基石，1–3 主系，4–5 副系），样式在
+    `stats.perkPrimaryStyle` / `perkSubStyle`。09-26 实测真值：
+    `8465/8463/8473/8453/8345/8347` + `8400/8300`。见 `writeRunes`。
+- **装备**在 `stats.item0…item6`：**0–5 是装备、6 是饰品/视野位**。`writeItems`
+  额外写 `slot`（格子号）——不带格子号时前端只能按下标顺位渲染，中间空一格
+  （卖掉一件装备）会让后面的装备整体前移，最后一格就认不出是饰品。前端按 `slot` 取；
+  老缓存没有 `slot` 时退回按下标顺位（`itemsWithSlots`）。
+  - 展开区（十人明细）排 **7 格**（6 装备 + 饰品）；**外面的对局行排 8 格**
+    （多一格「任务」，极地大乱斗才有）。两者不要互相「统一」。
+- **`cs` 的野怪字段是 `neutralMinionsKilled`**（= 自家 + 敌方野怪）。早先写的
+  `neutralMinionsKilledToTeamJungle` 在客户端响应里**根本不存在**（真实的键是
+  `neutralMinionsKilledTeamJungle`），`statInt` 恒返回 0 → 所有打野的补刀都少了全部野怪。
+- 展开区的行内列序固定为 **头像 → 召唤师技能 → 名字 → K/D/A → 伤害 → 经济 → 装备(7) →
+  符文 → 视野**（`grid-template-areas: "champion spells identity kda damage economy items runes vision"`）。
+  召唤师技能**必须贴在头像右边**（跟外面的对局行同一套读法）：09-26 之前它排在装备
+  后面，装备列（`minmax(94px, 1.15fr)`）比 6 个 26px 图标窄，`overflow:hidden` 把
+  后面的图标裁掉、视觉上就像「右边的两个技能格把装备挡住了」。现在装备列
+  `minmax(152px, …)` 且 `overflow: visible`，7 格 × 20px + 6 个 2px 间距正好 152px。
+  一行需要 ~534px，所以 `≤1050px` 时 `.match-row__participants` 直接改成单列
+  （两栏并排必然挤压）。
+- 展开 10 人是**按 `gameId` 单独拉**的（`useMatchDetail` → `get_match_detail` →
+  LCU `/lol-match-history/v1/games/{gameId}`，只有这条才有十个人；缓存里的列表数据
+  因为 `participants.length < 2` 会被 `singleMatchDto` 主动拒绝）。数据没到时
+  展开区显示「正在读取这局的十人数据…」，**不要**用列表那一条假装成十人。
+  09-26 真浏览器实测：展开后 `.participant-line` = 10 条、`.participant-team` = 2 组、
+  兄弟元素之间 `overlap = []`。
+
 ## 页面结构
 
 左导航：`首页/战绩/英雄/自动化/历史/好友/客户端/对局`。「工具箱」页已删，别捡回来。

@@ -37,6 +37,77 @@ describe("MatchDetailCard", () => {
     expect(wrapper.findAll(".participant-team")).toHaveLength(2);
   });
 
+  /**
+   * 两个召唤师技能必须贴在**头像右边**（跟外面的对局行同一套读法），不能排到
+   * 装备后面去占格子：以前它们排在装备右面，列宽一挤就把装备整片裁掉，
+   * 看起来像「技能格把装备挡住了」。
+   */
+  it("keeps the summoner spells next to the champion avatar, not after the items", () => {
+    const wrapper = mount(MatchDetailCard, {
+      props: { match: structuredClone(fixtureMatches[0]), expanded: true },
+      global: { stubs: { AssetIcon: true } },
+    });
+
+    const children = Array.from(wrapper.get(".participant-line").element.children)
+      .map((node) => node.getAttribute("class") ?? "");
+    expect(children[0]).toContain("participant-line__champion");
+    expect(children[1]).toContain("participant-line__spells");
+    expect(children[2]).toContain("participant-line__identity");
+    // 装备与符文继续排在名字/数据右边，不再被技能夹在中间。
+    expect(children.findIndex((name) => name.includes("participant-line__items")))
+      .toBeGreaterThan(children.findIndex((name) => name.includes("participant-line__identity")));
+  });
+
+  /** 十人明细的装备栏固定 7 格：6 件装备 + 最后一格饰品/视野位。 */
+  it("draws seven item slots with the trinket last", () => {
+    const wrapper = mount(MatchDetailCard, {
+      props: { match: structuredClone(fixtureMatches[0]), expanded: true },
+      global: { stubs: { AssetIcon: true } },
+    });
+
+    const items = wrapper.get(".participant-line .participant-line__items").element;
+    expect(items.children).toHaveLength(7);
+    expect(items.children[6].getAttribute("class")).toContain("participant-line__item-slot--trinket");
+  });
+
+  /**
+   * 装备必须待在**客户端给的格子号**上：中间卖掉一件装备后，后面的装备不能整体前移,
+   * 否则最后一格就看不出是饰品了。这条用例只给 0 / 5 / 6 三格，验中间是空格。
+   */
+  it("keeps items on their client slot instead of shifting them left", () => {
+    const match = structuredClone(fixtureMatches[0]);
+    match.participants[0].items = [
+      { id: 6655, name: "卢登的伙伴", iconUrl: "", slot: 0 },
+      { id: 3089, name: "灭世者的死亡之帽", iconUrl: "", slot: 5 },
+      { id: 3340, name: "警觉眼石", iconUrl: "", slot: 6 },
+    ];
+    const wrapper = mount(MatchDetailCard, {
+      props: { match, expanded: true },
+      global: { stubs: { AssetIcon: true } },
+    });
+
+    const slots = Array.from(wrapper.get(".participant-line .participant-line__items").element.children);
+    expect(slots).toHaveLength(7);
+    // 只给了 0 / 5 / 6 三格 → 中间 4 个是空格（占位符），最后两格是装备。
+    expect(slots.filter((node) => (node.getAttribute("class") ?? "").includes("participant-line__item-slot"))).toHaveLength(4);
+    expect(slots[5].getAttribute("class") ?? "").not.toContain("participant-line__item-slot");
+    expect(slots[6].getAttribute("class") ?? "").not.toContain("participant-line__item-slot");
+  });
+
+  /**
+   * 战绩列表接口每局只带查询者一条 participants，参团率的分母（队伍击杀）等于自己
+   * 的击杀数，算出来恒定 100%。后端现在写 `null`，界面必须显示「—」而不是编一个数。
+   */
+  it("shows a dash instead of a fake 100% participation when the squad is unknown", () => {
+    const row = { ...structuredClone(fixtureLobby.ally[0].recentMatches[0]), killParticipation: null };
+    const wrapper = mount(MatchDetailCard, {
+      props: { match: row },
+      global: { stubs: { AssetIcon: true } },
+    });
+
+    expect(wrapper.get(".match-row__kda small").text()).toBe("— 参团");
+  });
+
   it("keeps the row expanded when the detail area itself is clicked", async () => {
     const wrapper = mount(MatchDetailCard, {
       props: { match: structuredClone(fixtureMatches[0]), expanded: true },

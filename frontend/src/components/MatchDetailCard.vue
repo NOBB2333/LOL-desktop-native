@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { ChevronDown, ChevronUp, Coins, Crosshair, HeartPulse, Shield, Swords, TowerControl, Trophy } from "@lucide/vue";
-import type { MatchSummary, RecentMatch } from "../types/domain";
+import type { ItemSummary, MatchSummary, RecentMatch } from "../types/domain";
 import AssetIcon from "./AssetIcon.vue";
-import { championImage, roleName, shortDate } from "../utils/format";
+import { championImage, percentOrDash, roleName, shortDate } from "../utils/format";
 
 const props = withDefaults(defineProps<{
   match: MatchSummary | RecentMatch;
@@ -70,8 +70,28 @@ const towerLeader = (match: MatchSummary | RecentMatch) => isSummary(match) && m
 const number = (value: number) => new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 const fallbackChampion = (match: MatchSummary | RecentMatch) => championImage(match.championId);
 const itemSlots = Array.from({ length: 8 }, (_, index) => index);
-const itemAt = (match: MatchSummary | RecentMatch, index: number) => match.items[index] ?? null;
-const participantItems = (participant: MatchSummary["participants"][number]) => participant.items ?? [];
+/**
+ * 十人明细里的装备格子：**6 件装备 + 1 个饰品/视野位**（序号 6）。
+ *
+ * 与外面的对局行不同：外面那行排 8 格（多一个「任务」格，极地大乱斗才有）。
+ * 这个组件是召唤师峡谷/排位的主视图，最后一格就是饰品，所以排 7 格。
+ */
+const detailItemSlots = Array.from({ length: 7 }, (_, index) => index);
+/**
+ * 按**格子序号**取装备。
+ *
+ * `writeItems` 只输出非空格子，所以数组下标不等于格子号：中间卖掉一件装备时，
+ * 按下标渲染会让后面的装备整体前移，「最后一格是饰品」也就看不出来了。
+ * 旧缓存里的 DTO 没有 `slot`，那时退回按下标顺位，保证不会整块变空。
+ */
+function itemsWithSlots(items: ItemSummary[] | undefined): ItemSummary[] {
+  if (!items?.length) return [];
+  return items.some((item) => typeof item.slot === "number") ? items : items.map((item, index) => ({ ...item, slot: index }));
+}
+const itemAt = (match: MatchSummary | RecentMatch, index: number) =>
+  itemsWithSlots(match.items).find((item) => item.slot === index) ?? null;
+const participantItemAt = (participant: MatchSummary["participants"][number], index: number) =>
+  itemsWithSlots(participant.items).find((item) => item.slot === index) ?? null;
 /** 仍然是列表级数据（只有查询者本人），十人详情还没到位。 */
 const incompleteParticipants = computed(() => !isSummary(props.match) || props.match.participants.length < 2);
 const participantSpells = (participant: MatchSummary["participants"][number]) => participant.summonerSpells ?? [];
@@ -139,7 +159,9 @@ function toggleFromRow(event: MouseEvent) {
     <div class="match-row__kda">
       <strong><b>{{ match.kills }}</b><i>/</i><em>{{ match.deaths }}</em><i>/</i><b>{{ match.assists }}</b></strong>
       <span>{{ ((match.kills + match.assists) / Math.max(1, match.deaths)).toFixed(2) }} KDA</span>
-      <small>{{ Math.round(match.killParticipation * 100) }}% 参团</small>
+      <!-- 「—」= 这一局的整队数据没拿到（战绩列表接口每局只带查询者一条 participants），
+           不是 0%，更不能拿自己的击杀当队伍击杀算出个假的 100%。 -->
+      <small>{{ percentOrDash(match.killParticipation) }} 参团</small>
     </div>
 
     <div class="match-row__traits">
@@ -229,13 +251,23 @@ function toggleFromRow(event: MouseEvent) {
             <div class="participant-team__rows">
               <div v-for="participant in group.rows" :key="participant.puuid || `${participant.championId}-${participant.gameName}`" class="participant-line" :data-side="participant.side">
                 <AssetIcon class="participant-line__champion" kind="champion" :id="participant.championId" :name="participant.championName" :fallback-url="championImage(participant.championId)" size="sm" />
+                <!-- 召唤师技能跟外面的对局行一样贴在头像右边，而不是占掉右侧的装备格：
+                     以前它排在装备后面，宽一点就把装备整片挤掉，看着像「技能把装备挡住了」。 -->
+                <span class="participant-line__spells" aria-label="召唤师技能">
+                  <AssetIcon v-for="spell in participantSpells(participant)" :key="`spell-${participant.puuid}-${spell.id}`" kind="spell" :id="spell.id" :name="spell.name" :fallback-url="spell.iconUrl" size="xs" />
+                </span>
                 <span class="participant-line__identity"><strong>{{ participant.gameName }}<em v-if="participant.isBot">人机</em></strong><small>{{ participant.championName }} · {{ roleName(participant.position) }}</small></span>
                 <b class="participant-line__kda">{{ participant.kills }}/{{ participant.deaths }}/{{ participant.assists }}</b>
                 <span class="participant-line__metric participant-line__damage"><strong>{{ number(participant.damageDealt) }}</strong><small>英雄伤害</small></span>
                 <span class="participant-line__metric participant-line__economy"><strong>{{ number(participant.goldEarned) }}</strong><small>{{ participant.cs }} 补刀</small></span>
-                <span class="participant-line__icons participant-line__items"><AssetIcon v-for="item in participantItems(participant)" :key="`item-${participant.puuid}-${item.id}`" kind="item" :id="item.id" :name="item.name" :fallback-url="item.iconUrl" size="sm" /><i v-if="!participantItems(participant).length">无装备数据</i></span>
-                <span class="participant-line__icons participant-line__spells"><AssetIcon v-for="spell in participantSpells(participant)" :key="`spell-${participant.puuid}-${spell.id}`" kind="spell" :id="spell.id" :name="spell.name" :fallback-url="spell.iconUrl" size="sm" /><i v-if="!participantSpells(participant).length">无技能</i></span>
-                <span class="participant-line__icons participant-line__runes"><AssetIcon v-for="rune in participantRunes(participant)" :key="`rune-${participant.puuid}-${rune.id}`" kind="perk" :id="rune.id" :name="rune.name" :fallback-url="rune.iconUrl" size="sm" /><i v-if="!participantRunes(participant).length">无符文</i></span>
+                <!-- 固定 6+1 格：0–5 是装备，第 7 格（序号 6）是饰品/视野位。 -->
+                <span class="participant-line__icons participant-line__items" aria-label="装备">
+                  <template v-for="index in detailItemSlots" :key="`item-${participant.puuid}-${index}`">
+                    <AssetIcon v-if="participantItemAt(participant, index)" kind="item" :id="participantItemAt(participant, index)!.id" :name="participantItemAt(participant, index)!.name" :fallback-url="participantItemAt(participant, index)!.iconUrl" size="xs" />
+                    <span v-else class="participant-line__item-slot" :class="{ 'participant-line__item-slot--trinket': index === 6 }" :title="index === 6 ? '饰品 / 视野位' : '空装备位'">{{ index === 6 ? "饰" : "" }}</span>
+                  </template>
+                </span>
+                <span class="participant-line__icons participant-line__runes" aria-label="符文"><AssetIcon v-for="rune in participantRunes(participant)" :key="`rune-${participant.puuid}-${rune.id}`" kind="perk" :id="rune.id" :name="rune.name" :fallback-url="rune.iconUrl" size="xs" /><i v-if="!participantRunes(participant).length">无符文</i></span>
                 <span class="participant-line__metric participant-line__vision"><strong>{{ participant.wardsPlaced ?? 0 }}/{{ participant.wardsKilled ?? 0 }}</strong><small>视野 {{ participant.visionScore ?? 0 }}</small></span>
               </div>
             </div>
@@ -639,9 +671,11 @@ function toggleFromRow(event: MouseEvent) {
 .participant-team > header strong { color: var(--text-primary); font-size: 9px; }.participant-team__rows { display: grid; gap: 2px; padding: 3px; }
 .participant-line {
   display: grid;
-  grid-template-columns: 28px minmax(80px, 1fr) 48px 55px 54px minmax(94px, 1.15fr) minmax(38px, .5fr) minmax(58px, .65fr) 45px;
+  /* 列序：头像 → 召唤师技能 → 名字 → K/D/A → 伤害 → 经济 → 装备(7 格) → 符文 → 视野。
+     技能紧贴头像（跟外面的对局行同一套读法），装备独占一格并按格子号排 7 个位置。 */
+  grid-template-columns: 28px 20px minmax(70px, 1fr) 46px 52px 52px minmax(152px, 1.35fr) minmax(40px, .5fr) 42px;
   grid-template-areas:
-    "champion identity kda damage economy items spells runes vision";
+    "champion spells identity kda damage economy items runes vision";
   align-items: center;
   gap: 4px;
   min-width: 0;
@@ -660,6 +694,8 @@ function toggleFromRow(event: MouseEvent) {
 }
 
 .participant-line__champion { grid-area: champion; }.participant-line__identity { grid-area: identity; }.participant-line__kda { grid-area: kda; }.participant-line__damage { grid-area: damage; }.participant-line__economy { grid-area: economy; }.participant-line__items { grid-area: items; }.participant-line__spells { grid-area: spells; }.participant-line__runes { grid-area: runes; }.participant-line__vision { grid-area: vision; }
+/* 两个召唤师技能竖着叠在头像右侧，正好和头像等高。 */
+.participant-line__spells { display: grid; align-content: center; gap: 2px; }
 
 .participant-line strong,
 .participant-line span,
@@ -682,6 +718,12 @@ function toggleFromRow(event: MouseEvent) {
 .participant-line__identity em { margin-left: 4px; color: var(--blue); font-size: 7px; font-style: normal; }
 .participant-line__icons { display: flex; align-items: center; gap: 2px; min-width: 0; overflow: hidden; }
 .participant-line__icons i { color: var(--text-muted); font-size: 7px; font-style: normal; }
+/* 装备整格按固定 7 个位置排队（20px × 7 + 间距 = 152px，与列宽一致）。
+   这里**不能**用 overflow:hidden 裁切：以前装备列比内容窄，最后一格连图标带
+   后一排的召唤师技能一起被裁掉，看起来就像「右边的技能格把装备挡住了」。 */
+.participant-line__items { display: grid; grid-auto-flow: column; grid-auto-columns: 20px; justify-content: start; gap: 2px; overflow: visible; }
+.participant-line__item-slot { display: inline-grid; place-items: center; width: 20px; height: 20px; border: 1px dashed var(--line-strong); border-radius: 5px; color: var(--text-muted); background: var(--surface-raised); font-size: 8px; line-height: 1; }
+.participant-line__item-slot--trinket { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 45%, var(--line)); background: var(--amber-soft); }
 
 @media (max-width: 1050px) {
   .match-row {
@@ -693,6 +735,12 @@ function toggleFromRow(event: MouseEvent) {
 
   .match-row__metrics {
     grid-template-columns: repeat(3, minmax(80px, 1fr));
+  }
+
+  /* 十人明细一行要 ~534px 才放得下 7 个装备格；两栏并排在这个宽度以下必然挤压
+     （表现就是格子被裁）。窄屏直接改成上下两队。 */
+  .match-row__participants {
+    grid-template-columns: 1fr;
   }
 }
 

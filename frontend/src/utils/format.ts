@@ -85,6 +85,15 @@ export const platformRegionGuide = (value?: string | null) => {
   return lines.slice(0, -1).join("\n");
 };
 export const percent = (value: number) => `${Math.round(value * 100)}%`;
+/**
+ * 参团率（以及其它「队伍级占比」）的展示。
+ *
+ * 后端在**拿不到整队数据**时写 `null` 而不是 0 或 100 —— 战绩列表接口每局只带
+ * 查询者一条 participants，用它的「队伍击杀」算参团率会恒定 100%（分子是击杀+助攻，
+ * 分母只有自己的击杀）。那种情况下这里必须显示「—」，不能把「不知道」画成一个数字。
+ */
+export const percentOrDash = (value: number | null | undefined) =>
+  typeof value === "number" && Number.isFinite(value) ? percent(value) : "—";
 export const meterClass = (value: number) => `meter-${Math.min(100, Math.max(0, Math.round(value / 5) * 5))}`;
 // Native production pages are served from zero://app. Keep fallback assets
 // relative so a leading slash cannot escape the bundled frontend directory.

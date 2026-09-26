@@ -84,7 +84,17 @@ const losses = computed(() => completedRows.value.length - wins.value);
 const winRate = computed(() => completedRows.value.length ? Math.round(wins.value / completedRows.value.length * 100) : 0);
 const averageKda = computed(() => completedRows.value.length ? (completedRows.value.reduce((sum, match) => sum + (match.kills + match.assists) / Math.max(1, match.deaths), 0) / completedRows.value.length).toFixed(2) : "--");
 const averageDamage = computed(() => completedRows.value.length ? `${(completedRows.value.reduce((sum, match) => sum + match.damageDealt, 0) / completedRows.value.length / 1000).toFixed(1)}k` : "--");
-const averageParticipation = computed(() => completedRows.value.length ? percent(completedRows.value.reduce((sum, match) => sum + match.killParticipation, 0) / completedRows.value.length) : "--");
+/**
+ * 参团率均值只统计**真的拿到整队数据**的那些局。
+ *
+ * `killParticipation === null` 表示「这一局没有整队明细」（战绩列表接口每局只带
+ * 查询者一条 `participants`），不是 0%，也不是 100% —— 把它当 0 混进分母会凭空
+ * 把均值拉低，和以前那个恒定 100% 的毛病一样都是假数据。
+ */
+const participationSample = computed(() => completedRows.value
+  .map((match) => match.killParticipation)
+  .filter((value): value is number => typeof value === "number" && Number.isFinite(value)));
+const averageParticipation = computed(() => participationSample.value.length ? percent(participationSample.value.reduce((sum, value) => sum + value, 0) / participationSample.value.length) : "--");
 const streak = computed(() => {
   const first = completedRows.value[0]?.result;
   if (!first) return "--";

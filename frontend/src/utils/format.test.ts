@@ -1,10 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { championImage, platformRegionGuide, platformRegionName, platformRegionOverview, rankName, relativeTime, roleName, shortDate } from "./format";
+import { championImage, percentOrDash, platformRegionGuide, platformRegionName, platformRegionOverview, rankName, relativeTime, roleName, shortDate } from "./format";
 
 describe("display formatting", () => {
   it("localizes ranks and positions", () => {
     expect(rankName("DIAMOND")).toBe("钻石");
     expect(roleName("JUNGLE")).toBe("打野");
+  });
+
+  /**
+   * 参团率这类「队伍级占比」拿不到整队数据时后端写 `null`。显示必须是「—」：
+   * 写成 0% 或 100% 都会让人以为那是真实数据。
+   */
+  it("renders a missing team ratio as a dash instead of a number", () => {
+    expect(percentOrDash(0.62)).toBe("62%");
+    expect(percentOrDash(0)).toBe("0%");
+    expect(percentOrDash(null)).toBe("—");
+    expect(percentOrDash(undefined)).toBe("—");
+    expect(percentOrDash(Number.NaN)).toBe("—");
   });
 
   it("resolves bundled champion assets", () => {

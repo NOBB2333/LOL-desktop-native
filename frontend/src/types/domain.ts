@@ -76,7 +76,12 @@ export interface RecentMatch {
   goldEarned: number;
   cs: number;
   damageShare: number;
-  killParticipation: number;
+  /**
+   * 参团率。战绩列表接口每局只带查询者一条 `participants`，用它的「队伍击杀」
+   * 当分母算出来恒为 100%（分子是击杀 + 助攻）——所以后端在**拿不到整队数据**时
+   * 写 `null`，展示必须走 `percentOrDash`，不要 `?? 0` 也不要直接乘 100。
+   */
+  killParticipation: number | null;
   /**
    * 队伍占比类字段。只有拿到十人明细（SGP 富化后的战绩）时才由后端输出——
    * 战绩列表接口本身每局只带查询者一条 participants。缺字段时标签侧会把这些
@@ -118,6 +123,14 @@ export interface ItemSummary {
   id: number;
   name: string;
   iconUrl: string;
+  /**
+   * 客户端里的格子序号（0–5 装备、6 饰品/视野位），由后端 `writeItems` 输出。
+   *
+   * 有它才能画固定的 6+1 个格子：中间空一格（卖掉一件装备）时，后面的装备要留在
+   * 自己原来的格子里，不能整体前移。老缓存里的 DTO 没有这个字段，前端此时退回
+   * 「按数组下标顺位」渲染。
+   */
+  slot?: number;
 }
 
 export interface SpellSummary {
@@ -173,7 +186,7 @@ export interface MatchParticipant {
   heal?: number;
   damageShare?: number;
   damageTakenShare?: number;
-  killParticipation?: number;
+  killParticipation?: number | null;
   towerDamage?: number;
   turretKills?: number;
   wardsPlaced?: number;
@@ -451,10 +464,12 @@ export interface MatchSummary {
   turretKills: number;
   towerLeader: boolean;
   damageShare: number;
-  killParticipation: number;
+  /** 参团率；拿不到整队数据时为 `null`（见 `RecentMatch.killParticipation`）。 */
+  killParticipation: number | null;
   performance: "carry" | "solid" | "carried" | "struggling";
   mvp: "MVP" | "SVP" | null;
-  teamKills: number;
+  /** 己方队伍总击杀；拿不到整队数据时为 `null`，不要当成 0。 */
+  teamKills: number | null;
   participants: MatchParticipant[];
   bans: string[];
   banDetails?: BanSummary[];

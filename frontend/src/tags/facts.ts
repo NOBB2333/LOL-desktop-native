@@ -131,7 +131,10 @@ export function isJungler(player: Pick<PlayerProfile, "assignedPosition" | "summ
  *
  * AK 的这些比例来自 `computeSingleSummary`（十人明细）。此项目只有在明细字段
  * 存在时才凑得出同一套数字，所以返回 null 表示「这一局队伍数据不足」——
- * 该局会被排除在这 7 项之外，而不是按 0 混进均值把结果拉低。
+ * 该局会被排除在这些项之外，而不是按 0 混进均值把结果拉低。
+ *
+ * `killParticipation` 也是一样：后端在拿不到整队数据时写 `null`（战绩列表接口
+ * 每局只带查询者一条 participants，自己的击杀当队伍击杀会算出恒正的假 100%）。
  */
 function singleAkariInput(match: RecentMatch): SingleAkariInput | null {
   const teamSize = numberOrNull(match.teamSize);
@@ -139,13 +142,15 @@ function singleAkariInput(match: RecentMatch): SingleAkariInput | null {
   const damageTakenShare = numberOrNull(match.damageTakenShare);
   const goldShare = numberOrNull(match.goldShare);
   const visionScoreShare = numberOrNull(match.visionScoreShare);
+  const killParticipation = numberOrNull(match.killParticipation);
   if (
     teamSize === null ||
     teamSize <= 1 ||
     teamDamageTaken === null ||
     damageTakenShare === null ||
     goldShare === null ||
-    visionScoreShare === null
+    visionScoreShare === null ||
+    killParticipation === null
   ) {
     return null;
   }
@@ -160,7 +165,7 @@ function singleAkariInput(match: RecentMatch): SingleAkariInput | null {
     healingRatioToTeamAverageDamageTaken: match.heal / Math.max(1, teamDamageTaken / teamSize),
     csPerMinute: match.cs / Math.max(1, match.durationMinutes),
     goldRatioToExpectedContribution: scale(goldShare),
-    killParticipation: match.killParticipation,
+    killParticipation,
     visionScoreRatioToExpectedContribution: scale(visionScoreShare),
   };
 }
