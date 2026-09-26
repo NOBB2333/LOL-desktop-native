@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watchEffect } from "vue";
+import { cachedAsset, peekAsset } from "../assets/assetCache";
 import { backend, isTauri } from "../services/backend";
 
 const props = withDefaults(defineProps<{
@@ -19,7 +20,9 @@ const props = withDefaults(defineProps<{
   round?: boolean;
 }>(), { name: "", fallbackUrl: "", size: "md", round: false });
 
-const nativeSource = ref("");
+/** 缓存键。`id <= 0` 没有可取的图（0 不是合法图标 id），此时不进缓存。 */
+const assetKey = computed(() => (props.id > 0 ? `${props.kind}:${props.id}` : ""));
+const nativeSource = ref(assetKey.value ? peekAsset(assetKey.value) : "");
 /** 已经加载失败的候选地址。**是列表不是布尔**：一个挂了不能把另一个也判死。 */
 const broken = ref<string[]>([]);
 const initials = computed(() => props.name.trim().slice(0, 1) || "?");
@@ -43,14 +46,18 @@ watchEffect((onCleanup) => {
   let active = true;
   onCleanup(() => { active = false; });
   broken.value = [];
-  nativeSource.value = "";
-  if (!isTauri() || props.id <= 0) return;
-  void backend.asset(props.kind, props.id).then((asset) => {
-    // 空载荷不该抹掉调用方已经给好的 URL。
-    if (active && asset.dataUrl) nativeSource.value = asset.dataUrl;
-  }).catch(() => {
-    // 拿不到就留在远程兜底上，这里不标记失败。
-  });
+  const key = assetKey.value;
+  // 缓存命中时**同步**就有值：卡片因身份落定而重挂时不会再闪一下首字母占位。
+  nativeSource.value = key ? peekAsset(key) : "";
+  if (!isTauri() || !key) return;
+  void cachedAsset(key, () => backend.asset(props.kind, props.id).then((asset) => asset.dataUrl ?? ""))
+    .then((url) => {
+      // 空载荷不该抹掉调用方已经给好的 URL。
+      if (active && url) nativeSource.value = url;
+    })
+    .catch(() => {
+      // 拿不到就留在远程兜底上，这里不标记失败。
+    });
 });
 
 function onError() {

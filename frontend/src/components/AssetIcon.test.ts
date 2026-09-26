@@ -1,19 +1,23 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { resetAssetCache } from "../assets/assetCache";
 import AssetIcon from "./AssetIcon.vue";
 
 /** 由用例控制的「原生宿主」状态：拿不拿得到字节、拿到什么。 */
 let nativeHost = false;
 let nativeAsset: (kind: string, id: number) => Promise<{ dataUrl: string }> = async () => ({ dataUrl: "" });
+let assetCalls = 0;
 
 vi.mock("../services/backend", () => ({
   isTauri: () => nativeHost,
-  backend: { asset: (kind: string, id: number) => nativeAsset(kind, id) },
+  backend: { asset: (kind: string, id: number) => { assetCalls += 1; return nativeAsset(kind, id); } },
 }));
 
 beforeEach(() => {
   nativeHost = false;
   nativeAsset = async () => ({ dataUrl: "" });
+  assetCalls = 0;
+  resetAssetCache();
 });
 
 describe("AssetIcon", () => {
@@ -67,5 +71,51 @@ describe("AssetIcon", () => {
     expect(square.get(".asset-icon").classes()).not.toContain("asset-icon--round");
     round.unmount();
     square.unmount();
+  });
+
+  it("同一个英雄图标只过一次桥；重挂（身份落定会让 key 变）也不会重新拉", async () => {
+    nativeHost = true;
+    nativeAsset = async () => ({ dataUrl: "data:image/png;base64,AAAA" });
+    const first = mount(AssetIcon, { props: { kind: "champion", id: 875, name: "腕豪" } });
+    await flushPromises();
+    expect(first.get("img").attributes("src")).toBe("data:image/png;base64,AAAA");
+    expect(assetCalls).toBe(1);
+    first.unmount();
+
+    // 再挂一次（模拟卡片重挂）：缓存命中，同步就该有图，且不再过桥。
+    const second = mount(AssetIcon, { props: { kind: "champion", id: 875, name: "腕豪" } });
+    expect(second.get("img").attributes("src")).toBe("data:image/png;base64,AAAA");
+    await flushPromises();
+    expect(assetCalls).toBe(1);
+    second.unmount();
+  });
+
+  it("同一张图并发渲染多次只发一次请求", async () => {
+    nativeHost = true;
+    let resolveAsset: (value: { dataUrl: string }) => void = () => undefined;
+    nativeAsset = () => new Promise((resolve) => { resolveAsset = resolve; });
+    const a = mount(AssetIcon, { props: { kind: "champion", id: 103, name: "阿狸" } });
+    const b = mount(AssetIcon, { props: { kind: "champion", id: 103, name: "阿狸" } });
+    await flushPromises();
+    expect(assetCalls).toBe(1);
+    resolveAsset({ dataUrl: "data:image/png;base64,BBBB" });
+    await flushPromises();
+    expect(a.get("img").attributes("src")).toBe("data:image/png;base64,BBBB");
+    expect(b.get("img").attributes("src")).toBe("data:image/png;base64,BBBB");
+    a.unmount();
+    b.unmount();
+  });
+
+  it("空载荷不进缓存：下一张卡还会再试一次", async () => {
+    nativeHost = true;
+    nativeAsset = async () => ({ dataUrl: "" });
+    const first = mount(AssetIcon, { props: { kind: "champion", id: 64, name: "盲僧" } });
+    await flushPromises();
+    expect(assetCalls).toBe(1);
+    first.unmount();
+    const second = mount(AssetIcon, { props: { kind: "champion", id: 64, name: "盲僧" } });
+    await flushPromises();
+    expect(assetCalls).toBe(2);
+    second.unmount();
   });
 });

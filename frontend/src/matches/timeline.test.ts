@@ -35,7 +35,12 @@ describe("timeline formatting", () => {
   it("compacts gold and keeps the sign", () => {
     expect(compactGold(999)).toBe("999");
     expect(compactGold(1250)).toBe("1.3k");
-    expect(compactGold(24300)).toBe("24k");
+    // 两位数 k 必须保住小数：用户报的就是「一过 10k 就只剩 10/11/12」。
+    expect(compactGold(6520)).toBe("6.5k");
+    expect(compactGold(10500)).toBe("10.5k");
+    expect(compactGold(24300)).toBe("24.3k");
+    // 到三位数 k 才舍小数，免得 Y 轴被挤爆。
+    expect(compactGold(123400)).toBe("123k");
     expect(signedGold(2400)).toBe("+2.4k");
     expect(signedGold(-8100)).toBe("-8.1k");
     expect(signedGold(0)).toBe("0");

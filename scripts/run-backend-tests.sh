@@ -16,6 +16,16 @@ ZIG=/d/4_Code/.miseEnv/installs/zig/0.16.0/zig.exe
 SDK=node_modules/@native-sdk/cli
 SQLITE="$SDK/third_party/sqlite"
 
+# `build_options` 是 native-sdk 构建生成的模块文件，目录名是内容 hash：app.json 的
+# version / 构建选项一变 hash 就变。以前这里写死过一个 hash，版本一升就直接
+# `failed to check cache: ... options.zig FileNotFound`（表现像代码编不过，其实只是路径过期）。
+# 现查最近生成的那一个；一个都没有时说明还没跑过 native-sdk 构建。
+BUILD_OPTIONS=$(ls -t .zig-cache/c/*/options.zig 2>/dev/null | head -1)
+if [ -z "$BUILD_OPTIONS" ]; then
+  echo "missing .zig-cache/c/*/options.zig — 先跑一次 native-sdk 构建（会生成 build_options）再跑本脚本" >&2
+  exit 1
+fi
+
 run() {
   "$ZIG" test \
     -j1 \
@@ -31,7 +41,7 @@ run() {
       --dep diagnostics --dep platform_info --dep json --dep canvas \
     "-Mnative_sdk=$SDK/src/root.zig" \
     -ODebug "-Mlcu=src/lcu.zig" \
-    "-Mbuild_options=.zig-cache/c/3ad8806beb176df27bad156e8694f7e8/options.zig" \
+    "-Mbuild_options=$BUILD_OPTIONS" \
     -ODebug -I "$SQLITE" "-Mstorage=src/storage.zig" \
     -ODebug "-Mgeometry=$SDK/src/primitives/geometry/root.zig" \
     -ODebug "-Massets=$SDK/src/primitives/assets/root.zig" \

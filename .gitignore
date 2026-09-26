@@ -25,5 +25,7 @@ zig-out/
 frontend/.verify/
 /.verify/
 
-# 校验脚本的重定向日志（`vue-tsc` 前台跑会被超时 SIGTERM，所以一律写文件再看）。
+# 校验脚本的重定向日志（`vue-tsc` / `vitest` 前台跑会被超时 SIGTERM，所以一律写文件再看）。
+# 命名不固定（tsc.log / vt-all.log / lint.log / bt.log…），所以整类忽略；仓库里没有任何被跟踪的 *.log。
 frontend/.tsc.log
+*.log

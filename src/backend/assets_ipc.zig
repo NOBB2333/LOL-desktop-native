@@ -173,17 +173,126 @@ pub fn getAsset(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
     const payload = payload_json.value;
     // 领取奖励的图标只有路径没有 (kind, id)：任务奖励给的就是
     // `/lol-game-data/assets/v1/...` 这样的整条资源路径。
-    if (payload.path.len > 0) return assetByPath(self, payload.path, output);
+    if (payload.path.len > 0) {
+        var path_key_buffer: [1024]u8 = undefined;
+        const path_key = std.fmt.bufPrint(&path_key_buffer, "path:{s}", .{payload.path}) catch
+            return assetByPath(self, payload.path, output);
+        if (assetCacheGet(path_key, output)) |cached| return cached;
+        const dto = try assetByPath(self, payload.path, output);
+        assetCachePut(path_key, dto);
+        return dto;
+    }
     if (payload.id <= 0) return error.InvalidAsset;
     const kind = assetKind(payload.kind) orelse return error.InvalidAsset;
-    if (self.io) |io| {
-        var client = backend.discoverClient(self, io) catch return communityDragonAsset(kind, payload.id, output);
-        defer client.deinit();
-        const bytes = fetchLcuAsset(client, kind, payload.id) catch return communityDragonAsset(kind, payload.id, output);
-        defer std.heap.page_allocator.free(bytes);
-        return assetDataDto(kind, payload.id, bytes, output);
+    var key_buffer: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buffer, "{s}:{d}", .{ @tagName(kind), payload.id }) catch return error.InvalidAsset;
+    if (assetCacheGet(key, output)) |cached| return cached;
+    const dto = try fetchAssetDto(self, kind, payload.id, output);
+    assetCachePut(key, dto);
+    return dto;
+}
+
+/// 取 `(kind, id)` 的图标 DTO：LCU 本地字节优先，拿不到退回 CommunityDragon。
+fn fetchAssetDto(self: *backend.Runtime, kind: AssetKind, id: i64, output: []u8) ![]const u8 {
+    const io = self.io orelse return communityDragonAsset(kind, id, output);
+    var client = backend.discoverClient(self, io) catch return communityDragonAsset(kind, id, output);
+    defer client.deinit();
+    const bytes = fetchLcuAsset(client, kind, id) catch return communityDragonAsset(kind, id, output);
+    defer std.heap.page_allocator.free(bytes);
+    return assetDataDto(kind, id, bytes, output);
+}
+
+/// 图标 DTO 的进程内缓存。
+///
+/// **为什么必须缓存**（2026-09-26 实测）：一局十人的对局页要画 ~90 个图标，而每个
+/// 图标都是一次独立的桥调用 + 一条**新建的 WinHTTP 连接**去打 LCU——实测平均
+/// **39.7ms**，同样 30 个请求复用一条连接只要 4.4ms/个。90 个串起来就是
+/// **3.5 秒**，表现就是「数据 0.8 秒就到了，图标却一个一个往外冒」。
+/// 而重复量极大：十个玩家互相打过同一批英雄、每 400ms 轮询一次、
+/// 卡片还会因为玩家身份落定（`playerCardKey` 变了）整张重挂，每次都把同样的
+/// 字节重新拉一遍。
+///
+/// 只缓存**真的从 LCU 拿到字节**的结果（DTO 尾巴是 `"source":"lcu"`）。
+/// CommunityDragon 的兜底值只是一条 URL，缓存住会把「当时客户端没开」这一个瞬间
+/// 焊死一整个会话——等用户真开了客户端反而还在用云上的图。
+const asset_cache_budget_bytes: usize = 24 * 1024 * 1024;
+/// 单条上限。桥的响应上限是 1 MiB（`native_sdk.bridge.max_response_bytes`），
+/// 比它还大的 DTO 本来也回不去，直接不入缓存。
+const asset_cache_max_entry_bytes: usize = 512 * 1024;
+const AssetCacheEntry = struct { key: []u8, dto: []u8 };
+
+var asset_cache_entries: std.array_list.Managed(AssetCacheEntry) = .init(std.heap.page_allocator);
+var asset_cache_bytes: usize = 0;
+var asset_cache_mutex: std.atomic.Mutex = .unlocked;
+
+/// 图标是高频只读访问，临界区极短（几十 KB 的 memcpy），用自旋足够；
+/// 抢不到时让出时间片，避免长任务在别的线程上把 CPU 空烧。
+fn lockAssetCache() void {
+    var spins: usize = 0;
+    while (!asset_cache_mutex.tryLock()) {
+        if (spins < 64) {
+            std.atomic.spinLoopHint();
+            spins += 1;
+        } else {
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
     }
-    return communityDragonAsset(kind, payload.id, output);
+}
+
+fn isLcuSourcedDto(dto: []const u8) bool {
+    return std.mem.endsWith(u8, dto, "\"source\":\"lcu\"}");
+}
+
+/// 命中就把缓存里的 DTO 原样拷进调用方的 `output`（超出容量时当未命中）。
+fn assetCacheGet(key: []const u8, output: []u8) ?[]const u8 {
+    lockAssetCache();
+    defer asset_cache_mutex.unlock();
+    for (asset_cache_entries.items) |entry| {
+        if (!std.mem.eql(u8, entry.key, key)) continue;
+        if (entry.dto.len > output.len) return null;
+        @memcpy(output[0..entry.dto.len], entry.dto);
+        return output[0..entry.dto.len];
+    }
+    return null;
+}
+
+fn assetCachePut(key: []const u8, dto: []const u8) void {
+    if (!isLcuSourcedDto(dto) or dto.len > asset_cache_max_entry_bytes) return;
+    const allocator = std.heap.page_allocator;
+    lockAssetCache();
+    defer asset_cache_mutex.unlock();
+    for (asset_cache_entries.items) |entry| if (std.mem.eql(u8, entry.key, key)) return;
+    const owned_key = allocator.dupe(u8, key) catch return;
+    const owned_dto = allocator.dupe(u8, dto) catch {
+        allocator.free(owned_key);
+        return;
+    };
+    asset_cache_entries.append(.{ .key = owned_key, .dto = owned_dto }) catch {
+        allocator.free(owned_key);
+        allocator.free(owned_dto);
+        return;
+    };
+    asset_cache_bytes += owned_key.len + owned_dto.len;
+    // FIFO 淘汰到水位以下：图标都是差不多大的小对象，不值得为 LRU 记账。
+    while (asset_cache_bytes > asset_cache_budget_bytes and asset_cache_entries.items.len > 1) {
+        const evicted = asset_cache_entries.orderedRemove(0);
+        asset_cache_bytes -= evicted.key.len + evicted.dto.len;
+        allocator.free(evicted.key);
+        allocator.free(evicted.dto);
+    }
+}
+
+/// 测试用：清空缓存，避免用例之间互相污染。
+fn assetCacheResetForTest() void {
+    const allocator = std.heap.page_allocator;
+    lockAssetCache();
+    defer asset_cache_mutex.unlock();
+    for (asset_cache_entries.items) |entry| {
+        allocator.free(entry.key);
+        allocator.free(entry.dto);
+    }
+    asset_cache_entries.clearRetainingCapacity();
+    asset_cache_bytes = 0;
 }
 
 /// 按 LCU 资源路径取图标。取不到就回退 CommunityDragon 的同名 URL。
@@ -343,6 +452,40 @@ test "assets by path fall back to community dragon with a lowercased relative pa
         "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/v1/missions/icons/reward.png",
         parsed.value.object.get("dataUrl").?.string,
     );
+}
+
+test "图标 DTO 缓存命中就原样返回，未命中返回 null" {
+    assetCacheResetForTest();
+    defer assetCacheResetForTest();
+    const dto = "{\"kind\":\"champion\",\"id\":36,\"mimeType\":\"image/png\",\"dataUrl\":\"data:image/png;base64,AAAA\",\"source\":\"lcu\"}";
+    assetCachePut("champion:36", dto);
+    var output: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(dto, assetCacheGet("champion:36", &output).?);
+    try std.testing.expect(assetCacheGet("champion:37", &output) == null);
+    // 同一个 key 只留一份，重复写入不该把条目数翻倍。
+    assetCachePut("champion:36", dto);
+    try std.testing.expectEqual(@as(usize, 1), asset_cache_entries.items.len);
+}
+
+test "CommunityDragon 兜底值不进图标缓存" {
+    assetCacheResetForTest();
+    defer assetCacheResetForTest();
+    const cdn = "{\"kind\":\"champion\",\"id\":36,\"mimeType\":\"image/png\",\"dataUrl\":\"https://raw.communitydragon.org/x.png\",\"source\":\"communitydragon\"}";
+    assetCachePut("champion:36", cdn);
+    var output: [512]u8 = undefined;
+    try std.testing.expect(assetCacheGet("champion:36", &output) == null);
+    try std.testing.expect(!isLcuSourcedDto(cdn));
+    try std.testing.expect(isLcuSourcedDto("{\"dataUrl\":\"data:image/png;base64,AA\",\"source\":\"lcu\"}"));
+}
+
+test "图标缓存的目标缓冲装不下时当未命中，不越界写" {
+    assetCacheResetForTest();
+    defer assetCacheResetForTest();
+    const dto = "{\"kind\":\"champion\",\"id\":36,\"mimeType\":\"image/png\",\"dataUrl\":\"data:image/png;base64,AAAA\",\"source\":\"lcu\"}";
+    assetCachePut("champion:36", dto);
+    var tiny: [8]u8 = .{0} ** 8;
+    try std.testing.expect(assetCacheGet("champion:36", &tiny) == null);
+    try std.testing.expectEqual(@as(u8, 0), tiny[0]);
 }
 
 test "svg reward icons are no longer rejected as unknown types" {

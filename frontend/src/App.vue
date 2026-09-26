@@ -12,6 +12,7 @@ import { listenNative, openExternalUrl } from "./services/native";
 import { useAppStore } from "./stores/app";
 import type { AccountPresence } from "./types/domain";
 import { profileIconId, profileIconImage } from "./utils/format";
+import { landingRedirect } from "./utils/landing";
 import { MATCH_HISTORY_QUERY_ROOT } from "./matches/query";
 
 const PROJECT_URL = "https://github.com/NOBB2333/LOL-desktop-native";
@@ -120,19 +121,18 @@ watch(() => app.lastSavedAt, () => {
 });
 
 /**
- * 首次落地：客户端没在跑的时候，直接把用户送到「客户端」页。
+ * 首次落地：客户端在跑就留在首页，没跑就把用户送到「客户端」页。
  *
- * 判据只在 `app.initialized` 变 true 的那一瞬间取**一次**——之后用户点哪儿就是哪儿。
- * 否则客户端中途掉线会把正在看战绩的人弹走（那是打断，不是帮忙）。
- * 严格条件另有三条：还在首页、实时模式、以及确实没连上——用户若主动切到演示模式，
- * 说明他就是想在没有客户端的情况下翻页面，不该被推回启动页。
+ * 判据只取**一次**——之后用户点哪儿就是哪儿，客户端中途掉线不弹走正在看战绩的人。
+ * 判断本身在 `utils/landing.ts`（纯函数 + 单测）；这里只负责「等状态落地」：
+ * `connecting` 表示探测还没回来，此时不下结论，等 connection-state 推过来再判。
  */
 let landingDecided = false;
-watch(() => app.initialized, (ready) => {
-  if (!ready || landingDecided) return;
+watch(() => [app.initialized, app.connection.status] as const, ([ready, status]) => {
+  if (!ready || landingDecided || status === "connecting") return;
   landingDecided = true;
-  if (route.path !== "/" || app.mode !== "live" || app.connection.status === "connected") return;
-  void router.replace("/client");
+  const target = landingRedirect({ initialized: ready, path: route.path, mode: app.mode, status });
+  if (target) void router.replace(target);
 }, { immediate: true });
 
 function scheduleMatchHistoryRefresh() {

@@ -689,7 +689,8 @@ const hoveredSeat = ref<number | null>(null);
       <button type="button" :disabled="!canStepBack" @click="stepFight(-1)">◀ 上一波</button>
       <button type="button" :disabled="!canStepForward" @click="stepFight(1)">下一波 ▶</button>
       <button type="button" @click="resetCursor">回到终局</button>
-      <!-- 时间轴上的刻度是三种颜色，不写图例没人知道哪个是哪个。 -->
+      <!-- 时间轴上的标记有三种形状（细刻度 / 菱形 / 圆环），不写图例没人知道哪个是哪个。
+           图例里的形状和时间轴共用同一套 `data-kind`，改一边必须改另一边。 -->
       <span class="spectate__controls-legend" aria-hidden="true">
         <span><i data-kind="kill" data-tone="blue" /><i data-kind="kill" data-tone="red" />击杀</span>
         <span><i data-kind="monster" />野怪</span>
@@ -880,13 +881,19 @@ const hoveredSeat = ref<number | null>(null);
 .spectate__timeline { position: relative; height: 28px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-muted); cursor: ew-resize; touch-action: none; }
 /* 键盘擦洗要有可见焦点，不然方向键改了时间也不知道焦点在哪。 */
 .spectate__timeline:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-/* 事件标记改成**细刻度**（转播时间轴那种竖线）：一堆圆点在 28px 高的条里挤成一片，
-   分不清谁是谁；竖线按类型给高度，重叠了也还是竖线，不会糊。 */
-.spectate__mark { position: absolute; top: 50%; width: 2px; margin-top: -6px; height: 12px; border-radius: 1px; pointer-events: auto; }
-.spectate__mark--kill { background: var(--blue); box-shadow: 0 0 0 .5px var(--surface-muted); }
+/* 事件标记靠**形状**分辨，不再只靠颜色。早先只有「细刻度」一种形态、用高度和颜色区分
+   （怕圆点在 28px 高的条里挤成一片）；但三根宽度不到 4px 的竖条只有颜色不同，扫一眼
+   根本分不出哪根是推塔哪根是击杀。
+   现在的语言：击杀 = 细竖刻度（事件流的主线，保持细）、野怪 = 实心菱形、推塔 = 空心圆环。
+   菱形和圆环本身仍是小图形，密集重叠时也只是压在一起，不会像大圆点那样糊掉整条轴。
+   形状中心统一用 translateX(-50%) 对到时间戳上；不这么做的话宽度一变大就会整体偏右，
+   和它下面的团战高亮段对不上。 */
+.spectate__mark { position: absolute; top: 50%; transform: translateX(-50%); pointer-events: auto; }
+.spectate__mark--kill { width: 2px; height: 12px; margin-top: -6px; border-radius: 1px; background: var(--blue); box-shadow: 0 0 0 .5px var(--surface-muted); }
 .spectate__mark--kill[data-tone="red"] { background: var(--red); }
-.spectate__mark--monster { width: 3px; height: 17px; margin-top: -8.5px; background: var(--amber); }
-.spectate__mark--building { height: 7px; margin-top: -3.5px; background: var(--text-muted); }
+.spectate__mark--monster { width: 7px; height: 7px; margin-top: -3.5px; border-radius: 1px; background: var(--amber); transform: translateX(-50%) rotate(45deg); }
+/* 空心圆环：外圈描边 + 底色填充，压在彩色刻度之间也能一眼认出是「建筑」而不是一次击杀。 */
+.spectate__mark--building { width: 8px; height: 8px; margin-top: -4px; border: 1.5px solid var(--text-secondary); border-radius: 50%; background: var(--surface); }
 .spectate__fight { position: absolute; top: 2px; bottom: 2px; display: grid; place-items: center; border-radius: 4px; color: var(--accent); background: var(--accent-soft); font-size: 8px; font-weight: 700; cursor: pointer; }
 .spectate__fight.is-active { color: var(--accent); outline: 1px solid var(--accent); }
 .spectate__playhead { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--accent); pointer-events: none; }
@@ -919,11 +926,13 @@ const hoveredSeat = ref<number | null>(null);
 /* 刻度图例：色块形状跟时间轴上的真刻度一致（击杀 2px、野怪 3px 高一点、推塔更短）。 */
 .spectate__controls-legend { display: inline-flex; align-items: center; gap: 10px; margin-left: 2px; color: var(--text-muted); font-size: 9px; }
 .spectate__controls-legend > span { display: inline-flex; align-items: center; gap: 3px; }
-.spectate__controls-legend i { width: 2px; height: 9px; border-radius: 1px; }
-.spectate__controls-legend i[data-tone="blue"] { background: var(--blue); }
-.spectate__controls-legend i[data-tone="red"] { background: var(--red); }
-.spectate__controls-legend i[data-kind="monster"] { width: 3px; height: 11px; background: var(--amber); }
-.spectate__controls-legend i[data-kind="building"] { height: 6px; background: var(--text-muted); }
+/* 图例必须和时间轴用同一套形状，否则图例本身就成了误导：写了「野怪」却画一根竖条，
+   用户会以为野怪就是竖条里偏黄的那根。 */
+.spectate__controls-legend i { width: 2px; height: 9px; border-radius: 1px; flex: none; }
+.spectate__controls-legend i[data-kind="kill"][data-tone="blue"] { background: var(--blue); }
+.spectate__controls-legend i[data-kind="kill"][data-tone="red"] { background: var(--red); }
+.spectate__controls-legend i[data-kind="monster"] { width: 6px; height: 6px; border-radius: 1px; background: var(--amber); transform: rotate(45deg); }
+.spectate__controls-legend i[data-kind="building"] { width: 7px; height: 7px; border: 1.5px solid var(--text-secondary); border-radius: 50%; background: var(--surface); }
 
 @media (max-width: 980px) {
   .spectate__stage { grid-template-columns: 1fr 1fr; }

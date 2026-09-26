@@ -1,0 +1,226 @@
+# UI / 时间线 / 阵容配对 —— 不变量备忘（2026-09-26 汇总）
+
+> 从长期项目备忘里搬出来的细节。凡是标「勿推翻」的都是实测踩出来的结论，
+> 改对应代码前先读这一节。新条目继续往这里追加（按主题归并，不按时间堆）。
+
+## 阵营有两套坐标：`side` 相对、`team` 绝对（勿推翻）
+
+- `MatchParticipant.side`（`ally`/`enemy`）是**相对主视角**的；
+  `MatchTimelineParticipant.team`（100 蓝 / 200 红）与事件 `team` 是**绝对阵营**。
+  **我打红方时自己那行的 `side` 仍是 `ally`、`team` 却是 200**。
+- 因此「按 `side` 推座位」的规则（`(seat.team === 蓝) === (side !== "enemy")`）在
+  主视角处于红方时对十个座位**全部为假** → 表现是「每个人 KDA 都是 000、装备与对塔
+  伤害整片空白」，而打蓝方时一切正常 → 看起来像**「有的对局有、有的对局没有」**
+  （09-25 真机 bug 的根因）。
+- 修法已落地：后端 `writeParticipant` 额外写绝对 `team`（`side` 不动，
+  `MatchParticipant` 有可选 `team?`）；前端配对**只此一份** →
+  `frontend/src/matches/lineup.ts` 的 `sameTeamAsSeat` / `pairSeatsWithPlayers` /
+  `realSeats`，观战面板、每波团、事件流三处全用它。**只有老缓存缺 `team` 时**才退回
+  旧的 `side` 口径。
+- 排查入口：`player.side` 与 `player.team` 是否同向、`seat.team` 与视角方阵营是否一致。
+
+## 分路（position）来源与「上单被写成打野」（勿推翻）
+
+- `participantPosition` 的优先级：点名位置（match-v5 / SGP 的 `teamPosition`、
+  `individualPosition`、`positionAssignedByMatchmaking`、`position`）→ 退到 LCU 裁剪版的
+  `timeline.lane`。
+- ⚠️ **LCU / 腾讯服的 `timeline.lane` 会把上单写成 `JUNGLE`**（09-26 直连客户端实测，
+  440 排位）：上单和打野的 `timeline.role` 都是 `NONE`，服务端把两个位置一起塞进了
+  `JUNGLE`。同一局实测：上单 DrMundo/Jax → `lane:"JUNGLE"`，打野 Viego/Warwick 也是
+  `"JUNGLE"`；而 SGP 的 `teamPosition` 明确分别是 `TOP` / `JUNGLE`。
+- 所以 `lane == "JUNGLE"` **不能直接采信**，必须用**惩戒**（召唤师技能 11）消歧：
+  带惩戒的是打野，不带的就是上单（SR 里打野必带惩戒；ARAM 这类无分路模式 `lane` 是
+  `NONE`，走不到这一支）。实现见 `backend.zig` 的 `participantPosition` +
+  `shortcut_service.hasSmitePlayer`。
+- LCU 裁剪版的形状（`/lol-match-history/v1/products/.../matches` 与
+  `/lol-match-history/v1/games/{gameId}`）：参与者只有
+  `participantId / championId / spell1Id / spell2Id / stats / teamId / timeline /
+  highestAchievedSeasonTier`，**没有 `teamPosition`，列表接口连 `puuid` 都没有**
+  （靠 game 级 `participantId` 认人，见 `participantForPuuid`）。
+- 另外：`timeline.role` 的 `SUPPORT`（不带 `DUO_` 前缀）也要判成 `UTILITY`，旧口径只认
+  `DUO_SUPPORT` 会把辅助错报成下路。
+
+## 页面结构
+
+左导航：`首页/战绩/英雄/自动化/历史/好友/客户端/对局`。「工具箱」页已删，别捡回来。
+
+- 历史页两页签：`对局` 展开一局 = `MatchDeepDetail.vue` =
+  **`MatchSummaryStrip`（结论条：首杀/击杀/团战/多杀）+ `MatchSpectatePanel`（观战 HUD：
+  转播式顶部比分条 │ 蓝五人列·**常驻**小地图·红五人列 │ 全宽经济差面积图 │
+  全宽时间轴+可拖游标 │ 回放控制条） + `MatchDetailPanel`（团战/事件流）**；
+  `人` = 逐局行（他英雄/我英雄/双方 KDA），行可再点开 `MatchDeepDetail`。
+  深链 `?tab=players&player=` 仍生效。
+- `MatchLineupPanel.vue`、`MatchMetPlayers.vue` **已删**，别捡回来；它的「四指标切换」
+  已迁到 `TeamfightList` 详情右上角（`本波输出/本波承伤/全场输出/全场承伤/出装`）。
+  「遇到过 N」角标现在长在观战面板玩家行上。
+- 时间线详情 = `MatchDetailPanel.vue` + `TeamfightList.vue`（`layout="split"`：
+  左=每波团列表 170~220px、右=选中那波详情、事件流走 `#below` 插槽落在详情下面）；
+  删掉的经济曲线、BP 记录别捡回来。
+
+## 观战面板 / 团战
+
+- ⚠️ **真机分钟帧里没有伤害字段**（09-25 直连客户端实测，TENCENT；ARAM 2400/map12 与
+  SR 440 两种都测）：`participantFrames` 只有
+  `currentGold`/`dominionScore`/`jungleMinionsKilled`/`level`/`minionsKilled`/
+  `participantId`/`position`/`teamScore`/`totalGold`/`xp`——既无扁平
+  `totalDamageDoneToChampions`，**也无嵌套 `damageStats`**（所以 `jungle_analysis.zig`
+  读 `damageStats` 在这版上同样是空的）。**只有十人详情的 `stats` 有伤害/装备/对塔**
+  （`/lol-match-history/v1/games/{gameId}` 那条路没问题）。
+- ✅ **伤害的补法（09-25 夜已实现）**：同一局的 SGP `DETAILS` 里**嵌着 match-v5 的完整
+  时间线**，逐帧带 `damageStats.totalDamageDoneToChampions` / `totalDamageTaken`。
+  `backend.zig` 的 `fetchSgpMatchDetails(client, game_json, gameId)` 取原文（平台号直接读
+  本地对局详情里的 `platformId`，省一次往返），`timeline.zig` 的
+  `writeTimeline(game, timeline, sgp_json, out)` 按**时间戳**（不按下标）把 SGP 那一帧的
+  伤害并进 `damage`/`taken`，本地有值优先。取不到返回 null / 传空串 → 照旧写 0，
+  前端降级。
+  - ⚠️⚠️ **SGP `DETAILS` 的外层是 `{"json": <嵌进去的对象>, "metadata": {...}}`**——
+    `"json"` 后面紧跟 `{`，不是转义字符串。之前用 `json.dumps(payload)` 打印，看到的
+    永远是转义形式，据此写成「只认字符串」的话真机会一路 null：伤害恒 0、**不报错**、
+    柱状图静悄悄永远空。`sgpTimelineFrames` 两种形状都认（单测两条用例各钉一种）。
+  - 两份时间线对齐已实测：`frameInterval: 60000`、**各 30 帧、逐帧时间戳完全相同**
+    （0/60022/120028/…）、十人 `level` 逐座位全等 → 座位号是同一人。`damageStats` 是
+    **累计值**（单调不减），所以团战「这波打了多少」= 团后帧 − 团前帧。
+  - **时间轴落盘缓存的 key 带版本前缀 `v2:`**（`timeline_cache_prefix`）。缓存存的是整份
+    输出 JSON、无版本字段，且假设「打完就固定」——只对同一版输出形状成立。
+    **输出形状一变就 +1**，否则用户看过的老对局会一直读回全 0 的旧快照（不报错）。
+- **渲染要对「没拿到帧伤害」诚实降级，不能画一根全 0 的图**（用户看到的就是
+  「柱状图没渲染」）：`matches/timeline.ts` 的 `framesHaveDamage(frames)` 是唯一判据 →
+  十人第二行的输出/承伤降级成**全场总账**（`player.damageDealt`/`damageTaken`）并把文案
+  换成「全场输出/承伤」+ 角标「输出 / 承伤为全场总账」；`TeamfightList` 的
+  「本波输出/本波承伤」**置灰 + 删除线**、默认指标自动跳「全场输出」、上方给琥珀色说明。
+  预览开关 `?frameDamage=0` 就是这条真机形状。**注意这是个真判断不是历史包袱**：
+  合并失败（离线 / 区服不在 SGP 白名单 / 拿不到 entitlement / 对局太新）时它就会走到降级。
+- **任意时刻的出装做不了**（LCU 无 `ITEM_PURCHASED`）；`.rofl` 解析也给不了伤害时间线
+  （关键帧回放）。**但「终局那六件」有**（十人详情的 `participants[].items`），所以
+  「装备」可以当行指标 / 团战指标用（团战是一个时间点，装备不会换，站得住）。
+  要「拖游标看某一刻的出装」必须走 SGP——**这条路已经通了一半**：`fetchSgpMatchDetails`
+  每次拉时间线时本来就会取回整份 `DETAILS`，里面有 `ITEM_PURCHASED` / `SKILL_LEVEL_UP` /
+  `WARD_PLACED` 等本地完全没有的事件（实测 336 条 `ITEM_PURCHASED`）。
+  差的是「把这些事件也写进输出 + 前端按游标还原装备栏」，未开工。
+- 观战面板硬约定：**小地图常驻**（别再做出「地图 / 实时伤害」那种切换）；
+  玩家行**两行封顶**（①名字 + 遇到过的角标 · KDA 胶囊 · 经济胶囊 ②**由
+  `.spectate__rowbar` 的切换器决定**：输出/承伤/推塔/装备——前三项柱状图、第四项 6 件
+  图标），塞不下的补刀/视野挂 `title`；等级角标用全 app 徽章语言（不另配色）；
+  游标时间气泡贴边要改对齐方向。
+- **时间轴事件标记是三种形状**（09-26 用户明确要求，覆盖更早的「只用细刻度」约定）：
+  **击杀 = 细竖刻度（2×12）· 野怪 = 实心菱形（7×7 `rotate(45deg)`，amber）·
+  推塔 = 空心圆环（8×8、`border-radius:50%`、1.5px 描边 + 底色填充）**。
+  `.spectate__mark` 统一 `transform: translateX(-50%)` 把形状中心对到时间戳上
+  （宽度变大不加这句会整体偏右、和团战高亮段对不上）。图例 `.spectate__controls-legend i`
+  必须用**同一套**形状，否则图例本身就在误导。
+  - **切换器放在比分条正下方的整宽条 `.spectate__rowbar`**（09-25 改：原来是压在底部
+    控制条里，用户说「不容易找到」）。结构 = 「十人第二行」标签 + 4 个按钮 + 口径合计
+    （蓝 X / 红 Y）+ 无帧伤害时的降级角标。**不能压在地图角上**——会被读成「地图的显示
+    选项」（用户原话「放这里太尬了」）。⚠️ 挪出 `.spectate__controls` 后，原
+    `.spectate__controls button` 泛化规则**不再压得住它**，`.spectate__rowswitch` 必须独立
+    定样式（padding `3px 12px`、激活态用 accent）。选控制条按钮别再写
+    `.spectate__controls > button`（切换器已经不在里面）。
+  - 柱状图**只画柱**；归一化基准两端不一：**输出/承伤取「终局那一帧」的最大值**（分母
+    固定，柱子才会随游标从 0 长到满格），**推塔**才用「十人当前值的最大值」（它跟游标无关）。
+    ⚠️ 曾用「当前游标下十人的最大值」当分母 → 累计值涨、分母跟着涨、比值恒定，
+    **拖时间轴时只有数字在变、柱子长度几乎不动**，看起来和「这一项没数据」一模一样
+    （就是用户报的那个现象）。降级路径记得绕开帧分支（帧全 0 而值是全场总账，会算出
+    1900000%）。子标题要写明口径是「到此刻累计 X」还是「全场 X」（`推塔` 只有整局总账，
+    LCU 帧里没有对塔伤害）。
+  - **没有逐分钟 KDA 这种东西**：本地事件只有 `CHAMPION_KILL`，没有按座位的逐帧统计，
+    全 app 也没有别的源。KDA 只能是整局总账，别去「修」它。
+- 顶部是**对局面板式比分条**（09-25 夜重做）：蓝/红**两翼**（各自的队色边 + 渐变底 +
+  目标物胶囊）+ **中间比分板**（时间 / 比分 / 经济差）。经济类数字（两侧总经济、经济差）
+  前面带**金币图标**——`--coin-glyph` 是个 CSS `mask` 的同心圆，靠 `currentColor` 上色，
+  所以深浅主题 / 蓝红两侧 / 金币底色下都不用改色；新增 `--gold`/`--gold-soft` token，
+  **别复用 `--amber`**（那是「警告」色，夹在蓝红两队之间会被读成告警）。
+  目标物：`塔 N` · `小龙 N` + **龙种** · `大龙 N` · `先锋 N`。「拿了几条」和「拿的哪几条」
+  是两个问题都要有。**「塔」只数 `TOWER_BUILDING`**——水晶也是 `BUILDING_KILL`，
+  一起算会虚报。
+- 地图建筑层：22 塔 + 6 水晶走 `matches/structures.ts`（Riot map11 官方坐标，水晶 300s
+  重生），**被推掉的画空心灰而不是删掉**；建筑 `z-index: 0` < 英雄头像 1 < **编号钉 2**
+  （钉子必须在头像之上，团战落点常压在人堆里，否则数字被脸盖住），选中态 4。
+- 玩家行的镜像对齐走**行内** `flex-direction: row-reverse` + `margin-right: auto`，
+  **不要**在 body 上写 `justify-items: end`（grid item 会变 shrink-to-fit，靠
+  `flex: 1 1 auto` 的柱条会塌成 0px，只有红方那半边坏）。柱长要横向可比 → 数字列定宽
+  （`min-width: 32px`）。
+- 名字是 `<b>`、胶囊里的 KDA 数字也是 `<b>`：名字的规则必须写成
+  `.spectate-player__line > b`（只命中直接子级），否则 `.spectate-player__body.is-self b`
+  会压过 `.spectate-kda b`。
+- **父传命令给子组件的 ref 都要想「同值重发」**：`MatchDeepDetail` 的 `seekSeconds`
+  （点事件流/点团 → 落地那一刻）是不变就触发不了 watch 的值，拖走游标后再点**同一条**
+  事件会一点反应都没有。修法 = 面板落位后 `emit("seek-consumed")`、父组件清回 `null`。
+- 地图编号钉的下标必须取**原数组下标**（`fights.map((f,i)=>({f,i})).filter(有落点)`）
+  ——先 filter 再 map 会让点「团 7」选中「团 6」（落点算不出来时 `center` 为 null）。
+- 事件流**跟着选中的团走**：击杀严格按团战窗口，大小龙 / 推塔放宽 ±15 秒（抢龙和开团在
+  时间上是一件事，严格按窗会漏「谁把大龙收了」）；没选中团才退回整局。每行**带英雄头像**
+  （击杀两张脸 + 小箭头、阵亡者压暗；拿龙推塔只有一头）。文字用**玩家名**不是英雄名
+  ——镜像对局下英雄名会写成「九尾妖狐 击杀 九尾妖狐」；`MatchParticipant` **不带
+  participantId**，要经 `timeline.participants` 的「英雄 + 阵营」桥接。
+- 每波团柱状图的显隐由 `hasFrames`（整局有没有分钟帧）决定，**不是** `metricTotal > 0`
+  ——后者会让「某项整列是 0」时整块图被换成对位表，用户看成「柱状图时有时无」。
+- 时间轴是 `role="slider"`：必须有 `tabindex="0"` + ←/→（5s）/Shift（30s）/Home/End +
+  `aria-valuetext` + 焦点环。
+- **经济差面积图也能拖着擦洗时间轴**（09-25 加）：游标逻辑抽成共用的
+  `scrubTo(event, element)`，`.spectate__spark` 接 pointerdown/move/up + `cursor: ew-resize`
+  + `touch-action: none`，图例加 `pointer-events: none` 免得挡住拖动；拖完与下面时间轴的
+  游标同步（CDP 实测 20%→05:12/206px、80%→20:48/824px）。
+- 启动落地：`utils/landing.ts` 的 `landingRedirect()`——客户端已连 → 首页；
+  disconnected/error → 客户端页。live 模式 `stores/app.ts` 的 `initialize()` 用
+  `Promise.race([refreshConnection(), 3s])`，否则落地读到 bootstrap 的陈旧快照。
+- 经济文案 `compactGold`：**小数位只在三位数 k（≥100k）才舍掉**。曾经 ≥10k 就
+  `toFixed(0)` → 两位数的 k 全变成 `10k/11k/12k`，用户报「一过 10k 小数就没了」。
+
+## fixture 约束（`frontend/src/fixtures/data.ts`）
+
+- 一律**确定性**（`wobble` / `formOut` / `formIn`，按局号+座位算），绝不用
+  `Math.random`——预览要可复现、截图对比才有意义。
+- 十人两项数据源别搞混：详情用 `ROLE_BASELINE`（`damageDealt` 等），逐帧用 `LANE_RATES`
+  （`index % 5` 就是 上/野/中/下/辅）。两队共用 `LANE_RATES` 会在早期帧打出**完全一样的
+  数字**，所以叠了 ±8% 的 `formOut`/`formIn`；幅度不能再大（中 950 / 下 1000 只差 5%，
+  一大就翻位置顺序）。
+- 十人详情与大厅的 puuid/名字必须同一套（相遇档案按 puuid join）；帧数组必须是 **10 项**。
+- **fixture 的边界必须与真机对齐，否则预览会掩盖 bug**：fixture 一直把「我」放在蓝方，
+  于是 `side` 与 `team` 恰好同向——「按 side 配座位」的错规则在预览里**永远是对的**，
+  真机红方局却全线错位。09-25 起支持：
+  - `createFixtureMatchDetail(gameId, { selfTeam })`、
+    `createFixtureMatchTimeline(gameId, { frameDamage, selfTeam })`；拆出
+    `buildFixtureMatch(index, selfTeam)`，`fixtureMatches` 仍走默认蓝方（8 个引用它的测试
+    文件不用动）。
+  - **预览开关**（`browserBackend` 读查询参数，只在 fixture 分支生效，可叠加）：
+    `?phase=room`（房间阶段）· `?frameDamage=0`（真机形状：帧无伤害）·
+    `?selfSide=red`（主视角在红方）。
+  - `selfTeam` 必须**连帧里的绝对颜色一起换边**（`blueGold`/`blueCs` 取后五个座位、
+    事件 `team` 整体翻转、走位锚点换半区）——只翻座位不翻颜色会造出一份自相矛盾的预览。
+  - 新增 fixture 开关时**顺手给它写单测**，钉住「等价于真机形状」，否则它自己也会和真机
+    悄悄分叉。
+
+## 打野路线图
+
+- 样本上限 20 局；地图坐标 `invertY`；底图是深色 → 标记颜色**写死亮色**，别跟着主题走。
+- 地图**必须带文字**（地名/营地名），纯色块看不出是哪儿。
+- 营地坐标有**两份**（`detectStartCamp` 与 `live/gameMap.ts`），改一处必须同步另一处。
+- `blueInvade[camp]` 的落点在**红方半区**（收口在 `clearCountsAt`）。
+- 只对**本局打野**下发路线（`isCurrentJungler`），别给十个人都画。
+
+## 已知未修：深色模式前景色对比度（全 app 级）
+
+`main.css` 的 `:root[data-color-mode="dark"]` 只覆盖了 `--*-soft` 底色，**没覆盖**
+`--accent`/`--blue`/`--red`/`--amber`。实测 `--accent`(#0f766e) on `--surface`(#242522)
+≈ 2.8:1、`--blue` on `--surface-muted` ≈ 2.3:1，都低于 AA 的 4.5:1。后果：深色下「我」的
+名字、KDA 里的阵亡/助攻数字偏糊。**要改得动 `main.css`（影响整个深色主题），需先问用户**。
+默认主题是浅色（`colorMode: "light"`）。
+
+## 图标加载（性能，09-26 实测）
+
+- 一局十人页要画约 **140 个**图标（10 张卡 × (1 主英雄 + `recentLimit`=10 局 × 1 +
+  3 常用英雄)）。每个图标 = 一次桥调用 + **一条新建的 WinHTTP 连接**打 LCU：
+  实测 **39.7ms/个**；同样 30 个请求**复用一条连接只要 4.4ms/个**。
+  → 无缓存时纯请求耗时 ≈ **3.6–5.6 秒**，就是用户看到的「数据 0.8 秒到了、图标却一个一个
+  慢慢冒」。
+- 放大因素：玩家身份落定（占位 puuid → 真 puuid）会让 `playerCardKey` 变化 → 整张卡重挂
+  → 卡内所有图标重拉；加载期 400ms 轮询每次版本变化都全量重渲染。
+- 已修：**两端各一层缓存**。
+  - 后端 `assets_ipc.zig`：按 `kind:id` / `path:<路径>` 缓存**编码好的 DTO**（24MB 预算、
+    FIFO 淘汰）。**只缓存 `"source":"lcu"` 的结果**——CommunityDragon 兜底只是一条 URL，
+    缓存住会把「当时客户端没开」焊死一整个会话。
+  - 前端 `frontend/src/assets/assetCache.ts`：`peekAsset`（同步取，重挂不闪占位）+
+    `cachedAsset`（并发合并成一次）。`AssetIcon.vue` / `LcuAssetImage.vue` 都走它。
+- 还没做（下一个量级）：`http_windows.zig` 每次请求都 `WinHttpOpen`/`WinHttpConnect` 再
+  `defer` 关掉，**不复用连接**。做成按 `host:port` 的会话/连接池能把剩下的请求从 39.7ms
+  压到 ~4.4ms。改动面在 WinHTTP 句柄生命周期 + 客户端重启失效，风险高于本轮范围。

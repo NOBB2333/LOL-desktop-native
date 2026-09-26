@@ -139,21 +139,22 @@ function detail(redView = false): MatchSummary {
   };
 }
 
-function timeline(frames: MatchTimelineFrame[]): MatchTimeline {
-  return { gameId: 1, durationSeconds: 1560, participants: seats, frames, events };
+function timeline(frames: MatchTimelineFrame[], list: MatchTimelineEvent[] = events): MatchTimeline {
+  return { gameId: 1, durationSeconds: 1560, participants: seats, frames, events: list };
 }
 
 /** 头像用桩替掉：真组件会去拉远程图，这里只关心「这一行挂了几个图标」。 */
 const AssetIconStub = { props: { id: { default: 0 }, name: { default: "" } }, template: '<i class="asset-icon-stub" />' };
 
-function mountPanel(options: { frames?: MatchTimelineFrame[]; redView?: boolean } = {}) {
+function mountPanel(options: { frames?: MatchTimelineFrame[]; redView?: boolean; events?: MatchTimelineEvent[] } = {}) {
   const frames = options.frames ?? [frame(0), frame(26)];
+  const list = options.events ?? events;
   return mount(MatchSpectatePanel, {
     props: {
       detail: detail(options.redView ?? false),
-      timeline: timeline(frames),
+      timeline: timeline(frames, list),
       championNameOf: (id: number) => `英雄${id}`,
-      fights: deriveTeamfights(events, seats),
+      fights: deriveTeamfights(list, seats),
       selectedFightIndex: 0,
       selfPuuid: options.redView ? "puuid-6" : "puuid-1",
     },
@@ -247,6 +248,36 @@ describe("观战面板：真机数据形状", () => {
     await nextTick();
     expect(wrapper.get(".spectate__clock strong").text()).toBe("00:00");
     expect(Math.max(...barWidths(wrapper))).toBe(0);
+  });
+
+  // 三类事件原来都是「细竖条 + 换颜色」，宽度不到 4px，扫一眼分不出哪根是推塔哪根是击杀。
+  // 形状由修饰类决定，所以这里钉的是两件事：三种标记挂**三个不同的**修饰类，
+  // 以及图例把三种都列出来——只改时间轴不改图例，图例本身就成了误导。
+  it("击杀 / 野怪 / 推塔是三种不同的标记，且图例三种都列了", () => {
+    const list: MatchTimelineEvent[] = [
+      event(180, { killerId: 1, victimId: 6, killerChampionId: 10, victimChampionId: 60 }),
+      event(200, { killerId: 6, victimId: 1, killerChampionId: 60, victimChampionId: 10 }),
+      event(300, { type: "ELITE_MONSTER_KILL", monsterType: "DRAGON" }),
+      event(420, { type: "BUILDING_KILL", buildingType: "TOWER_BUILDING", laneType: "MID_LANE" }),
+    ];
+    const wrapper = mountPanel({ events: list });
+
+    for (const selector of [".spectate__mark--kill", ".spectate__mark--monster", ".spectate__mark--building"]) {
+      expect(wrapper.findAll(selector).length).toBeGreaterThan(0);
+    }
+    // 三种标记的修饰类互不相同 —— 否则形状必然相同，区分就没了。
+    const modifiers = new Set(
+      wrapper.findAll(".spectate__mark").map((mark) => mark.classes().find((name) => name.startsWith("spectate__mark--"))),
+    );
+    expect(modifiers.size).toBe(3);
+
+    const legend = wrapper.get(".spectate__controls-legend");
+    for (const kind of ["kill", "monster", "building"]) {
+      expect(legend.findAll(`[data-kind="${kind}"]`).length).toBeGreaterThan(0);
+    }
+    expect(legend.text()).toContain("击杀");
+    expect(legend.text()).toContain("野怪");
+    expect(legend.text()).toContain("推塔");
   });
 
   it("视角方在红方时，十个人的 KDA 与装备照样配得上（不再 000 / 空白）", async () => {

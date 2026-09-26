@@ -132,10 +132,20 @@ export const useAppStore = defineStore("app", () => {
           listenNative<string>("automation-error", reportAutomationError),
         ]);
         // 后台轮询的首个事件可能早于前端监听器注册，启动后主动刷新一次补上竞态。
+        //
+        // 这一次**必须 await**：启动落地（客户端在跑就留首页、没跑就去客户端页）读的就是
+        // 这个状态，bootstrap 里那份是上一轮的快照。不等探测回来就放开 `initialized`，
+        // 落地判断就会拿旧快照把人送错页（客户端开着却被推到客户端页）。探测给 3 秒上限，
+        // 超时/失败就沿用快照——启动不能为了这个状态卡住。
         if (nextBootstrap.dataMode === "live") {
-          void backend.refreshConnection()
-            .then((connection) => updateConnection(connection))
-            .catch((cause) => { reportError(cause instanceof Error ? cause.message : String(cause)); });
+          const connection = await Promise.race([
+            backend.refreshConnection().catch((cause) => {
+              reportError(cause instanceof Error ? cause.message : String(cause));
+              return null;
+            }),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+          ]);
+          if (connection) updateConnection(connection);
         }
       }
       await registerAssessmentShortcuts();

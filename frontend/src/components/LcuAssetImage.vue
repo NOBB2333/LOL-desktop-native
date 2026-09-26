@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watchEffect } from "vue";
 import { isLcuAssetPath, lcuAssetToCommunityDragon } from "../assets/lcuAsset";
+import { cachedAsset, peekAsset } from "../assets/assetCache";
 import { backend, isTauri } from "../services/backend";
 
 /**
@@ -21,6 +22,11 @@ const props = withDefaults(defineProps<{
 
 const source = ref("");
 const failed = ref(false);
+/** 缓存键：LCU 路径本身就能唯一标识一张图。 */
+const assetKey = computed(() => {
+  const path = props.path?.trim() ?? "";
+  return isLcuAssetPath(path) ? `path:${path}` : "";
+});
 const communityDragonUrl = computed(() => lcuAssetToCommunityDragon(props.path));
 /** 不是 LCU 路径但本身就能当 src 用（http(s) / data: / 站内绝对路径）。 */
 const directUrl = computed(() => {
@@ -34,12 +40,13 @@ watchEffect((onCleanup) => {
   let active = true;
   onCleanup(() => { active = false; });
   failed.value = false;
-  source.value = "";
-  const path = props.path;
-  if (!path || !isLcuAssetPath(path) || !isTauri()) return;
-  void backend.assetPath(path)
-    .then((asset) => {
-      if (active && asset.dataUrl) source.value = asset.dataUrl;
+  const key = assetKey.value;
+  // 缓存命中时同步就有值，重挂不再闪一下占位。
+  source.value = key ? peekAsset(key) : "";
+  if (!key || !isTauri()) return;
+  void cachedAsset(key, () => backend.assetPath(props.path ?? "").then((asset) => asset.dataUrl ?? ""))
+    .then((url) => {
+      if (active && url) source.value = url;
     })
     .catch(() => {
       // 交给 CommunityDragon 兜底，这里不标记失败。

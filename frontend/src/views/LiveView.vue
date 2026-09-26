@@ -36,13 +36,20 @@ const MAX_RECENT_MATCHES = 20;
 const initialRosterReady = ref(!isTauri());
 const lastSuccessfulLobbyRequestStartedAt = ref(0);
 let forceNextLobby = false;
-// 没有原生推送通道（native_sdk 只提供 request/response），改用版本号 +
-// 自适应轮询：连续多次收到 unchanged 时把轮询间隔拉长，避免原地空转。
-// 进度推进到下一名玩家（后端 live_lobby_version 自增）时立刻收回正常节奏。
+// 没有原生推送通道（native_sdk 只提供 request/response），只能靠版本号轮询。
+//
+// 加载进行中**固定**短间隔。后端已改成「整批一次发布」：一次加载只自增一次
+// live_lobby_version，中间过程反复收到 unchanged。要是这里仍按 unchanged 退避，
+// 退避爬到 2.5s 之后，那一批数据也会被推后 2.5s 才看到——本该更快的观感反而更差。
+// 用一个时间预算兜底：批次卡住（worker 挂死）时不至于一直空转，超预算后退回退避节奏。
+const LOADING_POLL_MS = 400;
+const LOADING_POLL_BUDGET_MS = 8000;
 const LOADING_POLL_BACKOFF_MS = [750, 1500, 2500, 4000, 6000] as const;
 let unchangedStreak = 0;
 let lastObservedVersion: number | null = null;
+let loadingElapsedMs = 0;
 function nextLoadingInterval() {
+  if (loadingElapsedMs < LOADING_POLL_BUDGET_MS) return LOADING_POLL_MS;
   const index = Math.min(unchangedStreak, LOADING_POLL_BACKOFF_MS.length - 1);
   return LOADING_POLL_BACKOFF_MS[index];
 }
@@ -55,10 +62,11 @@ async function fetchLobby() {
   const snapshotVersion = (snapshot as { version?: number }).version ?? null;
   const wasUnchanged = (snapshot as { unchanged?: boolean }).unchanged === true;
   if (snapshotVersion !== null) {
-    // 版本号变化说明有人刚刚完成加载，立刻收回节奏，避免错过下一名玩家的推送窗口。
+    // 版本号变化＝这一批资料已经整批落地（后端一次加载只自增一次），立刻收回节奏。
     if (lastObservedVersion !== null && snapshotVersion !== lastObservedVersion) unchangedStreak = 0;
     lastObservedVersion = snapshotVersion;
   }
+  loadingElapsedMs = snapshot.loading?.elapsedMs ?? 0;
   if (snapshot.loading?.active) unchangedStreak = wasUnchanged ? unchangedStreak + 1 : 0;
   else unchangedStreak = 0;
   return snapshot;

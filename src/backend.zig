@@ -1319,8 +1319,8 @@ fn getLiveLobby(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
     if (self.mode != .live) return getLiveLobbyInternal(context, invocation, output, false);
     if (self.live_lobby_len == 0) return error.LobbyLoading;
     if (!self.is_snapshot) try startLiveLoading(self);
-    // 加载期间前端每 750ms 问一次进度，但十个人里往往只有一两个刚完成。
-    // 快照内容没变就只回版本号和进度，避免反复传输并重建整份 244KB 阵容。
+    // 加载期间前端按短间隔问进度。发布改成「整批一次」之后，一批没落地之前
+    // 快照内容不会变，只回版本号 + 进度就够了，省掉反复传输并重建整份 244KB 阵容。
     if (!payload.force and payload.sinceVersion != 0 and payload.sinceVersion == self.live_lobby_version) {
         return liveProgressResponse(self, output);
     }
@@ -1504,6 +1504,8 @@ fn runLiveLoadJobs(batch: *LiveLoadBatch, client: lcu.Client, current: std.json.
     batch.total = jobs.items.len;
     batch.parent.command_mutex.unlock();
     batch.queue.run();
+    // 全部 worker 退出后再发布：这次加载只产生一次版本自增，前端一次拿到整批人。
+    publishLoadedProfiles(batch);
     batch.jobs = &.{};
 }
 
@@ -1514,18 +1516,42 @@ fn loadLivePlayer(context: *anyopaque, index: usize) void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const profile = if (job.failure == null) std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), job.output.?[0..job.output_len], .{}) catch null else null;
+    // 这里**不发布**：发布整体挪到 `queue.run()` 之后一次做完（见 publishLoadedProfiles）。
+    // 逐人发布会让 live_lobby_version 一位玩家跳一次，界面就成「一个人一个人冒出来」。
     lockBackendMutex(&batch.parent.command_mutex);
     defer batch.parent.command_mutex.unlock();
     if (batch.generation != batch.parent.live_generation or batch.parent.mode != .live or batch.queue.cancelled.load(.acquire)) return;
     batch.completed += 1;
     if (batch.first_player_ms == null) batch.first_player_ms = runtimeMonotonicMillis(batch.snapshot) - batch.started_ms;
     if (profile == null or !jsonBool(profile.?, "dataComplete")) batch.failed += 1;
-    if (profile) |value| {
-        var publication = value;
+}
+
+/// `queue.run()` 返回后统一发布。
+///
+/// 此时所有 worker 都已退出，`job.output` 仍然挂在 `runLiveLoadJobs` 的 arena 上，
+/// 可以安全地再解析一遍——不需要让 worker 把 profile 跨线程搬运。
+fn publishLoadedProfiles(batch: *LiveLoadBatch) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var entries: std.array_list.Managed(LiveProfilePublication) = .init(allocator);
+    for (batch.jobs) |job| {
+        const output = job.output orelse continue;
+        if (job.failure != null or job.output_len == 0) continue;
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, output[0..job.output_len], .{}) catch continue;
+        if (parsed != .object) continue;
+        // 和逐人发布时一样：把最终身份写进资料，`updateLiveProfileArray` 靠它认人。
+        // `put` 需要可变绑定，所以这里必须先拷进 var（`parsed` 是 const）。
+        var publication = parsed;
         const key = jsonField(job.player, "rosterKey");
-        publication.object.put(arena.allocator(), "rosterKey", .{ .string = if (key.len > 0) key else jsonField(job.player, "puuid") }) catch return;
-        publishLiveProfile(batch.parent, job.player, publication, job.side, job.index) catch {};
+        publication.object.put(allocator, "rosterKey", .{ .string = if (key.len > 0) key else jsonField(job.player, "puuid") }) catch continue;
+        entries.append(.{ .original = job.player, .profile = publication, .side = job.side, .index = job.index }) catch continue;
     }
+    if (entries.items.len == 0) return;
+    lockBackendMutex(&batch.parent.command_mutex);
+    defer batch.parent.command_mutex.unlock();
+    if (batch.generation != batch.parent.live_generation or batch.parent.mode != .live or batch.queue.cancelled.load(.acquire)) return;
+    publishLiveProfiles(batch.parent, entries.items) catch {};
 }
 
 pub fn verifyLiveProfilePipeline(io: std.Io, port: u16) !void {
@@ -1573,31 +1599,51 @@ pub fn verifyLiveProfilePipeline(io: std.Io, port: u16) !void {
     std.debug.print("原生十人资料验证：身份、英雄及战绩逐人对应，首名 {d} 毫秒，全部 {d} 毫秒\n", .{ batch.first_player_ms orelse 0, runtimeMonotonicMillis(state) - batch.started_ms });
 }
 
-fn publishLiveProfile(self: *Runtime, original: std.json.Value, profile: std.json.Value, target_side: []const u8, target_index: usize) !void {
+/// 一条待写入快照的玩家资料。
+const LiveProfilePublication = struct {
+    /// 快照里定位槽位用的原始条目（发布时要按 rosterKey / 身份校验，防止写到别人身上）。
+    original: std.json.Value,
+    profile: std.json.Value,
+    side: []const u8,
+    index: usize,
+};
+
+/// 把一批玩家资料**一次性**写进快照。
+///
+/// 为什么必须是批量的：`cacheLiveLobby` 每次都会自增 `live_lobby_version`，而前端只能靠
+/// 版本号轮询发现新数据。逐人发布（每位 worker 一完成就写一次）会把一次加载切成 N 次
+/// 版本跳变，界面看到的就是「一个人一个人冒出来」——这正是用户报的现象。
+/// 这里解析一次、应用全部、序列化一次、缓存一次，版本号只跳一次，界面一次拿到全部人。
+/// 顺带把原本 N 次 244KB 的解析 + 序列化（而且全程压在 command_mutex 上、会堵住轮询）
+/// 压成 1 次。
+fn publishLiveProfiles(self: *Runtime, entries: []const LiveProfilePublication) !void {
+    if (entries.len == 0) return;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     var root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, self.live_lobby[0..self.live_lobby_len], .{ .allocate = .alloc_always });
     if (root != .object) return;
-    // 两处结构（根级 ally/enemy 与 teams[]）用的是同一批玩家，摘要只算一次：
-    // 每次计算都要把整队重新序列化再解析回来，是发布路径上最贵的一步。
-    var shared_summary: ?std.json.Value = null;
-    for ([_][]const u8{ "ally", "enemy" }) |side| {
-        if (!std.mem.eql(u8, side, target_side)) continue;
-        if (root.object.getPtr(side)) |list| {
-            try updateLiveProfileArray(allocator, list, original, profile, target_index);
-            shared_summary = try liveSummaryValue(allocator, side, list.*);
-            try root.object.put(allocator, if (std.mem.eql(u8, side, "ally")) "allySummary" else "enemySummary", shared_summary.?);
+    for (entries) |entry| {
+        // 两处结构（根级 ally/enemy 与 teams[]）用的是同一批玩家，摘要只算一次：
+        // 每次计算都要把整队重新序列化再解析回来，是发布路径上最贵的一步。
+        var shared_summary: ?std.json.Value = null;
+        for ([_][]const u8{ "ally", "enemy" }) |side| {
+            if (!std.mem.eql(u8, side, entry.side)) continue;
+            if (root.object.getPtr(side)) |list| {
+                try updateLiveProfileArray(allocator, list, entry.original, entry.profile, entry.index);
+                shared_summary = try liveSummaryValue(allocator, side, list.*);
+                try root.object.put(allocator, if (std.mem.eql(u8, side, "ally")) "allySummary" else "enemySummary", shared_summary.?);
+            }
         }
-    }
-    if (root.object.getPtr("teams")) |teams| if (teams.* == .array) for (teams.array.items) |*team| {
-        if (!std.mem.eql(u8, jsonField(team.*, "side"), target_side)) continue;
-        if (team.* == .object) if (team.object.getPtr("players")) |players| {
-            try updateLiveProfileArray(allocator, players, original, profile, target_index);
-            const summary = shared_summary orelse try liveSummaryValue(allocator, jsonField(team.*, "side"), players.*);
-            try team.object.put(allocator, "summary", summary);
+        if (root.object.getPtr("teams")) |teams| if (teams.* == .array) for (teams.array.items) |*team| {
+            if (!std.mem.eql(u8, jsonField(team.*, "side"), entry.side)) continue;
+            if (team.* == .object) if (team.object.getPtr("players")) |players| {
+                try updateLiveProfileArray(allocator, players, entry.original, entry.profile, entry.index);
+                const summary = shared_summary orelse try liveSummaryValue(allocator, jsonField(team.*, "side"), players.*);
+                try team.object.put(allocator, "summary", summary);
+            };
         };
-    };
+    }
     var timestamp_buffer: [64]u8 = undefined;
     var stamp_writer = std.Io.Writer.fixed(&timestamp_buffer);
     try writeIsoTimestamp(&stamp_writer, runtimeNowMillis(self));
@@ -1608,6 +1654,12 @@ fn publishLiveProfile(self: *Runtime, original: std.json.Value, profile: std.jso
     try stringify.write(root);
     cacheLiveLobby(self, writer.buffered());
     if (lobbyIsChampSelectSnapshot(writer.buffered())) cacheChampSelectLobby(self, writer.buffered());
+}
+
+/// 单人写入。只给「单个玩家资料后到」的场景用（验证与补写）；
+/// 整批加载一律走 `publishLiveProfiles`，别在循环里调这个。
+fn publishLiveProfile(self: *Runtime, original: std.json.Value, profile: std.json.Value, target_side: []const u8, target_index: usize) !void {
+    return publishLiveProfiles(self, &.{.{ .original = original, .profile = profile, .side = target_side, .index = target_index }});
 }
 
 fn updateLiveProfileArray(allocator: std.mem.Allocator, list: *std.json.Value, original: std.json.Value, profile: std.json.Value, target_index: usize) !void {
@@ -4569,18 +4621,43 @@ fn writeParticipant(writer: *std.Io.Writer, participant: std.json.Value, self_te
     try writer.print(",\"heal\":{d},\"damageShare\":{d:.4},\"damageTakenShare\":{d:.4},\"killParticipation\":{d:.4},\"towerDamage\":{d},\"turretKills\":{d},\"wardsPlaced\":{d},\"wardsKilled\":{d},\"visionScore\":{d},\"visionWardsBought\":{d},\"sightWardsBought\":{d}}}", .{ statInt(participant, "totalHeal"), ratio(damage, team_damage), ratio(taken, team_taken), killParticipationRatio(kills, assists, team_kills), statInt(participant, "damageDealtToTurrets"), statInt(participant, "turretKills"), statInt(participant, "wardsPlaced"), statInt(participant, "wardsKilled"), statInt(participant, "visionScore"), statInt(participant, "visionWardsBoughtInGame"), statInt(participant, "sightWardsBoughtInGame") });
 }
 
+/// 位置字段的优先级：点名位置（match-v5 / SGP 的 `teamPosition`、`individualPosition`、
+/// `positionAssignedByMatchmaking`）→ 退到 LCU 裁剪版的 `timeline.lane`。
+///
+/// ⚠️ **LCU/腾讯服的 `timeline.lane` 会把上单写成 `JUNGLE`**（2026-09-26 直连客户端实测）：
+/// 上单和打野的 `timeline.role` 都是 `NONE`，服务端把这两个位置一起塞进了 `JUNGLE`
+/// —— 同一局里上单 DrMundo/Jax 的 `lane` 是 `JUNGLE`，打野 Viego/Warwick 也是 `JUNGLE`，
+/// 而 SGP 的 `teamPosition` 明确分别是 `TOP` / `JUNGLE`。
+/// 所以 `lane == JUNGLE` **不能直接采信**，必须用惩戒（11 号召唤师技能）消歧：
+/// 带惩戒的是打野，不带的就是上单（SR 里打野必带惩戒；ARAM 这类无分路模式 `lane` 是
+/// `NONE`，压根走不到这一支）。字段口径见 `shortcut_service.hasSmitePlayer`。
+///
+/// 点名位置可靠，故只在**由 `lane` 推导**时才做这层消歧。
 fn participantPosition(participant: std.json.Value) []const u8 {
-    for ([_][]const u8{ "teamPosition", "individualPosition", "positionAssignedByMatchmaking", "position", "lane" }) |field| {
+    for ([_][]const u8{ "teamPosition", "individualPosition", "positionAssignedByMatchmaking", "position" }) |field| {
         const value = jsonField(participant, field);
         if (value.len > 0 and !std.ascii.eqlIgnoreCase(value, "NONE") and !std.ascii.eqlIgnoreCase(value, "INVALID")) return value;
     }
-    if (nestedObject(participant, "timeline")) |timeline| {
-        const lane = jsonField(timeline, "lane");
-        const role = jsonField(timeline, "role");
-        if (std.ascii.eqlIgnoreCase(lane, "BOTTOM") and std.ascii.eqlIgnoreCase(role, "DUO_SUPPORT")) return "UTILITY";
-        if (lane.len > 0 and !std.ascii.eqlIgnoreCase(lane, "NONE") and !std.ascii.eqlIgnoreCase(lane, "INVALID")) return lane;
-    }
-    return "";
+    const timeline = nestedObject(participant, "timeline");
+    const lane = blk: {
+        const direct = jsonField(participant, "lane");
+        if (direct.len > 0) break :blk direct;
+        if (timeline) |value| break :blk jsonField(value, "lane");
+        break :blk "";
+    };
+    if (lane.len == 0 or std.ascii.eqlIgnoreCase(lane, "NONE") or std.ascii.eqlIgnoreCase(lane, "INVALID")) return "";
+    const role = blk: {
+        if (timeline) |value| {
+            const nested = jsonField(value, "role");
+            if (nested.len > 0) break :blk nested;
+        }
+        break :blk jsonField(participant, "role");
+    };
+    if (std.ascii.eqlIgnoreCase(lane, "BOTTOM") and
+        (std.ascii.eqlIgnoreCase(role, "DUO_SUPPORT") or std.ascii.eqlIgnoreCase(role, "SUPPORT"))) return "UTILITY";
+    if (std.ascii.eqlIgnoreCase(lane, "JUNGLE"))
+        return if (shortcut_service.hasSmitePlayer(participant)) "JUNGLE" else "TOP";
+    return lane;
 }
 
 fn writeItems(writer: *std.Io.Writer, participant: std.json.Value) !void {
@@ -7548,6 +7625,59 @@ test "资料发布更新双方视图和队伍摘要并保留当前英雄" {
     try std.testing.expectEqual(@as(i64, 75), jsonInt(team.object.get("summary").?, "score"));
 }
 
+// 「整批一次发布」是这一版的核心不变量：逐人发布会把一次加载切成 N 次
+// cacheLiveLobby + N 次版本变化，前端按版本号轮询就会「一个人一个人冒出来」。
+// 原子性本身由「只有一个调用点、且在 queue.run() 之后」保证（这个测试测不了并发），
+// 这里钉住的是另外两件能测的事：一次调用写完整批，以及空批次是彻底的空操作
+// —— 一次没有内容的「发布」不该让前端以为有新数据到了。
+test "整批发布一次写完整批玩家，空批次不产生版本变化" {
+    var state = Runtime.init();
+    // 占位身份用**纯数字**（身份质量低），真实资料用中文 puuid（质量高）——
+    // `updateLiveProfileArray` 只在「新身份质量更高」时才改写 puuid，
+    // 两边同为高质量时会被判成没有升级，看不到任何变化。
+    const lobby =
+        \\{"id":"789","phase":"InProgress","ally":[{"puuid":"111","gameName":"未知玩家","championId":1,"recentMatches":[],"score":{"total":0}},{"puuid":"222","gameName":"未知玩家","championId":2,"recentMatches":[],"score":{"total":0}}],"enemy":[]}
+    ;
+    cacheLiveLobby(&state, lobby);
+    const before = state.live_lobby_version;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    try publishLiveProfiles(&state, &.{});
+    try std.testing.expectEqual(before, state.live_lobby_version);
+
+    const first = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"puuid\":\"111\"}", .{});
+    const second = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"puuid\":\"222\"}", .{});
+    const first_profile = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"puuid":"真实甲","rosterKey":"111","gameName":"甲","championId":1,"recentMatches":[{"gameId":55}],"score":{"total":10},"dataComplete":true}
+    , .{});
+    const second_profile = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"puuid":"真实乙","rosterKey":"222","gameName":"乙","championId":2,"recentMatches":[{"gameId":77}],"score":{"total":20},"dataComplete":true}
+    , .{});
+    try publishLiveProfiles(&state, &.{
+        .{ .original = first, .profile = first_profile, .side = "ally", .index = 0 },
+        .{ .original = second, .profile = second_profile, .side = "ally", .index = 1 },
+    });
+
+    const updated = try std.json.parseFromSliceLeaky(std.json.Value, allocator, state.live_lobby[0..state.live_lobby_len], .{});
+    const players = updated.object.get("ally").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), players.len);
+    // 两个人必须都已经是「这一批写过」的状态：发布只调一次，前端不可能读到
+    // 「第一个写完了、第二个还没写」的中间快照。
+    try std.testing.expectEqualStrings("真实甲", jsonField(players[0], "puuid"));
+    try std.testing.expectEqualStrings("真实乙", jsonField(players[1], "puuid"));
+    for (players) |player| try std.testing.expectEqual(@as(usize, 1), profileArrayLen(player, "recentMatches"));
+    // 阵型字段仍以当前阵容为准（不会被资料里的旧值覆盖）。
+    try std.testing.expectEqual(@as(i64, 1), jsonInt(players[0], "championId"));
+    try std.testing.expectEqual(@as(i64, 2), jsonInt(players[1], "championId"));
+    // 摘要是按**整批写完之后**的名单算的。`score` 是队均值而不是总和
+    // （单人时 10 和总和长得一样，只有两个人才看得出差别）：
+    // 10 与 20 → 15。要是摘要在写到一半时算过一次，这里会停在 10。
+    try std.testing.expectEqual(@as(i64, 15), jsonInt(updated.object.get("allySummary").?, "score"));
+}
+
 test "全零身份不能匹配玩家且五个敌方占位保持独立" {
     const empty_id = "00000000-0000-0000-0000-000000000000";
     try std.testing.expect(!samePuuid(empty_id, empty_id));
@@ -8789,6 +8919,51 @@ test "collects nested summoner spell fields for smite detection" {
     const spells = parsed.value.object.get("summonerSpells").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), spells.len);
     try std.testing.expectEqual(@as(i64, 11), spells[0].object.get("id").?.integer);
+}
+
+// 用户在历史里看到「我玩上路被写成打野」，根因是 LCU 裁剪版的 `timeline.lane`
+// 把上单归进了 JUNGLE（上单/打野的 `role` 都是 NONE）。这里用一份**真实的
+// LCU 形状**（2026-09-26 直连客户端抓的 440 排位）把四种座位钉住。
+test "disambiguates LCU timeline lane where top laners are reported as jungle" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // 上单 DrMundo：lane 被服务端写成 JUNGLE，角色 NONE，没带惩戒 → 必须还原成 TOP。
+    const top = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        "{\"championId\":36,\"teamId\":100,\"spell1Id\":6,\"spell2Id\":4,\"timeline\":{\"lane\":\"JUNGLE\",\"role\":\"NONE\"}}", .{});
+    try std.testing.expectEqualStrings("TOP", participantPosition(top));
+
+    // 同局打野 Viego：lane 同样是 JUNGLE，但带惩戒 → 保持 JUNGLE。
+    const jungle = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        "{\"championId\":234,\"teamId\":100,\"spell1Id\":4,\"spell2Id\":11,\"timeline\":{\"lane\":\"JUNGLE\",\"role\":\"NONE\"}}", .{});
+    try std.testing.expectEqualStrings("JUNGLE", participantPosition(jungle));
+
+    // 辅助 Pantheon：lane BOTTOM + role SUPPORT → 辅助（旧口径只认 DUO_SUPPORT，会错报下路）。
+    const support = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        "{\"championId\":80,\"teamId\":100,\"spell1Id\":4,\"spell2Id\":14,\"timeline\":{\"lane\":\"BOTTOM\",\"role\":\"SUPPORT\"}}", .{});
+    try std.testing.expectEqualStrings("UTILITY", participantPosition(support));
+
+    // 中路 Fizz 不受影响。
+    const mid = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        "{\"championId\":105,\"teamId\":100,\"spell1Id\":14,\"spell2Id\":4,\"timeline\":{\"lane\":\"MIDDLE\",\"role\":\"SOLO\"}}", .{});
+    try std.testing.expectEqualStrings("MIDDLE", participantPosition(mid));
+
+    // ARAM（lane NONE）不该被编出一个分路来。
+    const aram = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        "{\"championId\":36,\"teamId\":100,\"spell1Id\":4,\"spell2Id\":14,\"timeline\":{\"lane\":\"NONE\",\"role\":\"SUPPORT\"}}", .{});
+    try std.testing.expectEqualStrings("", participantPosition(aram));
+
+    // SGP/match-v5 的 teamPosition 是权威值：**即使不带惩戒**也按它来，
+    // 不能被上面的消歧逻辑误改成 TOP。
+    const sgp = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        "{\"championId\":64,\"teamPosition\":\"JUNGLE\",\"individualPosition\":\"JUNGLE\",\"lane\":\"JUNGLE\",\"role\":\"NONE\"}", .{});
+    try std.testing.expectEqualStrings("JUNGLE", participantPosition(sgp));
+
+    // 顺带把「SGP 少一个字段」的形状也钉一下：只有 individualPosition。
+    const individual = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        "{\"championId\":875,\"individualPosition\":\"TOP\"}", .{});
+    try std.testing.expectEqualStrings("TOP", participantPosition(individual));
 }
 
 test "maps premade group identifiers into player profile evidence" {

@@ -120,9 +120,9 @@ export const backend = {
   },
   async lobby(force = false): Promise<LiveLobby> {
     if (usesFixtureData()) return browserBackend.lobby();
-    // 加载期间界面每 750ms 问一次进度，但十个人里往往只有一两个刚完成。
-    // 带上一次收到的版本号，快照内容没变时后端只回进度，省掉整份阵容的
-    // 传输与前端重建。
+    // 加载期间界面按 LOADING_POLL_MS 的节奏问进度（见 LiveView），后端则改成
+    // 「整批一次发布」，中间过程只会反复回 unchanged；带上一次收到的版本号，
+    // 后端就能只回进度（外加总人数 / 已完成数），省掉整份 244KB 阵容的传输与前端重建。
     const response = await command<LiveLobby & { version?: number; unchanged?: boolean }>("get_live_lobby", { force, sinceVersion: lastLobbyVersion });
     if (typeof response.version === "number") lastLobbyVersion = response.version;
     const merged = response.unchanged && lastLobby ? { ...lastLobby, loading: response.loading } : response;

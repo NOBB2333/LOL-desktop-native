@@ -20,11 +20,18 @@ export function clockOf(seconds: number): string {
   return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
 }
 
-/** 1.2k 这种紧凑写法：折线图的 Y 轴只有几十像素宽，写全数字会被挤爆。 */
+/**
+ * 1.2k 这种紧凑写法：折线图的 Y 轴只有几十像素宽，写全数字会被挤爆。
+ *
+ * 小数位只在**三位数 k**（≥100k）时才舍掉，`6.5k / 10.5k / 24.3k` 都要保住小数——
+ * 之前是 ≥10k 就 `toFixed(0)`，于是两位数的 k 全变成 `10k/11k/12k`，
+ * 用户看到的就是「一过 10k 小数就没了」。
+ */
 export function compactGold(value: number): string {
   const abs = Math.abs(Math.round(value));
   if (abs < 1000) return String(abs);
-  return `${(abs / 1000).toFixed(abs >= 10000 ? 0 : 1)}k`;
+  const k = abs / 1000;
+  return `${k.toFixed(k >= 100 ? 0 : 1)}k`;
 }
 
 /** 带符号的经济差，用于「谁领先多少」。 */
