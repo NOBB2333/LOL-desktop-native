@@ -1991,6 +1991,24 @@ fn getLiveLobbyInternal(context: *anyopaque, invocation: native_sdk.bridge.Invoc
                 return merged;
             };
 
+            // 房间阶段但**没有房间 session**：用户已经退回到「选择模式」的表面，还没
+            // 真正进房间（`/lol-lobby/v2/lobby` 是 404）。缓存里那份是**上一局**的十人
+            // 名单，旧代码只把 `phase` 字段换成 "Lobby" 就端出去了——界面因此一直摆着
+            // 上一局的十个人（用户报的「房间里还是那5个人」）。这里改成返回一份**空房间**
+            // 名单：这个阶段本来就没人可显示。
+            const room_without_session = isLobbyPhase(phase) and self.live_lobby_len > 0 and
+                !lobbyIsRoomSnapshot(self.live_lobby[0..self.live_lobby_len]);
+            if (room_without_session) {
+                const catalog = cachedGameAsset(self, client, "champions", "/lol-game-data/assets/v1/champion-summary.json") catch null;
+                defer if (catalog) |catalog_json| std.heap.page_allocator.free(catalog_json);
+                const queues = cachedGameAsset(self, client, "queues", "/lol-game-data/assets/v1/queues.json") catch null;
+                defer if (queues) |queue_json| std.heap.page_allocator.free(queue_json);
+                const empty_room = liveSessionEnvelopePhaseContext(self, client, "{}", null, null, phase, current, catalog orelse "[]", queues orelse "[]", output, false) catch return error.LcuRequestFailed;
+                self.live_roster_hash = 0;
+                self.live_lobby_enriched = false;
+                cacheLiveLobby(self, empty_room);
+                return empty_room;
+            }
             if (self.live_lobby_len > 0) {
                 return liveLobbyCacheWithPhase(self, phase, output) catch {
                     @memcpy(output[0..self.live_lobby_len], self.live_lobby[0..self.live_lobby_len]);
@@ -2123,6 +2141,11 @@ const LobbyIdentity = struct {
     /// 又**保留重复度**（异或会让同名的两个座位互相抵消），且不用额外分配。
     roster: u64 = 0,
     roster_count: usize = 0,
+    /// 这份快照是不是「房间 / 匹配中」的赛前名单。
+    ///
+    /// 房间名单是**权威**名单：`/lol-lobby/v2/lobby` 的 `members` 就是当前房间里
+    /// 全部可见的人，人少是**真的**只有这么几个人，不是「还没加载出来」的过渡态。
+    room: bool = false,
 };
 
 /// 只公开了本地一个人的占位名单（游戏刚启动那一两个轮询）。
@@ -2134,6 +2157,8 @@ const lobby_single_player_roster: usize = 1;
 fn lobbyIdentity(root: std.json.Value) LobbyIdentity {
     var identity = LobbyIdentity{ .game_id = lobbyGameIdValue(root) };
     if (root != .object) return identity;
+    const phase = jsonField(root, "phase");
+    identity.room = std.mem.eql(u8, phase, "Lobby") or std.mem.eql(u8, phase, "Matchmaking");
     var sum: u64 = 0;
     for ([_][]const u8{ "ally", "enemy" }) |side| {
         const players = root.object.get(side) orelse continue;
@@ -2189,6 +2214,16 @@ fn lobbyIdentitiesCompatible(left: LobbyIdentity, right: LobbyIdentity) bool {
     if (left.game_id > 0 and right.game_id > 0) return left.game_id == right.game_id;
     if (left.roster_count == 0 or right.roster_count == 0) return true;
     if (left.roster == right.roster and left.roster_count == right.roster_count) return true;
+    // 房间 ↔ 非房间（选人 / 局内）：判为**两份不同的名单**。
+    //
+    // 用户报告的症状就出在这里：一局打完回到房间，房间这份名单只有 1 个人，而
+    // 缓存里还留着上一局的十个人。旧规则见 `lobby_single_player_roster`，会把
+    // 「人数 ≤ 1」当成过渡态放行，于是上一局的十个人被并回房间里，界面就成了
+    // 「房间里还是那5个人」。
+    //
+    // 反过来同样成立：房间 → 选人时，也不该把房间里的队友并进选人名单。
+    if (left.room or right.room) return false;
+    // 只有**局内**才会出现 allPlayers 短暂只公开本地一人的过渡态，此时才允许并缓存补拓扑。
     return left.roster_count <= lobby_single_player_roster or right.roster_count <= lobby_single_player_roster;
 }
 
@@ -2360,6 +2395,14 @@ fn mergeLobbyTeam(allocator: std.mem.Allocator, base: std.json.Value, dynamic: *
     const live_is_topology = dynamic.array.items.len >= base.array.items.len;
     const primary = if (live_is_topology) dynamic.array.items else base.array.items;
     const fallback = if (live_is_topology) base.array.items else dynamic.array.items;
+    // 「这两个座位是同一个人，只是名字还没公开」——这个判断只有在两边**阵容形状
+    // 一致**时才成立（选人 → 开局：两边都是 10 个座位，新的一边只是还没有名字）。
+    //
+    // 形状不同就说明两边根本不是同一份名单：缓存里是上一局的十个人、候选是房间里的
+    // 一两个人。这时还允许按下标硬凑，就会把**别人**的身份写到这个座位上——用户的
+    // 「有两个我 / 有人名字被识别成我」正是这么来的：座位 0 是别人的英雄（145），
+    // 身份却被换成了我，于是界面上出现两个「我」。
+    const same_shape = base.array.items.len == dynamic.array.items.len;
     var used: [16]bool = [_]bool{false} ** 16;
     var merged = std.json.Array.init(allocator);
     try merged.ensureTotalCapacity(primary.len);
@@ -2372,7 +2415,7 @@ fn mergeLobbyTeam(allocator: std.mem.Allocator, base: std.json.Value, dynamic: *
                 break;
             }
         }
-        if (matched == null and index < fallback.len and index < used.len and !used[index]) {
+        if (matched == null and same_shape and index < fallback.len and index < used.len and !used[index]) {
             const unresolved = !profileHasKnownName(member) or profileIdentityQuality(member) < 2;
             if (unresolved and !profileNamesConflict(member, fallback[index])) matched = index;
         }
@@ -9488,4 +9531,138 @@ fn writeProfileWithGroupIndexed(writer: *std.Io.Writer, participant: std.json.Va
     try writer.writeAll(",\"positionGames\":0,\"positionWinRate\":0,\"currentChampionGames\":0,\"currentChampionWinRate\":0,\"championPoolConcentration\":0,\"dataComplete\":false,\"unavailableSources\":[\"lcu\"],\"dataStatus\":{\"source\":\"lcu\",\"fetchedAt\":\"1970-01-01T00:00:00.000Z\",\"expiresAt\":null,\"isStale\":false,\"error\":null},\"side\":");
     try jsonString(writer, side);
     try writer.writeByte('}');
+}
+
+test "房间名单是权威名单，不会被上一局的十人缓存并回来" {
+    var state = Runtime.init();
+    // 刚打完的一局：十个人都在缓存里，座位 0 是别人（英雄 145），座位 3 是我。
+    const finished_game =
+        "{\"id\":\"901079838957\",\"queueId\":2400,\"gameMode\":\"海克斯大乱斗\",\"phase\":\"InProgress\",\"ally\":[" ++
+        "{\"puuid\":\"other-1\",\"championId\":145,\"recentMatches\":[{\"gameId\":1}]}," ++
+        "{\"puuid\":\"other-2\",\"championId\":157,\"recentMatches\":[{\"gameId\":2}]}," ++
+        "{\"puuid\":\"other-3\",\"championId\":55,\"recentMatches\":[{\"gameId\":3}]}," ++
+        "{\"puuid\":\"self\",\"championId\":85,\"recentMatches\":[{\"gameId\":9}]}," ++
+        "{\"puuid\":\"other-5\",\"championId\":875,\"recentMatches\":[{\"gameId\":5}]}]," ++
+        "\"enemy\":[{\"puuid\":\"foe-1\",\"championId\":245},{\"puuid\":\"foe-2\",\"championId\":161}]}";
+    cacheLiveLobby(&state, finished_game);
+    try std.testing.expectEqual(@as(usize, 7), lobbyRosterCount(state.live_lobby[0..state.live_lobby_len]));
+
+    // 打完回到房间：房间里只有我自己。
+    const room =
+        "{\"id\":\"lcu-session\",\"queueId\":2400,\"gameMode\":\"海克斯大乱斗\",\"phase\":\"Lobby\"," ++
+        "\"ally\":[{\"puuid\":\"self\",\"gameName\":\"我\",\"championId\":85,\"recentMatches\":[{\"gameId\":9}]}]," ++
+        "\"enemy\":[]}";
+    var output: [64 * 1024]u8 = undefined;
+    const merged = try mergeWithBestLiveCache(&state, room, false, &output);
+    // 房间名单就是全部可见的人：只有我自己，敌方为空。
+    try std.testing.expectEqual(@as(usize, 1), lobbyRosterCount(merged));
+    try std.testing.expect(std.mem.indexOf(u8, merged, "other-1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "foe-1") == null);
+    try std.testing.expectEqual(@as(usize, 0), lobbyIdentityOf(merged, "enemy").roster_count);
+    // 而且房间里不会出现两个「我」。
+    try std.testing.expectEqual(@as(usize, 1), identityOccurrences(merged, "self"));
+}
+
+test "房间与非房间两份快照互相不认，房间也不能并进选人名单" {
+    const room = "{\"id\":\"lcu-session\",\"phase\":\"Lobby\",\"ally\":[{\"puuid\":\"self\"}],\"enemy\":[]}";
+    // 两边名单本来就不同（房间 1 人 vs 局内 2 人），所以走的是「人数不一致」那条判定。
+    const in_game = "{\"id\":\"777\",\"phase\":\"InProgress\",\"ally\":[{\"puuid\":\"self\"},{\"puuid\":\"other-1\"}],\"enemy\":[]}";
+    const champ_select = "{\"id\":\"777\",\"phase\":\"ChampSelect\",\"ally\":[{\"puuid\":\"self\"},{\"puuid\":\"other-1\"}],\"enemy\":[]}";
+    try std.testing.expect(!lobbyIdsCompatible(room, in_game));
+    try std.testing.expect(!lobbyIdsCompatible(room, champ_select));
+    try std.testing.expect(!lobbyIdsCompatible(in_game, room));
+    // 同一个人、同一份名单时仍然互认（房间 ↔ 房间、局内 ↔ 局内）。
+    try std.testing.expect(lobbyIdsCompatible(
+        "{\"id\":\"0\",\"phase\":\"Lobby\",\"ally\":[{\"puuid\":\"self\"}],\"enemy\":[]}",
+        "{\"id\":\"lcu-session\",\"phase\":\"Matchmaking\",\"ally\":[{\"puuid\":\"self\"}],\"enemy\":[]}",
+    ));
+    // 局内的「只有一个我」过渡态仍然允许并入缓存补足十人拓扑。
+    try std.testing.expect(lobbyIdsCompatible(
+        "{\"id\":\"0\",\"phase\":\"InProgress\",\"ally\":[{\"puuid\":\"self\"}],\"enemy\":[]}",
+        "{\"id\":\"0\",\"phase\":\"InProgress\",\"ally\":[{\"puuid\":\"self\"},{\"puuid\":\"other-1\"}],\"enemy\":[]}",
+    ));
+}
+
+test "形状不同的两份名单不会按下标互换身份" {
+    // 缓存是五个人的一局（座位 0 是别人、还没有公开名字），候选是新的一份只有我自己的名单。
+    // 旧代码会按下标把「我」的身份写到座位 0 上，界面上就出现两个「我」。
+    const base =
+        "{\"id\":\"777\",\"phase\":\"InProgress\",\"ally\":[" ++
+        "{\"puuid\":\"other-1\",\"championId\":145,\"recentMatches\":[{\"gameId\":1}]}," ++
+        "{\"puuid\":\"other-2\",\"championId\":157,\"recentMatches\":[{\"gameId\":2}]}," ++
+        "{\"puuid\":\"other-3\",\"championId\":55,\"recentMatches\":[{\"gameId\":3}]}," ++
+        "{\"puuid\":\"self\",\"championId\":85,\"recentMatches\":[{\"gameId\":9}]}," ++
+        "{\"puuid\":\"other-5\",\"championId\":875,\"recentMatches\":[{\"gameId\":5}]}],\"enemy\":[]}";
+    const dynamic =
+        "{\"id\":\"777\",\"phase\":\"InProgress\",\"ally\":[" ++
+        "{\"puuid\":\"self\",\"gameName\":\"我\",\"tagLine\":\"0001\",\"championId\":85,\"recentMatches\":[{\"gameId\":9}],\"dataComplete\":true}]," ++
+        "\"enemy\":[]}";
+    var output: [64 * 1024]u8 = undefined;
+    const merged = try mergeLiveLobbySnapshotsPolicy(base, dynamic, true, false, &output);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, merged, .{});
+    defer parsed.deinit();
+    const ally = parsed.value.object.get("ally").?.array.items;
+    try std.testing.expectEqual(@as(usize, 5), ally.len);
+    // 座位 0 必须还是别人：英雄 145 留下，身份没有被换掉。
+    try std.testing.expectEqualStrings("other-1", jsonField(ally[0], "puuid"));
+    try std.testing.expectEqual(@as(i64, 145), jsonInt(ally[0], "championId"));
+    // 「我」只在原来的座位上出现一次。
+    var self_count: usize = 0;
+    for (ally) |player| if (std.mem.eql(u8, jsonField(player, "puuid"), "self")) {
+        self_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), self_count);
+}
+
+/// 测试辅助：按身份出现次数统计，用来断言「不会出现两个我」。
+fn identityOccurrences(value: []const u8, puuid: []const u8) usize {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), value, .{}) catch return 0;
+    if (parsed != .object) return 0;
+    var count: usize = 0;
+    for ([_][]const u8{ "ally", "enemy" }) |side| {
+        const players = parsed.object.get(side) orelse continue;
+        if (players != .array) continue;
+        for (players.array.items) |player| {
+            if (std.mem.eql(u8, identityPuuid(player), puuid)) count += 1;
+        }
+    }
+    return count;
+}
+
+/// 测试辅助：解析一份快照某一侧的 `LobbyIdentity`。
+fn lobbyIdentityOf(value: []const u8, side: []const u8) LobbyIdentity {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), value, .{}) catch return .{};
+    if (parsed != .object) return .{};
+    var identity = LobbyIdentity{};
+    const players = parsed.object.get(side) orelse return identity;
+    if (players != .array) return identity;
+    for (players.array.items) |player| {
+        const hash = playerPopulationHash(player);
+        if (hash == 0) continue;
+        identity.roster +%= hash;
+        identity.roster_count += 1;
+    }
+    return identity;
+}
+
+test "房间阶段没有房间 session 时给的是空房间名单而不是上一局的人" {
+    // 这条信封就是 `room_without_session` 分支的产物：`/lol-lobby/v2/lobby` 404 时
+    // 用空 session 现造一份，房间里没有人可显示，但字段形状必须完整（summary/teams
+    // 都在），否则前端会缺块。
+    var output: [64 * 1024]u8 = undefined;
+    const result = try liveSessionEnvelopePhaseContext(null, null, "{}", null, null, "Lobby", null, "[]", "[]", &output, false);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("Lobby", jsonField(parsed.value, "phase"));
+    try std.testing.expectEqualStrings("lcu-session", jsonField(parsed.value, "id"));
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("ally").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("enemy").?.array.items.len);
+    try std.testing.expect(parsed.value.object.get("allySummary") != null);
+    try std.testing.expect(parsed.value.object.get("enemySummary") != null);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("teams").?.array.items.len);
+    try std.testing.expect(lobbyIsRoomSnapshot(result));
 }
