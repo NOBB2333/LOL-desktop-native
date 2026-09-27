@@ -5,10 +5,11 @@ import MatchRecordingPanel from "./MatchRecordingPanel.vue";
 import type { GameRecording, GameRecordingPlayer } from "../types/domain";
 
 /**
- * 这一层盯的是「可选功能」的三条边界，而不是排版：
+ * 这一层盯的是「可选功能」的四条边界，而不是排版：
  * - **没录到就什么都不渲染**（开关默认关，绝大多数人看到的就是这个）；
  * - 录到了才出时间轴，游标默认停最后一帧（开局帧十个人全是 0，停在那里像坏了）；
- * - 开关开着却没录到，要给一句解释，不能默默消失。
+ * - 开关开着却没录到，要给一句解释，不能默默消失；
+ * - 而且**「这一局没录」和「本机一局都没录过」必须分开说**——两者的排查方向完全不同。
  */
 const { backendState, appState } = vi.hoisted(() => ({
   backendState: { recording: null as GameRecording | null },
@@ -71,6 +72,7 @@ function recording(): GameRecording {
   return {
     gameId: 7,
     intervalSeconds: 15,
+    recordedGames: 1,
     frames: [
       { t: 0, gameId: 7, sampledAt: "2026-09-26T10:00:00.000Z", players: [player({ k: 0, d: 0, a: 0, cs: 0, lvl: 1, items: [] })], me: null },
       { t: 15, gameId: 7, sampledAt: "2026-09-26T10:00:15.000Z", players: [player({ k: 1, cs: 12 })], me: null },
@@ -99,9 +101,9 @@ function mountPanel(gameId = 7) {
   });
 }
 
-describe("MatchRecordingPanel 可选录制的三条边界", () => {
+describe("MatchRecordingPanel 可选录制的四条边界", () => {
   it("没录到就整块不渲染（默认关的开关就是这个样子）", async () => {
-    backendState.recording = { gameId: 7, intervalSeconds: 15, frames: [] };
+    backendState.recording = { gameId: 7, intervalSeconds: 15, recordedGames: 0, frames: [] };
     appState.recordingEnabled = false;
     const wrapper = mountPanel();
     await flushPromises();
@@ -112,8 +114,8 @@ describe("MatchRecordingPanel 可选录制的三条边界", () => {
     expect(wrapper.text()).toBe("");
   });
 
-  it("开关开着却没录到，给一句解释而不是默默消失", async () => {
-    backendState.recording = { gameId: 7, intervalSeconds: 15, frames: [] };
+  it("开关开着、这一局没录但本机录过别的局 → 说「这一局没有」，并带上已录局数", async () => {
+    backendState.recording = { gameId: 7, intervalSeconds: 15, recordedGames: 2, frames: [] };
     appState.recordingEnabled = true;
     const wrapper = mountPanel();
     await flushPromises();
@@ -121,6 +123,21 @@ describe("MatchRecordingPanel 可选录制的三条边界", () => {
     expect(wrapper.find(".recording").exists()).toBe(false);
     const note = wrapper.get(".recording__empty").text();
     expect(note).toContain("这一局没有本地录制");
+    expect(note).toContain("本机已录 2 局");
+  });
+
+  it("本机一局都没录过 → 文案改成「从来没录到过」+ 三条自查，而不是甩一句「这一局没有」", async () => {
+    // 这条是那次「开了开关打了几把、一帧都没有」的教训：两种「空」长得一模一样，
+    // 用户没法判断是用法不对还是功能坏了。
+    backendState.recording = { gameId: 7, intervalSeconds: 15, recordedGames: 0, frames: [] };
+    appState.recordingEnabled = true;
+    const wrapper = mountPanel();
+    await flushPromises();
+
+    const note = wrapper.get(".recording__empty").text();
+    expect(note).toContain("从来没录到过");
+    expect(note).toContain("你本机在打");
+    expect(note).not.toContain("本机已录");
   });
 
   it("录到了才出时间轴，游标默认停在最后一帧，时钟显示游戏内时间", async () => {

@@ -423,6 +423,13 @@ export interface GameRecording {
   gameId: number;
   /** 采样间隔（秒）。相邻两帧的时间差就是它，装备变化的最小精度也是它。 */
   intervalSeconds: number;
+  /**
+   * 本机库里现有多少局录制。**专门用来区分两种「空」**：
+   * `0` = 这功能从没采到过（开关没生效 / 打的时候应用没开 / 客户端不在），
+   * `> 0` = 功能好好的，只是这一局没录。
+   * 没有它的话这两种情况在界面上长得一模一样，只能让用户猜。
+   */
+  recordedGames: number;
   frames: GameRecordingFrame[];
 }
 

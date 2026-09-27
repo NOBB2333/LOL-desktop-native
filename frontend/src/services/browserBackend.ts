@@ -307,8 +307,15 @@ export const browserBackend = {
    * `?recording=1`；不这么做的话预览里每局都凭空冒出一条录制，真机的空路径就没地方验了。
    */
   gameRecording(gameId: number): GameRecording {
-    const wanted = typeof location !== "undefined" && new URLSearchParams(location.search).get("recording") === "1";
-    if (!wanted) return { gameId, intervalSeconds: 15, frames: [] };
+    const params = typeof location !== "undefined" ? new URLSearchParams(location.search) : null;
+    const wanted = params?.get("recording") === "1";
+    if (!wanted) {
+      // 「这一局没录」有两种完全不同的文案，预览里必须能分别复现：
+      // 默认 `recordedGames=0` = 本机从来没采到过（功能没生效）；
+      // `?recordedGames=2` = 功能好好的，只是这一局没录。
+      const recorded = Math.trunc(Number(params?.get("recordedGames") ?? "0"));
+      return { gameId, intervalSeconds: 15, recordedGames: Number.isFinite(recorded) && recorded > 0 ? recorded : 0, frames: [] };
+    }
     return createFixtureGameRecording(gameId, { selfTeam: previewSelfTeam() });
   },
   matches(page: number, pageSize: number): MatchSummary[] {

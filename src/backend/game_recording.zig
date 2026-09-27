@@ -118,6 +118,16 @@ fn captureFrame(self: *backend.Runtime, io: std.Io) !bool {
     defer std.heap.page_allocator.free(phase_json);
     if (!isRecordingPhase(phase_json)) return false;
 
+    // 局号**必须**从 gameflow session 取：Live Client Data 的 `gameData` 里
+    // **没有** gameId（只有 gameMode / gameTime / mapName / mapNumber / mapTerrain，
+    // 官方文档与实测 payload 都是这五个）。而 gameflow session 的 `gameData.gameId`
+    // 才是与战绩页**同一个**局号——界面就是拿那个号回来查帧的。
+    // 每采样一次才拉一次，这个体积（几百 KB）摊在 15 秒的节拍上无所谓。
+    const session_json = client.get("/lol-gameflow/v1/session") catch return false;
+    defer std.heap.page_allocator.free(session_json);
+    const game_id = sessionGameId(session_json);
+    if (game_id <= 0) return false;
+
     // 英雄目录（名字 → id）用来给帧标上 `cid`，界面才画得出英雄头像。
     // `cachedGameAsset` 命中库里那份 24 小时的缓存，正常情况下不产生网络请求。
     const catalog = backend.cachedGameAsset(self, client, "champions", "/lol-game-data/assets/v1/champion-summary.json") catch null;
@@ -127,21 +137,39 @@ fn captureFrame(self: *backend.Runtime, io: std.Io) !bool {
     live_client.timeout_ms = @min(client.timeout_ms, build_options.lcu_live_probe_timeout_ms);
     const live = live_client.getLocalUrl(build_options.lcu_live_client_data_url) catch return false;
     defer std.heap.page_allocator.free(live);
-    return appendFrame(self, live, catalog orelse "[]") catch false;
+    return appendFrame(self, live, catalog orelse "[]", game_id) catch false;
+}
+
+/// 从 gameflow session 里取局号（`gameData.gameId`）。
+///
+/// 刻意**只认这一条路径**，不复用 `backend.lobbyGameIdValue`：那个辅助函数会先看顶层
+/// `id`（房间快照的语义），而 gameflow session 的顶层并没有「局号」意义的 `id`，
+/// 混用容易把别的数字当成局号。
+fn sessionGameId(session_json: []const u8) i64 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), session_json, .{}) catch return 0;
+    if (parsed != .object) return 0;
+    const game_data = parsed.object.get("gameData") orelse return 0;
+    if (game_data != .object) return 0;
+    return backend.jsonInt(game_data, "gameId");
 }
 
 /// 解析一份 allgamedata，压成一帧存进 SQLite，并按局数上限回收旧局。
-fn appendFrame(self: *backend.Runtime, live_json: []const u8, catalog_json: []const u8) !bool {
+///
+/// `game_id` 由调用方给（来自 gameflow session）——Live Client Data 里没有局号，
+/// 见 `sessionGameId`。
+fn appendFrame(self: *backend.Runtime, live_json: []const u8, catalog_json: []const u8, game_id: i64) !bool {
+    if (game_id <= 0) return false;
     const store = if (self.storage) |*value| value else return false;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, live_json, .{}) catch return false;
     if (root != .object) return false;
+    // `gameData` 到这里只用来读 `gameTime` / `gameMode`，局号是参数传进来的。
     const game_data = root.object.get("gameData") orelse return false;
     if (game_data != .object) return false;
-    const game_id = backend.jsonInt(game_data, "gameId");
-    if (game_id <= 0) return false;
 
     const frame_buffer = try allocator.alloc(u8, frame_capacity);
     var writer = std.Io.Writer.fixed(frame_buffer);
@@ -182,6 +210,13 @@ fn frameCountOf(meta_json: []const u8) usize {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), meta_json, .{}) catch return 0;
     const count = backend.jsonInt(parsed, "frameCount");
     return if (count > 0) @as(usize, @intCast(count)) else 0;
+}
+
+/// 库里现有多少局录制（`gameReplayMeta` 的条数）。给「区分两种空」用，见 `getGameRecording`。
+fn recordedGameCount(store: *storage.Store, allocator: std.mem.Allocator) usize {
+    const entries = store.list(allocator, replay_meta_kind) catch return 0;
+    defer storage.Store.freeEntries(allocator, entries);
+    return entries.len;
 }
 
 /// 只保留最近 `kept_games` 局：多出来的按「写入时间最旧」回收，连同它的帧一起删。
@@ -321,9 +356,13 @@ fn writeNumber(writer: *std.Io.Writer, value: std.json.Value, name: []const u8) 
     }
 }
 
-/// `lol.get_game_recording` —— payload：`{gameId}` → `{gameId, intervalSeconds, frames[]}`。
+/// `lol.get_game_recording` —— payload：`{gameId}` → `{gameId, intervalSeconds, frames[], recordedGames}`。
 ///
 /// 没录到就是空数组，不是错误：这个功能是可选开关，界面只要据此决定要不要画时间轴。
+///
+/// `recordedGames` = 本机库里现有多少局录制。**专门用来区分两种「空」**：
+/// 「开关没生效 / 客户端没开着（一局都没录过）」和「这个功能好好的，只是这一局没录」。
+/// 没有它的话这两种情况长得一模一样，用户只能猜。
 pub fn getGameRecording(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = backend.runtime(context);
     const payload_json = backend.parsePayload(struct { gameId: i64 = 0 }, invocation.request.payload) catch return error.InvalidRequest;
@@ -350,7 +389,11 @@ pub fn getGameRecording(context: *anyopaque, invocation: native_sdk.bridge.Invoc
     }
 
     var writer = std.Io.Writer.fixed(output);
-    try writer.print("{{\"gameId\":{d},\"intervalSeconds\":{d},\"frames\":[", .{ game_id, interval_seconds });
+    try writer.print("{{\"gameId\":{d},\"intervalSeconds\":{d},\"recordedGames\":{d},\"frames\":[", .{
+        game_id,
+        interval_seconds,
+        recordedGameCount(store, allocator),
+    });
     var written: usize = 0;
     var index: usize = 0;
     while (index < frame_count) : (index += 1) {
@@ -389,8 +432,10 @@ test "采样间隔被夹在允许区间内" {
 }
 
 test "帧里只收 KDA/视野/装备/等级这些能拿到的字段，不编造伤害" {
+    // ⚠️ `gameData` 刻意写成**真实形状**——Live Client Data 里没有 gameId，
+    // 帧的局号是从 gameflow session 传进来的（见 `sessionGameId` 那条用例）。
     const live =
-        "{\"gameData\":{\"gameId\":901079838957,\"gameTime\":312.5,\"gameMode\":\"KIWI\"}," ++
+        "{\"gameData\":{\"gameTime\":312.5,\"gameMode\":\"KIWI\",\"mapName\":\"Map11\",\"mapNumber\":11,\"mapTerrain\":\"Default\"}," ++
         "\"activePlayer\":{\"riotId\":\"我#0001\",\"currentGold\":1234.7,\"level\":11," ++
         "\"championStats\":{\"attackDamage\":123.4,\"abilityPower\":0,\"armor\":55.5,\"magicResist\":32.1,\"moveSpeed\":380,\"currentHealth\":1500.5,\"maxHealth\":2100}}," ++
         "\"allPlayers\":[{\"puuid\":\"self\",\"riotId\":\"我#0001\",\"team\":\"CHAOS\",\"championName\":\"Swain\",\"position\":\"MIDDLE\"," ++
@@ -434,6 +479,53 @@ test "局外的阶段不采" {
     try testing.expect(!isRecordingPhase("\"EndOfGame\""));
     try testing.expect(!isRecordingPhase("\"None\""));
     try testing.expect(!isRecordingPhase("{}"));
+}
+
+test "局号从 gameflow session 的 gameData.gameId 取（Live Client Data 里没有）" {
+    const session = "{\"phase\":\"InProgress\",\"gameData\":{\"gameId\":901079838957,\"gameMode\":\"CLASSIC\",\"queue\":{\"id\":420}},\"map\":{\"id\":11}}";
+    try testing.expectEqual(@as(i64, 901079838957), sessionGameId(session));
+    // 拿不到局号就**不采**：宁可漏采，也不要写一个界面永远查不回来的键。
+    try testing.expectEqual(@as(i64, 0), sessionGameId("{\"phase\":\"ChampSelect\"}"));
+    try testing.expectEqual(@as(i64, 0), sessionGameId("{}"));
+    try testing.expectEqual(@as(i64, 0), sessionGameId("[]"));
+}
+
+test "真实形状的 allgamedata（gameData 没有 gameId）也能落库并按局号读回" {
+    // 这条是「开了开关打了几把、一帧都没录到」那次事故的回归。
+    // 当初 `appendFrame` 自己去读 `gameData.gameId`，而真实 payload 里**没有**这个字段
+    // （只有 gameMode / gameTime / mapName / mapNumber / mapTerrain）→ 永远 0 → 一帧不存。
+    var store = try storage.Store.open(testing.allocator, testing.io, ":memory:");
+    defer store.deinit();
+    var state = backend.Runtime.init();
+    state.storage = store;
+    // 一开始一局都没有——这正是「开关没生效 / 从没采到过」的那个状态。
+    try testing.expectEqual(@as(usize, 0), recordedGameCount(&store, testing.allocator));
+
+    const game_id: i64 = 901079838957;
+    const live =
+        "{\"gameData\":{\"gameTime\":95.5,\"gameMode\":\"CLASSIC\",\"mapName\":\"Map11\",\"mapNumber\":11,\"mapTerrain\":\"Default\"}," ++
+        "\"activePlayer\":{\"riotId\":\"我#0001\",\"currentGold\":1500,\"level\":6," ++
+        "\"championStats\":{\"attackDamage\":80.5,\"abilityPower\":0,\"armor\":40,\"magicResist\":32,\"moveSpeed\":350,\"currentHealth\":1200,\"maxHealth\":1300}}," ++
+        "\"allPlayers\":[{\"puuid\":\"self\",\"riotId\":\"我#0001\",\"team\":\"ORDER\",\"championName\":\"锐雯\",\"position\":\"TOP\"," ++
+        "\"level\":6,\"isDead\":false,\"respawnTimer\":0,\"isBot\":false," ++
+        "\"scores\":{\"kills\":3,\"deaths\":1,\"assists\":5,\"creepScore\":120,\"wardScore\":7}," ++
+        "\"items\":[{\"itemID\":3153,\"count\":1,\"slot\":0}]," ++
+        "\"summonerSpells\":{\"summonerSpellOne\":{\"displayName\":\"闪现\"},\"summonerSpellTwo\":{\"displayName\":\"点燃\"}}}]}";
+    try testing.expect(try appendFrame(&state, live, "[]", game_id));
+
+    // `recordedGames` 就是拿这个数：界面上「这一局没录」和「这功能从没生效过」靠它区分。
+    try testing.expectEqual(@as(usize, 1), recordedGameCount(&store, testing.allocator));
+    const frame = (try store.get(replay_kind, "901079838957:000000")).?;
+    defer testing.allocator.free(frame);
+    try testing.expect(std.mem.indexOf(u8, frame, "\"k\":3") != null);
+    try testing.expect(std.mem.indexOf(u8, frame, "\"cs\":120") != null);
+    // 帧里必须带上局号，界面靠它回查。
+    try testing.expect(std.mem.indexOf(u8, frame, "\"gameId\":901079838957") != null);
+    const meta = (try store.get(replay_meta_kind, "901079838957")).?;
+    defer testing.allocator.free(meta);
+    try testing.expect(std.mem.indexOf(u8, meta, "\"frameCount\":1") != null);
+    // 局号非法时什么都不该落盘。
+    try testing.expect(!try appendFrame(&state, live, "[]", 0));
 }
 
 test "默认配置下采集一跳不发任何请求（开关关着）" {

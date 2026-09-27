@@ -215,7 +215,7 @@ export const backend = {
    * 只看 `frames.length` 决定要不要画时间轴。
    */
   async gameRecording(gameId: number): Promise<GameRecording> {
-    if (!Number.isFinite(gameId) || gameId <= 0) return { gameId, intervalSeconds: 0, frames: [] };
+    if (!Number.isFinite(gameId) || gameId <= 0) return { gameId, intervalSeconds: 0, recordedGames: 0, frames: [] };
     if (usesFixtureData()) return browserBackend.gameRecording(gameId);
     return command<GameRecording>("get_game_recording", { gameId });
   },

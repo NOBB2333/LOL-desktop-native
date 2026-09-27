@@ -267,11 +267,28 @@ puuid 判等，所以「被识别成我」是**名单合并把身份挪了位**�
   `127.0.0.1:2999`（Live Client Data），**不走公网**。SSH 隧道下本地 2999 不在本机 → 不采。
 - 引擎在 `src/backend/game_recording.zig`：15 秒一帧（5~120 可配）、单局上限 360 帧、
   只保留最近 **3** 局，落在 SQLite 的 `gameReplay` / `gameReplayMeta`。
+- ⚠️ **局号只能从 gameflow session 取，不要从 `allgamedata` 取**（09-27 踩过大坑）：
+  Live Client Data 的 `gameData` 里**根本没有 `gameId`**——只有
+  `gameMode` / `gameTime` / `mapName` / `mapNumber` / `mapTerrain` 五个字段
+  （官方文档 + Overwolf 的 GEP 镜像 + 本项目 09-27 的真 payload 都一致）。
+  当初 `appendFrame` 自己去读 `gameData.gameId`，永远得 0 → `game_id <= 0` 直接 return
+  → **开关开着打了几把，一帧都没存下来**。现在走
+  `GET /lol-gameflow/v1/session` 的 `.gameData.gameId`（`sessionGameId`），
+  那也才是和战绩页**同一个**局号（界面拿它回查帧）。
+  改这块务必留着 `真实形状的 allgamedata（gameData 没有 gameId）也能落库并按局号读回`
+  那条用例——它专门用**没有 gameId 的真实 payload** 断言能落库。
+- **「没录到」必须分两种说法**（09-27 踩过）：
+  `recordedGames === 0` = 这功能从没生效过（开关没存上 / 打的时候应用没开 / 客户端不在），
+  `> 0` = 功能好好的、只是这一局没录。两句混成一句时，用户完全没法判断是自己用错了
+  还是功能坏了——当时就是这个把排查带偏的。`recordedGames` 由后端在
+  `lol.get_game_recording` 里回（`gameReplayMeta` 的条数）。
+- 单帧实测约 **3 KB**（十人各 ~280B + 本人 ~130B）；30 分钟一局 ≈ **360 KB**，
+  顶格 360 帧 ≈ 1.1 MB，保留 3 局总计 **≤ ~3 MB**。所以不需要按时间清理。
 - **页面只画真采到的字段**（KDA / 补刀 / 视野分 / 装备 / 等级 / 复活倒计时）。官方接口
   **没有伤害字段**，也没有 ITEM_PURCHASED 事件——装备变化只能靠相邻两帧对比，精度 = 采样间隔。
   别为了「曲线好看」去编伤害。
 - `frames` 为空**不是错误**（开关没开 / 不是本机在打 / 已被回收），所以
-  `MatchRecordingPanel` 在空帧时**整块不渲染**；只有「开关开着却没录到」才提示一句。
+  `MatchRecordingPanel` 在空帧时**整块不渲染**；只有「开关开着却没录到」才提示，见上一条。
 - 加命令要同步三处，`scripts/check-bridge-parity.mjs` 会校验（`lol.get_game_recording`）。
 - **别按视口宽度写媒体查询**（09-27 实测踩到）：它挂在 `MatchDetailCard` / `MatchHistoryDetail`
   里，而 `.match-row` 的栅格最小宽度约 **990px**、外面还套着 `overflow-x: auto` —— 窗口再窄，

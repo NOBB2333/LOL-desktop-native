@@ -16,7 +16,7 @@ vi.mock("vue-router", () => ({
 vi.mock("../services/backend", () => ({
   // 抽屉里的展开行会挂「本地录制」面板（可选功能，默认关）：这里给它一份**空录制**，
   // 与 fixtures 的真机形状一致——面板拿空帧就整块不渲染，抽屉版面不受影响。
-  backend: { encounters, matches, matchDetail, junglePath, gameRecording: async () => ({ gameId: 0, intervalSeconds: 0, frames: [] }) },
+  backend: { encounters, matches, matchDetail, junglePath, gameRecording: async () => ({ gameId: 0, intervalSeconds: 0, recordedGames: 0, frames: [] }) },
   isTauri: () => false,
 }));
 

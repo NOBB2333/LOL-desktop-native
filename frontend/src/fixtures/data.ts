@@ -1005,12 +1005,12 @@ export function createFixtureGameRecording(gameId: number, options: { selfTeam?:
   const selfTeam = options.selfTeam ?? TEAM_BLUE;
   const otherTeam = selfTeam === TEAM_BLUE ? TEAM_RED : TEAM_BLUE;
   const match = createFixtureMatchDetail(gameId, { selfTeam });
-  if (!match) return { gameId, intervalSeconds, frames: [] };
+  if (!match) return { gameId, intervalSeconds, recordedGames: 0, frames: [] };
   const roster = [
     ...match.participants.filter((player) => player.side === "ally"),
     ...match.participants.filter((player) => player.side === "enemy"),
   ].slice(0, 10);
-  if (!roster.length) return { gameId, intervalSeconds, frames: [] };
+  if (!roster.length) return { gameId, intervalSeconds, recordedGames: 0, frames: [] };
 
   const seed = Math.abs(Math.trunc(gameId)) % 997;
   const durationSeconds = Math.max(intervalSeconds, (match.durationMinutes || 28) * 60);
@@ -1091,7 +1091,9 @@ export function createFixtureGameRecording(gameId: number, options: { selfTeam?:
       },
     });
   }
-  return { gameId, intervalSeconds, frames };
+  // 造出了帧就说明「本机录过」，所以 `recordedGames` 至少是 1（这个数字是给
+  // 「区分两种空」用的，不含在这一局里）。
+  return { gameId, intervalSeconds, recordedGames: 1, frames };
 }
 
 /**

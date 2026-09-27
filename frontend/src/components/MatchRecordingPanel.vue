@@ -32,6 +32,8 @@ const recording = useQuery({
 
 const frames = computed(() => recording.data.value?.frames ?? []);
 const intervalSeconds = computed(() => recording.data.value?.intervalSeconds ?? 0);
+/** 本机库里现有多少局录制——空状态的文案靠它分岔，见 `showsEmptyNote`。 */
+const recordedGames = computed(() => recording.data.value?.recordedGames ?? 0);
 /**
  * 游标默认停在**最后一帧**。
  *
@@ -57,7 +59,12 @@ function totals(players: GameRecordingPlayer[]) {
  * 「开关开着却什么都没录到」才提示一句。
  *
  * 开关关着时上面整块面板都不出现，再加一句「没录到」纯属噪声；反过来，用户明明把开关
- * 打开了、这一局却没有记录，必须给个说法（不是本机在打 / 已经超出保留局数）。
+ * 打开了、这一局却没有记录，必须给个说法。
+ *
+ * ⚠️ 而且**必须分清两种「没录到」**（2026-09-27 实测踩过）：`recordedGames === 0`
+ * 说明这功能从没生效过（开关没存上 / 打的时候应用没开 / 客户端不在），
+ * `> 0` 才只是「这一局没录」。当初两句混成一句，用户看到「这一局没有本地录制」
+ * 完全无法判断是自己的用法问题还是功能坏了。
  */
 const showsEmptyNote = computed(() => app.config.providers?.recording?.enabled === true && frames.value.length === 0);
 
@@ -139,7 +146,9 @@ const itemIcon = (id: number) => `https://ddragon.leagueoflegends.com/cdn/16.16.
   </section>
 
   <p v-else-if="showsEmptyNote" class="recording__empty">
-    <AlertTriangle :size="12" />这一局没有本地录制：录制只在「本机在打」且开关打开时才会存，跨局的老对局和观战视角都录不到。
+    <AlertTriangle :size="12" />
+    <span v-if="recordedGames > 0">这一局没有本地录制（本机已录 {{ recordedGames }} 局）。录制只在「本机在打」且开关打开时才会存，跨局的老对局和观战视角都录不到。</span>
+    <span v-else>本机还从来没录到过任何对局。请确认：①设置里的开关是打开的；②这一局是<b>你本机在打</b>（观战、回放都不行）；③打的时候这个应用一直开着。三条都满足却还是空的，就是功能出问题了。</span>
   </p>
 </template>
 
