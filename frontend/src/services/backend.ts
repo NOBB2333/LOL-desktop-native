@@ -25,6 +25,7 @@ import type {
   FriendToolsSnapshot,
   GameflowActionKey,
   GameflowActionResult,
+  GameRecording,
   JunglePathMap,
   LiveLobby,
   MatchSummary,
@@ -205,6 +206,18 @@ export const backend = {
     if (!Number.isFinite(gameId) || gameId <= 0) return null;
     if (usesFixtureData()) return browserBackend.matchTimeline(gameId);
     return command<MatchTimeline | null>("get_match_timeline", { gameId, selfPuuid: selfPuuid?.trim() ?? "" });
+  },
+  /**
+   * 本地录制（**可选功能**，见设置里的「对局录制」开关）。
+   *
+   * 返回这一局在本机录到的帧序列；`frames` 为空表示没录到（开关没开 / 不是本机在打 /
+   * 已超出保留局数被回收），**不是**错误。所以这里不做「查不到就抛」的处理——调用方
+   * 只看 `frames.length` 决定要不要画时间轴。
+   */
+  async gameRecording(gameId: number): Promise<GameRecording> {
+    if (!Number.isFinite(gameId) || gameId <= 0) return { gameId, intervalSeconds: 0, frames: [] };
+    if (usesFixtureData()) return browserBackend.gameRecording(gameId);
+    return command<GameRecording>("get_game_recording", { gameId });
   },
   async asset(kind: "champion" | "item" | "spell" | "perk" | "profile", id: number): Promise<AssetPayload> {    if (usesFixtureData()) throw new Error("Fixture 使用静态资源");
     const key = `${kind}:${id}`;

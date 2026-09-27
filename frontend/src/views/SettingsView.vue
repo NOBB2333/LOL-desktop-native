@@ -170,6 +170,15 @@ function clampForwardedPort() {
               <NSwitch v-model:value="app.config.providers.lobbyRoster" aria-label="房间里也统计队友" />
             </div>
           </div>
+          <div class="settings-row">
+            <div class="settings-row__label">
+              <strong>对局录制</strong>
+              <small>游戏进行中每 15 秒把本地就能拿到的数据存一帧（战绩、补刀、视野分、装备、等级），打完可以在对局页按时间轴回看。数据只落本机；关掉则不会发生任何事</small>
+            </div>
+            <div class="settings-row__control">
+              <NSwitch v-model:value="app.config.providers.recording.enabled" aria-label="对局录制" />
+            </div>
+          </div>
         </div>
 
         <!-- 路径信息 -->

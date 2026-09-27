@@ -124,6 +124,13 @@
         ]
       },
       {
+        "name": "lol.get_game_recording",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
         "name": "lol.search_summoner",
         "origins": [
           "zero://app",

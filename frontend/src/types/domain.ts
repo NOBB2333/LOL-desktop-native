@@ -349,6 +349,83 @@ export interface MatchTimeline {
   events: MatchTimelineEvent[];
 }
 
+/**
+ * 本地录制里的一名玩家（采样当刻的快照）。
+ *
+ * 数据源是**游戏进行中本机**的 Live Client Data（127.0.0.1:2999），不走公网，也不是
+ * 官方战绩接口。官方接口**没有**伤害字段，也没有装备购买的精确时刻——所以这里存的只能
+ * 是「某一刻的状态」，装备变化要靠相邻两帧对比，精度就是采样间隔。
+ */
+export interface GameRecordingPlayer {
+  puuid: string;
+  /** `名字#标签`（Live Client 的 `riotId`）。 */
+  rid: string;
+  /** `ORDER` / `CHAOS`。 */
+  team: string;
+  /** 英雄英文名：Live Client 只给这个名字，中文名要另查。 */
+  champ: string;
+  /** 英雄数字 id（后端拿英雄目录反查出来的），画头像用；查不到为 0。 */
+  cid: number;
+  pos: string;
+  lvl: number;
+  k: number;
+  d: number;
+  a: number;
+  cs: number;
+  /** 视野分（`wardScore`）。 */
+  ward: number;
+  dead: boolean;
+  /** 复活倒计时（秒）；活着是 0。 */
+  respawn: number;
+  bot: boolean;
+  /** 身上装备的 itemID 列表，只含 `count > 0` 的槽位。 */
+  items: number[];
+  spells: string[];
+}
+
+/**
+ * 本地玩家自己那一份。
+ *
+ * `championStats`（AD/AP/护甲/魔抗/移速/血量）**只有本人**在本地接口里拿得到，
+ * 别人的这些字段根本不存在——所以单独挂在帧上，不要试图给十个人都补。
+ */
+export interface GameRecordingSelf {
+  rid: string;
+  gold: number;
+  lvl: number;
+  ad: number;
+  ap: number;
+  armor: number;
+  mr: number;
+  ms: number;
+  hp: number;
+  maxHp: number;
+}
+
+/** 录制里的一帧 = 采样那一刻的全场状态。 */
+export interface GameRecordingFrame {
+  /** 游戏内时间（秒）。 */
+  t: number;
+  gameId: number;
+  sampledAt: string;
+  players: GameRecordingPlayer[];
+  /** 拿不到本人数据时为 null（例如观战视角）。 */
+  me: GameRecordingSelf | null;
+}
+
+/**
+ * `lol.get_game_recording` 的结果。
+ *
+ * `frames` 为空数组**不是错误**：这一局没录到（开关没开 / 不是本机在打 / 已经超过
+ * 保留局数被回收）都回空数组，界面据此决定要不要画时间轴。
+ */
+export interface GameRecording {
+  gameId: number;
+  /** 采样间隔（秒）。相邻两帧的时间差就是它，装备变化的最小精度也是它。 */
+  intervalSeconds: number;
+  frames: GameRecordingFrame[];
+}
+
 export interface PlayerProfile {
   rosterKey?: string;
   puuid: string;
@@ -663,6 +740,14 @@ export interface AppConfig {
     clearLobbyAfterGame: boolean;
     /** 房间/匹配中（还没进选人）也拉队友资料，对齐 AK 的 `queryInLobbyPhase`。 */
     lobbyRoster: boolean;
+    /**
+     * 对局录制（**可选功能，默认关**）。
+     *
+     * 开着时游戏进行中每隔 `intervalSeconds` 秒把本地 Live Client Data 的公开数据
+     * 存一帧（KDA / 补刀 / 视野分 / 装备 / 等级 / 复活倒计时），打完可以在对局页按
+     * 时间轴回放。关着时后台那一跳不发任何请求。
+     */
+    recording: { enabled: boolean; intervalSeconds: number };
   };
   ai: {
     enabled: boolean;

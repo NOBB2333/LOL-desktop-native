@@ -24,6 +24,7 @@ const launcher_ipc = @import("backend/launcher_ipc.zig");
 const assets_ipc = @import("backend/assets_ipc.zig");
 const claim_ipc = @import("backend/claim_ipc.zig");
 const gameflow_ipc = @import("backend/gameflow_ipc.zig");
+const game_recording = @import("backend/game_recording.zig");
 
 const fallback_data_dir = std.fmt.comptimePrint(".{s}", .{build_options.data_dir_name});
 
@@ -275,6 +276,8 @@ pub const command_table = [_]CommandSpec{
     .{ .name = "lol.get_match_detail", .lane = .query },
     .{ .name = "lol.get_jungle_path", .lane = .query },
     .{ .name = "lol.get_match_timeline", .lane = .query },
+    // 对局录制：只读本地库里录到的帧，没有就回空数组。可选功能，见 game_recording.zig。
+    .{ .name = "lol.get_game_recording", .lane = .query },
     .{ .name = "lol.search_summoner", .lane = .query },
     .{ .name = "lol.get_champions", .lane = .query },
     .{ .name = "lol.get_asset", .lane = .query },
@@ -333,10 +336,10 @@ test "未登记命令回落到默认 query 通道" {
 }
 
 const default_config =
-    "{\"version\":23,\"appearance\":{\"theme\":\"system\",\"colorMode\":\"dark\",\"compact\":false}," ++
+    "{\"version\":24,\"appearance\":{\"theme\":\"system\",\"colorMode\":\"dark\",\"compact\":false}," ++
     "\"connection\":{\"kind\":\"local\",\"sshTarget\":\"\",\"identityFile\":\"\",\"forwardedPort\":0}," ++
     "\"automation\":{\"enabled\":false,\"advisoryMode\":true,\"autoAccept\":false,\"autoAcceptDelaySeconds\":0,\"autoPick\":false,\"autoPickDelaySeconds\":1,\"autoPickStrategy\":\"show-and-lock-in\",\"autoBan\":false,\"pickChampionIds\":[],\"banChampionIds\":[],\"aramGrab\":false,\"aramChampionIds\":[],\"aramSwapDelaySeconds\":3,\"shortcutSendIntervalMs\":65,\"shortcutRecentGameCount\":5,\"shortcuts\":[{\"id\":\"encounter\",\"label\":\"发送遇到记录\",\"key\":\"Ctrl+F5\",\"target\":\"encounter\",\"template\":\"{encounter}\",\"enabled\":true},{\"id\":\"premade\",\"label\":\"发送已知组队\",\"key\":\"Ctrl+F9\",\"target\":\"premade\",\"template\":\"{position} {name}：组队 {premade}\",\"enabled\":true},{\"id\":\"jungle-preference\",\"label\":\"发送打野偏好\",\"key\":\"Ctrl+F7\",\"target\":\"jungle\",\"template\":\"{name}：{jungle_preference}\",\"enabled\":true},{\"id\":\"enemy\",\"label\":\"发送敌方评估\",\"key\":\"Ctrl+F11\",\"target\":\"enemy\",\"template\":\"{team}{position} {current_champion}：{rank} 主玩{main_position} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"ally\",\"label\":\"发送我方评估\",\"key\":\"Ctrl+F12\",\"target\":\"ally\",\"template\":\"{team}{position} {current_champion}：{rank} 主玩{main_position} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"open-game\",\"label\":\"打开对局速看\",\"key\":\"Ctrl+F1\",\"target\":\"lobby\",\"template\":\"对局速看：{team} {name}\",\"enabled\":true}]}," ++
-    "\"providers\":{\"statsProvider\":\"auto\",\"requestTimeoutSeconds\":6,\"cacheTtlMinutes\":120,\"hideUnfinishedMatches\":false,\"rankedOnly\":false,\"clearLobbyAfterGame\":true,\"lobbyRoster\":true}," ++
+    "\"providers\":{\"statsProvider\":\"auto\",\"requestTimeoutSeconds\":6,\"cacheTtlMinutes\":120,\"hideUnfinishedMatches\":false,\"rankedOnly\":false,\"clearLobbyAfterGame\":true,\"lobbyRoster\":true,\"recording\":{\"enabled\":false,\"intervalSeconds\":15}}," ++
     "\"ai\":{\"enabled\":false,\"provider\":\"deepseek\",\"protocol\":\"openai\",\"baseUrl\":\"https://api.deepseek.com\",\"model\":\"deepseek-v4-flash\",\"apiKey\":\"\",\"automaticPregameAnalysis\":false}}";
 
 const fixture_connection =
@@ -366,6 +369,12 @@ pub const Runtime = struct {
     /// JSON 解析——空闲时那一轮唯一的成本就是它。
     automation_loop_hash: u64 = 0,
     automation_loop_wanted: bool = false,
+    /// 对局录制（**可选功能，默认关**）的配置指纹与节流状态。开关关着时后台那一跳
+    /// 只算一次哈希，不发任何请求。见 `backend/game_recording.zig`。
+    recording_config_hash: u64 = 0,
+    recording_wanted: bool = false,
+    recording_interval_ms: i64 = game_recording.default_interval_seconds * 1000,
+    recording_last_frame_ms: i64 = 0,
     cache_platform: [32]u8 = undefined,
     cache_platform_len: usize = 0,
     // 手动自动化与后台检查共用互斥锁，避免重复接受同一次匹配。
@@ -619,6 +628,12 @@ pub const Runtime = struct {
         self.automation_client = null;
     }
 
+    /// 对局录制的一跳（可选功能，默认关）。由自动化守护线程顺带驱动，
+    /// 节流在模块内部按 `providers.recording.intervalSeconds` 自己管。
+    pub fn runRecordingBackground(self: *Runtime, io: std.Io) bool {
+        return game_recording.captureTick(self, io);
+    }
+
     pub fn modeName(self: *const Runtime) []const u8 {
         return switch (self.mode) {
             .live => "live",
@@ -672,6 +687,7 @@ pub const Runtime = struct {
             .{ .name = "lol.get_match_detail", .context = self, .invoke_fn = getMatchDetail },
             .{ .name = "lol.get_jungle_path", .context = self, .invoke_fn = getJunglePath },
             .{ .name = "lol.get_match_timeline", .context = self, .invoke_fn = match_timeline.getMatchTimeline },
+            .{ .name = "lol.get_game_recording", .context = self, .invoke_fn = game_recording.getGameRecording },
             .{ .name = "lol.search_summoner", .context = self, .invoke_fn = searchSummoner },
             .{ .name = "lol.get_champions", .context = self, .invoke_fn = assets_ipc.getChampions },
             .{ .name = "lol.get_asset", .context = self, .invoke_fn = assets_ipc.getAsset },
@@ -925,7 +941,7 @@ pub fn invokeQueued(self: *Runtime, handler: native_sdk.bridge.Handler, invocati
     return result;
 }
 
-fn lockBackendMutex(mutex: *std.atomic.Mutex) void {
+pub fn lockBackendMutex(mutex: *std.atomic.Mutex) void {
     var spins: usize = 0;
     while (!mutex.tryLock()) {
         if (spins < 64) {
@@ -983,7 +999,7 @@ fn discoverClientWithConfig(self: *const Runtime, io: std.Io, config_json: []con
     return client;
 }
 
-fn runtimeConnectionIsSsh(self: *const Runtime) bool {
+pub fn runtimeConnectionIsSsh(self: *const Runtime) bool {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const config = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.config[0..self.config_len], .{}) catch return false;
@@ -1028,7 +1044,7 @@ pub fn runtimeNowMillis(self: *const Runtime) i64 {
     return @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
 }
 
-fn runtimeMonotonicMillis(self: *const Runtime) i64 {
+pub fn runtimeMonotonicMillis(self: *const Runtime) i64 {
     const io = self.io orelse return 0;
     return @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms));
 }
@@ -1815,7 +1831,7 @@ fn writeLiveProgress(self: *Runtime, writer: *std.Io.Writer) !bool {
     return true;
 }
 
-fn cachedGameAsset(self: *Runtime, client: lcu.Client, key: []const u8, path: []const u8) ![]u8 {
+pub fn cachedGameAsset(self: *Runtime, client: lcu.Client, key: []const u8, path: []const u8) ![]u8 {
     if (cachedSnapshot(self, "cache", key, 86400)) |value| return value;
     const value = try client.get(path);
     if (self.storage) |*store| store.put("cache", key, value) catch {};
@@ -4392,7 +4408,7 @@ pub fn copyJson(value: []const u8, output: []u8) ![]const u8 {
     return output[0..value.len];
 }
 
-fn jsonBool(value: std.json.Value, name: []const u8) bool {
+pub fn jsonBool(value: std.json.Value, name: []const u8) bool {
     if (value != .object) return false;
     const item = value.object.get(name) orelse return false;
     return item == .bool and item.bool;
@@ -6529,7 +6545,7 @@ pub fn percentEncodeQuery(value: []const u8, output: []u8) ![]const u8 {
     return output[0..cursor];
 }
 
-fn liveChampionId(player: std.json.Value, catalog: std.json.Value) i64 {
+pub fn liveChampionId(player: std.json.Value, catalog: std.json.Value) i64 {
     const selected_id = selectedChampionId(player);
     if (selected_id > 0) return selected_id;
     const raw = if (jsonField(player, "rawChampionName").len > 0) jsonField(player, "rawChampionName") else jsonField(player, "championName");

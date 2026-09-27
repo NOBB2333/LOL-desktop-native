@@ -11,6 +11,7 @@
  */
 import { isNative } from "./native";
 import {
+  createFixtureGameRecording,
   createFixtureJunglePath,
   createFixtureLobby,
   createFixtureMatchDetail,
@@ -52,6 +53,7 @@ import type {
   FriendDeleteResultEntry,
   FriendToolsSnapshot,
   GameflowActionResult,
+  GameRecording,
   JunglePathMap,
   LiveLobby,
   MatchSummary,
@@ -296,6 +298,18 @@ export const browserBackend = {
   matchTimeline(gameId: number): MatchTimeline {
     const noDamage = typeof location !== "undefined" && new URLSearchParams(location.search).get("frameDamage") === "0";
     return createFixtureMatchTimeline(gameId, { frameDamage: !noDamage, selfTeam: previewSelfTeam() });
+  },
+  /**
+   * 预览用的本地录制。
+   *
+   * **默认回空帧**——真机上没开开关、不是本机在打、或者这一局已经超出保留局数被回收，
+   * 拿到的都是这份空结果，界面据此隐藏时间轴。要看到有数据的样子，得显式带
+   * `?recording=1`；不这么做的话预览里每局都凭空冒出一条录制，真机的空路径就没地方验了。
+   */
+  gameRecording(gameId: number): GameRecording {
+    const wanted = typeof location !== "undefined" && new URLSearchParams(location.search).get("recording") === "1";
+    if (!wanted) return { gameId, intervalSeconds: 15, frames: [] };
+    return createFixtureGameRecording(gameId, { selfTeam: previewSelfTeam() });
   },
   matches(page: number, pageSize: number): MatchSummary[] {
     const source = visibleMatches(fixtureMatches, browserState.config.providers.hideUnfinishedMatches, browserState.config.providers.rankedOnly);

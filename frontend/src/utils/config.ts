@@ -1,11 +1,14 @@
 import type { AppConfig, ShortcutDefinition } from "../types/domain";
 import { normalizePlayerTagSettings } from "../tags/settings";
 
-export const CURRENT_CONFIG_VERSION = 23;
+export const CURRENT_CONFIG_VERSION = 24;
 export const defaultOpenGameShortcutKey = "Ctrl+F1";
 
 /** 大乱斗换人前的等待秒数（对齐 AK `benchSwapAccumulatedDelaySeconds` = 2.9s）。 */
 export const defaultAramSwapDelaySeconds = 3;
+
+/** 对局录制的默认采样间隔（秒）。后端同一份默认值，改这里要一起改。 */
+export const defaultRecordingIntervalSeconds = 15;
 
 /**
  * `{main_position}`（主玩位置）插在段位与逐场战绩之间。旧版本存下来的默认模板
@@ -160,6 +163,14 @@ export function migrateAppConfig(config: AppConfig) {
     // 默认开——房间里就 1~5 个人，代价很小；缺字段按开处理，不打扰老配置。
     if (typeof config.providers.lobbyRoster !== "boolean") {
       config.providers.lobbyRoster = true;
+      changed = true;
+    }
+  }
+  if (config.version < 24) {
+    // v24：**可选**的对局录制，默认**关**。开着才在游戏进行中每 15 秒采一帧存本地，
+    // 打完可在对局页回放；默认关意味着升级上来的老配置行为完全不变。
+    if (!config.providers.recording || typeof config.providers.recording.enabled !== "boolean") {
+      config.providers.recording = { enabled: false, intervalSeconds: defaultRecordingIntervalSeconds };
       changed = true;
     }
   }

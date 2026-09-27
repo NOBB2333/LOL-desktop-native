@@ -584,6 +584,9 @@ fn stopApp(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
 fn automationWatchdog(self: *App, io: std.Io) void {
     while (!self.automation_stop.load(.acquire)) {
         const busy = self.runtime.runAutomationBackground(io);
+        // 可选的对局录制顺带跑在这条线程上：开关关着（默认）时它只比一次配置指纹，
+        // 不发任何请求；开着时自己按 `providers.recording.intervalSeconds` 节流。
+        _ = self.runtime.runRecordingBackground(io);
         // 空闲时退避到 1s：客户端没起、或者自动化整个关着的时候，250ms 一跳没有
         // 任何收益。真正有活干（自动化开着且客户端在）时保持 250ms 的响应速度，
         // 自动接受不会因此变慢。类型写全是因为 `Duration.fromMilliseconds` 收 i64。

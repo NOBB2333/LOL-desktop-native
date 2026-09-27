@@ -9,6 +9,9 @@ import type {
   EncounterRecord,
   FriendToolsSnapshot,
   FinalBpRecord,
+  GameRecording,
+  GameRecordingFrame,
+  GameRecordingPlayer,
   JungleCampCounts,
   JunglePathMap,
   JunglePathPoint,
@@ -619,7 +622,7 @@ export const fixtureClaims: ClaimSnapshot = {
 };
 
 export const fixtureConfig: AppConfig = {
-  version: 23,
+  version: 24,
   appearance: { theme: "mint", colorMode: "light", compact: false },
   playerTags: { ...defaultPlayerTagSettings },
   connection: { kind: "local", sshTarget: "", identityFile: "", forwardedPort: 0 },
@@ -648,7 +651,7 @@ export const fixtureConfig: AppConfig = {
       { id: "open-game", label: "打开对局速看", key: "Ctrl+F1", target: "lobby", template: "对局速看：{team} {name}，近10场 {recent_wins}胜{recent_losses}负，KDA {kda}", enabled: true },
     ],
   },
-  providers: { statsProvider: "auto", requestTimeoutSeconds: 6, cacheTtlMinutes: 120, hideUnfinishedMatches: false, rankedOnly: false, clearLobbyAfterGame: true, lobbyRoster: true },
+  providers: { statsProvider: "auto", requestTimeoutSeconds: 6, cacheTtlMinutes: 120, hideUnfinishedMatches: false, rankedOnly: false, clearLobbyAfterGame: true, lobbyRoster: true, recording: { enabled: false, intervalSeconds: 15 } },
   ai: { enabled: false, provider: "deepseek", protocol: "openai", baseUrl: "https://api.deepseek.com", model: "deepseek-v4-flash", apiKey: "", automaticPregameAnalysis: false },
 };
 
@@ -985,6 +988,110 @@ export function createFixtureMatchTimeline(gameId: number, options: { frameDamag
   }
 
   return { gameId, durationSeconds, participants, frames, events };
+}
+
+/**
+ * 预览用的「本地录制」帧序列。
+ *
+ * 真机上这是**游戏进行中**每 15 秒把本机 Live Client Data 采一帧存进 SQLite 的结果
+ * （见后端 `backend/game_recording.zig`）。预览里没有客户端，所以按同一份十人名单
+ * 合成一份**确定性**的帧（不用随机数，否则每次刷新曲线都在跳，看着像坏了）。
+ *
+ * 默认回空帧——真机上新装的人、没开开关的人、或者不是本机在打的人，看到的正是
+ * 「这一局没有录制」这条空状态，预览里必须能复现它，不能默认造一份假录制出来。
+ */
+export function createFixtureGameRecording(gameId: number, options: { selfTeam?: number; intervalSeconds?: number } = {}): GameRecording {
+  const intervalSeconds = options.intervalSeconds ?? 15;
+  const selfTeam = options.selfTeam ?? TEAM_BLUE;
+  const otherTeam = selfTeam === TEAM_BLUE ? TEAM_RED : TEAM_BLUE;
+  const match = createFixtureMatchDetail(gameId, { selfTeam });
+  if (!match) return { gameId, intervalSeconds, frames: [] };
+  const roster = [
+    ...match.participants.filter((player) => player.side === "ally"),
+    ...match.participants.filter((player) => player.side === "enemy"),
+  ].slice(0, 10);
+  if (!roster.length) return { gameId, intervalSeconds, frames: [] };
+
+  const seed = Math.abs(Math.trunc(gameId)) % 997;
+  const durationSeconds = Math.max(intervalSeconds, (match.durationMinutes || 28) * 60);
+  /**
+   * 每个座位一条「个人曲线」。
+   *
+   * 全程线性走到这一局的最终数据（补刀率、视野分率、阵亡时刻都由它推），再加一点按
+   * (局号, 座位) 定的固定扰动——不加扰动十个人的曲线会整齐得像同一个模板。
+   */
+  const curves = roster.map((player, index) => {
+    const lane = index % 5;
+    const wobble = ((seed + index * 41) % 13) / 100;
+    // 阵亡时刻：把人头均匀铺在整局里（第 n 个人头落在 (n + 0.6)/总数 处），
+    // 这样游标扫过去能真的看到「有人躺了、倒计时在跳」。
+    const deathTimes = Array.from({ length: Math.max(0, player.deaths) }, (_, nth) => (durationSeconds * (nth + 0.6 + wobble)) / Math.max(1, player.deaths));
+    return {
+      player,
+      index,
+      lane,
+      wobble,
+      csRate: [7.4, 6.1, 8.3, 8.7, 1.5][lane]! * (0.94 + wobble),
+      wardRate: [0.35, 0.42, 0.28, 0.26, 0.85][lane]! * (0.9 + wobble),
+      deathTimes,
+      build: itemsFor(player.championName),
+    };
+  });
+
+  const frames: GameRecordingFrame[] = [];
+  for (let t = 0; t <= durationSeconds; t += intervalSeconds) {
+    const progress = durationSeconds ? t / durationSeconds : 0;
+    const players: GameRecordingPlayer[] = curves.map((curve) => {
+      const { player, index, csRate, wardRate, deathTimes, build } = curve;
+      const lvl = Math.min(18, 1 + Math.floor(t / (durationSeconds / 18.5)));
+      const respawnSeconds = 6 + lvl * 1.3;
+      const downAt = deathTimes.find((at) => t >= at && t < at + respawnSeconds);
+      // 开局 12% 之前先不买东西：一级团就六神装看着太假。
+      const itemCount = progress < 0.12 ? 0 : Math.min(build.length, 1 + Math.floor(progress * 6));
+      return {
+        puuid: player.puuid,
+        rid: player.gameName,
+        // Live Client 给的是 ORDER / CHAOS，不是 100 / 200。
+        team: (player.team ?? (index < 5 ? selfTeam : otherTeam)) === TEAM_BLUE ? "ORDER" : "CHAOS",
+        champ: player.championName,
+        cid: player.championId,
+        pos: player.position,
+        lvl,
+        k: Math.floor(player.kills * progress),
+        d: deathTimes.filter((at) => at <= t).length,
+        a: Math.floor(player.assists * progress),
+        cs: Math.round(csRate * (t / 60)),
+        ward: Math.round(wardRate * (t / 60)),
+        dead: downAt !== undefined,
+        respawn: downAt === undefined ? 0 : Math.round(downAt + respawnSeconds - t),
+        bot: player.isBot,
+        items: build.slice(0, itemCount).map((item) => item.id),
+        spells: (player.summonerSpells ?? []).map((spell) => spell.name),
+      };
+    });
+    const selfCurve = curves[0]!;
+    const selfFrame = players[0]!;
+    const maxHp = Math.round(620 + progress * 1560 + selfCurve.wobble * 300);
+    frames.push({
+      t,
+      gameId,
+      sampledAt: new Date(now + t * 1000).toISOString(),
+      players,
+      me: {
+        rid: selfCurve.player.gameName,
+        gold: Math.round(selfCurve.player.goldEarned * progress),
+        lvl: selfFrame.lvl,
+        ad: Math.round(58 + selfCurve.wobble * 40 + progress * 210),
+        ap: Math.round(progress * 480 * (0.6 + selfCurve.wobble)),
+        armor: Math.round(34 + progress * 96),
+        mr: Math.round(32 + progress * 55),
+        ms: 345 + (selfCurve.lane === 4 ? 0 : 10),
+        hp: selfFrame.dead ? 0 : Math.round(maxHp * 0.72),
+        maxHp,
+      },
+    });
+  }
+  return { gameId, intervalSeconds, frames };
 }
 
 /**
