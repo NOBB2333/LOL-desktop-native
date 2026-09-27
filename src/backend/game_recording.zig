@@ -187,7 +187,8 @@ fn frameCountOf(meta_json: []const u8) usize {
 /// 只保留最近 `kept_games` 局：多出来的按「写入时间最旧」回收，连同它的帧一起删。
 fn pruneOldGames(store: *storage.Store, allocator: std.mem.Allocator) void {
     const entries = store.list(allocator, replay_meta_kind) catch return;
-    defer store.freeEntries(allocator, entries);
+    // `freeEntries` 是命名空间上的静态函数（没有 self），必须走类型名调用。
+    defer storage.Store.freeEntries(allocator, entries);
     if (entries.len <= kept_games) return;
     // `list` 已经是「写入时间新的在前」，所以尾部就是要回收的旧局。
     for (entries[kept_games..]) |entry| {
@@ -405,10 +406,7 @@ test "帧里只收 KDA/视野/装备/等级这些能拿到的字段，不编造�
     const game_data = root.object.get("gameData").?;
     const buffer = try allocator.alloc(u8, frame_capacity);
     var writer = std.Io.Writer.fixed(buffer);
-    const catalog = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "[{\"id\":50,\"name\":\"Swain\",\"alias\":\"Swain\"}]", .{});
-    _ = catalog;
-    try writeFrame(&writer, &state, root, game_data, 901079838957, "[{\"id\":50,\"name\":\"斯维因\",\"alias\":\"Swain\"}]");
-    const frame = writer.buffered();
+    try writeFrame(&writer, &state, root, game_data, 901079838957, "[{\"id\":50,\"name\":\"斯维因\",\"alias\":\"Swain\"}]");    const frame = writer.buffered();
     // 该有的都有。
     try testing.expect(std.mem.indexOf(u8, frame, "\"t\":312.5") != null);
     try testing.expect(std.mem.indexOf(u8, frame, "\"rid\":\"我#0001\"") != null);
@@ -436,4 +434,51 @@ test "局外的阶段不采" {
     try testing.expect(!isRecordingPhase("\"EndOfGame\""));
     try testing.expect(!isRecordingPhase("\"None\""));
     try testing.expect(!isRecordingPhase("{}"));
+}
+
+test "默认配置下采集一跳不发任何请求（开关关着）" {
+    // ⚠️ 这条首先是个**编译护栏**，别删。
+    //
+    // `captureTick` 这条链路（captureTick → captureFrame → appendFrame → writeFrame /
+    // pruneOldGames）原本**只有 `main.zig` 的自动化守护线程**会引用，测试构建根本走不到它。
+    // Zig 是惰性分析——没被引用到的函数完全不做语义检查，于是出现过：
+    // 后端 243 用例全绿，`zig build package` 却挂在 `store.freeEntries(...)`
+    // （静态函数被当成方法调用）。真调一次 `captureTick`，把整条链路钉进测试构建的分析图。
+    var state = backend.Runtime.init();
+    try testing.expect(!captureTick(&state, testing.io));
+    // 开关默认关：连节拍都不该推，下一跳仍然是「不比就返回」。
+    try testing.expectEqual(@as(i64, 0), state.recording_last_frame_ms);
+}
+
+test "只保留最近几局：回收旧局时连它的帧一起删" {
+    var store = try storage.Store.open(testing.allocator, testing.io, ":memory:");
+    defer store.deinit();
+    const frames_per_game: usize = 2;
+    const total_games = kept_games + 2;
+    for (0..total_games) |game| {
+        const game_id: i64 = @intCast(game + 1);
+        var meta_buffer: [32]u8 = undefined;
+        const meta_key = try std.fmt.bufPrint(&meta_buffer, "{d}", .{game_id});
+        var meta_json_buffer: [128]u8 = undefined;
+        const meta_json = try std.fmt.bufPrint(&meta_json_buffer, "{{\"gameId\":{d},\"frameCount\":{d}}}", .{ game_id, frames_per_game });
+        try store.put(replay_meta_kind, meta_key, meta_json);
+        for (0..frames_per_game) |frame| {
+            var frame_buffer: [64]u8 = undefined;
+            const frame_key = try std.fmt.bufPrint(&frame_buffer, "{d}:{d:0>6}", .{ game_id, frame });
+            try store.put(replay_kind, frame_key, "{\"t\":0}");
+        }
+    }
+    const before = try store.list(testing.allocator, replay_meta_kind);
+    try testing.expectEqual(@as(usize, total_games), before.len);
+    storage.Store.freeEntries(testing.allocator, before);
+
+    pruneOldGames(&store, testing.allocator);
+
+    const after = try store.list(testing.allocator, replay_meta_kind);
+    defer storage.Store.freeEntries(testing.allocator, after);
+    try testing.expectEqual(@as(usize, kept_games), after.len);
+    // 被回收那几局的帧必须一起没：否则磁盘只增不减，而没人再会读到它们。
+    const frames = try store.list(testing.allocator, replay_kind);
+    defer storage.Store.freeEntries(testing.allocator, frames);
+    try testing.expectEqual(@as(usize, kept_games) * frames_per_game, frames.len);
 }
