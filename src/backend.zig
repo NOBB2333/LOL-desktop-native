@@ -1343,6 +1343,18 @@ const LiveLoadBatch = struct {
     completed: usize = 0,
     failed: usize = 0,
     total: usize = 0,
+    /// 整批早退时的错误名（`@errorName`）。以前这种情况只会表现成
+    /// 「0/10 人 · N 人待重试」，用户和我们都看不出到底哪一步挂了。
+    error_name: []const u8 = "",
+    /// 十个人的**核心数据**是否已经发布（第一遍跑完）。
+    ///
+    /// 与 `done` 分开：`done` 是「这批活全干完了」，还控制着下一次批次能不能
+    /// 启动，必须是第二遍也结束才算；而这个只用来**如实汇报进度**——第一遍
+    /// 发布之后界面就该显示「已加载 10/10」，不该把还在补标签的第二遍算进
+    /// 「加载中」，否则用户看到的还是那个又涨到十几秒的计时器。
+    cores_done: bool = false,
+    /// 第一遍发布完成的时刻，用来把界面上的「耗时」定格在核心数据就绪那一刻。
+    cores_ms: ?i64 = null,
     started_ms: i64,
     first_player_ms: ?i64 = null,
     finished_ms: ?i64 = null,
@@ -1425,9 +1437,12 @@ fn startLiveLoading(self: *Runtime) !void {
 }
 
 fn runLiveLoadBatch(batch: *LiveLoadBatch) void {
-    runLiveLoadBatchInner(batch) catch {
+    runLiveLoadBatchInner(batch) catch |err| {
         lockBackendMutex(&batch.parent.command_mutex);
         batch.failed = @max(batch.failed, batch.total - batch.completed);
+        // 记下具体原因，随进度一起回报给界面——「10 人待重试」本身没有任何
+        // 诊断价值，是找客户端失败、账号换了还是平台校验没过，必须看得见。
+        batch.error_name = @errorName(err);
         batch.parent.command_mutex.unlock();
     };
     lockBackendMutex(&batch.parent.command_mutex);
@@ -1491,6 +1506,9 @@ fn runLiveLoadJobs(batch: *LiveLoadBatch, client: lcu.Client, current: std.json.
             // 资料已完整且缓存未过期的玩家不入队，避免复查时十个人全部重跑。
             if (!batch.force and livePlayerProfileFresh(self, player)) continue;
             var job = liveProfileJob(self, client, null, player, side, index, current, catalog, null);
+            // 第一遍只发核心数据：把「好抓 / 难抓」标签所需的公网详情请求留到
+            // 第二遍（见本函数尾部）。这是十人加载能不能「瞬发」的关键。
+            job.gank = false;
             job.shared_sgp = &shared_sgp;
             job.shared_encounter = if (shared_encounter) |*value| value else null;
             job.output = try allocator.alloc(u8, live_profile_output_capacity);
@@ -1506,6 +1524,30 @@ fn runLiveLoadJobs(batch: *LiveLoadBatch, client: lcu.Client, current: std.json.
     batch.queue.run();
     // 全部 worker 退出后再发布：这次加载只产生一次版本自增，前端一次拿到整批人。
     publishLoadedProfiles(batch);
+    // 核心数据落地就算「加载完成」：第二遍补标签不再计入进度，界面上的
+    // 「加载中 10/10 人 · N 秒」到此定格，不会因为标签还在拉就继续涨。
+    lockBackendMutex(&batch.parent.command_mutex);
+    batch.cores_done = true;
+    batch.cores_ms = runtimeMonotonicMillis(batch.snapshot);
+    batch.parent.command_mutex.unlock();
+    // 第二遍：补齐「好抓 / 难抓」标签所需的 SGP 对局详情（每人最多 5 场）。
+    // 这是十人加载里唯一会把公网请求堆到几十个的地方，而公网并发全局只有 2，
+    // 所以把它放到核心数据**发布之后**再跑，结果作为第二次发布补上——
+    // 用户明确说过这些标签可以后到，不参与「瞬发」。
+    // 这一遍全程命中刚写下的缓存（段位 / 等级 / 战绩都还新鲜），只有详情请求是真的。
+    if (jobs.items.len > 0 and runtimeEasyGankEnabled(batch.snapshot)) {
+        // 第一遍可能带 force（进入结算时强制刷新）。第二遍必须关掉它：
+        // 刚写下的缓存正是要复用的，否则段位 / 战绩会被整份再拉一次。
+        batch.snapshot.force_profile_refresh = false;
+        for (jobs.items) |*job| {
+            job.gank = true;
+            job.failure = null;
+            job.output_len = 0;
+        }
+        batch.queue.next.store(0, .monotonic);
+        batch.queue.run();
+        publishLoadedProfiles(batch);
+    }
     batch.jobs = &.{};
 }
 
@@ -1513,6 +1555,9 @@ fn loadLivePlayer(context: *anyopaque, index: usize) void {
     const batch: *LiveLoadBatch = @ptrCast(@alignCast(context));
     const job = &batch.jobs[index];
     runLiveProfileJob(job);
+    // 第二遍（补「好抓 / 难抓」标签）只是附加数据：不参与进度统计，失败也不算失败。
+    // 否则标签拉不到会把十个人一起拖进 10 秒整批重试——那正是这次要修掉的现象。
+    if (job.gank) return;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const profile = if (job.failure == null) std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), job.output.?[0..job.output_len], .{}) catch null else null;
@@ -1523,7 +1568,7 @@ fn loadLivePlayer(context: *anyopaque, index: usize) void {
     if (batch.generation != batch.parent.live_generation or batch.parent.mode != .live or batch.queue.cancelled.load(.acquire)) return;
     batch.completed += 1;
     if (batch.first_player_ms == null) batch.first_player_ms = runtimeMonotonicMillis(batch.snapshot) - batch.started_ms;
-    if (profile == null or !jsonBool(profile.?, "dataComplete")) batch.failed += 1;
+    if (profile == null) batch.failed += 1;
 }
 
 /// `queue.run()` 返回后统一发布。
@@ -1733,13 +1778,20 @@ fn liveProgressResponse(self: *Runtime, output: []u8) ![]const u8 {
 fn writeLiveProgress(self: *Runtime, writer: *std.Io.Writer) !bool {
     const batch = self.live_load orelse return false;
     const current_batch = batch.generation == self.live_generation and !batch.queue.cancelled.load(.acquire);
+    // 「核心数据发完了」与「整批彻底结束」分开：第二遍只补「好抓/难抓」标签，
+    // 界面这时候应该已经是「已加载 10/10」，耗时也定格在第一遍结束的时刻。
+    const cores_ready = batch.cores_done;
     const progress = .{
-        .active = !batch.done.load(.acquire) or !current_batch,
+        .active = !(batch.done.load(.acquire) or cores_ready) or !current_batch,
         .completed = if (current_batch) batch.completed else 0,
         .total = if (current_batch) batch.total else lobbyRosterCount(self.live_lobby[0..self.live_lobby_len]),
         .failed = if (current_batch) batch.failed else 0,
-        .elapsedMs = if (current_batch) (batch.finished_ms orelse runtimeMonotonicMillis(self)) - batch.started_ms else 0,
+        .elapsedMs = if (current_batch) ((batch.cores_ms orelse batch.finished_ms orelse runtimeMonotonicMillis(self)) - batch.started_ms) else 0,
         .firstPlayerMs = if (current_batch) batch.first_player_ms else null,
+        // 整批早退时给出具体错误名（如 AccountChanged），null 表示这一批没有早退。
+        // 光看「N 人待重试」根本推不出原因，必须把它带到界面上。
+        // 注意字段名不能叫 `error`：那是 Zig 关键字，`.error =` 会直接编译不过。
+        .errorName = if (current_batch and batch.error_name.len > 0) batch.error_name else null,
     };
     try writer.writeAll(",\"loading\":");
     var stringify = std.json.Stringify{ .writer = writer, .options = .{} };
@@ -5798,6 +5850,8 @@ fn writeLiveClientProfiles(self: *Runtime, client: lcu.Client, sgp_context: ?Jun
             const same_team = sameLiveTeam(jsonField(player, "team"), current_team);
             if (same_team != ally) continue;
             jobs[job_count] = liveProfileJob(self, client, sgp_context, player, if (ally) "ally" else "enemy", side_index, current, catalog, players);
+            // 会话路径（选人 / 房间）保持原样：这里的富化本来就带标签，且人数少。
+            // `gank` 默认就是 true，这里不用再显式打开。
             job_count += 1;
             side_index += 1;
         }
@@ -5813,7 +5867,7 @@ fn writeLiveClientProfiles(self: *Runtime, client: lcu.Client, sgp_context: ?Jun
         if (same_team != ally) continue;
         if (!first) try writer.writeByte(',');
         first = false;
-        try writeLiveClientProfile(self, client, sgp_context, writer, player, if (ally) "ally" else "enemy", side_index, current, catalog, enrich, players, null, null);
+        try writeLiveClientProfile(self, client, sgp_context, writer, player, if (ally) "ally" else "enemy", side_index, current, catalog, enrich, enrich, players, null, null);
         side_index += 1;
     }
     try writer.writeByte(']');
@@ -5900,6 +5954,13 @@ const LiveProfileJob = struct {
     output: ?[]u8 = null,
     output_len: usize = 0,
     failure: ?anyerror = null,
+    /// 是否允许这一遍去拉「好抓 / 难抓」标签所需的 SGP 对局详情。
+    /// 每人最多 5 场、全局公网并发只有 2，是十人加载里最贵的一段。
+    ///
+    /// 默认 `true`：选人 / 房间 / 平滑选人这几条路径人数少或本来就要标签，
+    /// 行为保持不变。**只有**整批十人加载（`runLiveLoadJobs`）第一遍会显式
+    /// 关掉它——先把十个人的核心数据发出去，第二遍才回来补齐标签。
+    gank: bool = true,
 };
 
 const PlayerRankRequestJob = struct {
@@ -5969,7 +6030,7 @@ fn liveProfileJob(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpCon
 
 fn runLiveProfileJob(job: *LiveProfileJob) void {
     var writer = std.Io.Writer.fixed(job.output.?);
-    writeLiveClientProfile(job.runtime_value, job.client, job.sgp_context, &writer, job.player, job.side, job.index, job.current, job.catalog, true, job.group_members, job.shared_sgp, job.shared_encounter) catch |err| {
+    writeLiveClientProfile(job.runtime_value, job.client, job.sgp_context, &writer, job.player, job.side, job.index, job.current, job.catalog, true, job.gank, job.group_members, job.shared_sgp, job.shared_encounter) catch |err| {
         job.failure = err;
         return;
     };
@@ -6002,7 +6063,7 @@ fn writeLiveProfileJobs(writer: *std.Io.Writer, jobs: []LiveProfileJob) !void {
     try writer.writeByte(']');
 }
 
-fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, writer: *std.Io.Writer, player: std.json.Value, side: []const u8, index: usize, current: std.json.Value, catalog: std.json.Value, enrich: bool, group_members: ?std.json.Value, shared_sgp: ?*SharedLiveSgpContext, shared_encounter: ?*LiveEncounterIndex) !void {
+fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, writer: *std.Io.Writer, player: std.json.Value, side: []const u8, index: usize, current: std.json.Value, catalog: std.json.Value, enrich: bool, gank: bool, group_members: ?std.json.Value, shared_sgp: ?*SharedLiveSgpContext, shared_encounter: ?*LiveEncounterIndex) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -6127,7 +6188,12 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
                     }
                 }
             }
-            if (self.storage) |*store| if (preferredHistory(history_owned, sgp_history_owned)) |value| {
+            // 即使这一份里一局都没有也要落盘：空列表同样是「读过了」的结果。
+            // 不落盘的话 `livePlayerProfileFresh` 永远判它不新鲜，5 秒一次的复查会
+            // 一直重跑这位玩家——新号 / 战绩不可见的玩家会让整个面板反复转圈。
+            // 已排他的读取方（战绩分页、相遇索引、单局详情）都只是在里面找某一局，
+            // 拿到空数组等价于「没找到」，行为不变。
+            if (self.storage) |*store| if (preferredHistory(history_owned, sgp_history_owned) orelse history_owned orelse sgp_history_owned) |value| {
                 store.put("playerHistory", puuid, value) catch {};
             };
         }
@@ -6147,10 +6213,20 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     const ranked = if (rank_owned) |value| std.json.parseFromSliceLeaky(std.json.Value, allocator, value, .{}) catch std.json.Value{ .null = {} } else std.json.Value{ .null = {} };
     const solo = rankQueueValue(ranked, "RANKED_SOLO_5x5");
     const preferred_history = preferredHistory(history_owned, sgp_history_owned) orelse history_owned;
-    const history_ready = if (preferred_history) |value| blk: {
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, value, .{}) catch break :blk false;
-        break :blk historyGames(parsed) != null;
-    } else false;
+    // 「读到过战绩」与「战绩里真有对局」必须分开：
+    // - `history_read`：这次**读到过**战绩（空列表也算读到——可能是新号，或战绩不可见）；
+    // - `history_has_games`：读到的东西里**真有对局**，只用来决定界面显示还是显「—」。
+    // 以前两者共用「有对局」，于是新号 / 战绩不可见的玩家每个批次都被记成 failed，
+    // 整批每 10 秒重跑一次、永远不收敛——用户看到的「N 人待重试」就是它。
+    var history_read = false;
+    var history_has_games = false;
+    if (preferred_history) |value| {
+        const parsed_history = std.json.parseFromSliceLeaky(std.json.Value, allocator, value, .{}) catch null;
+        if (parsed_history) |root| if (historyGames(root)) |games| {
+            history_read = true;
+            history_has_games = games.array.items.len > 0;
+        };
+    }
 
     var recent_owned: ?[]u8 = null;
     defer if (recent_owned) |value| std.heap.page_allocator.free(value);
@@ -6173,7 +6249,10 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     // 的显示效果；成本有上界（每位玩家最多看 5 场候选、凑够 3 场就停，见
     // `enrichRecentGankMetrics`），且命中过的 `gankMetric` / `jungleDetails`
     // 都会落盘缓存，同一局只付一次。标签被关掉时整段跳过，不做无谓请求。
-    if (enrich and runtimeEasyGankEnabled(self) and !is_bot and puuid.len > 0 and recent_count > 0 and !isJunglePosition(position)) {
+    //
+    // `gank` 与 `enrich` 分开：这一段是十人加载里唯一会把公网请求堆到几十个的地方，
+    // 所以整批加载的第一遍把它关掉，先把十个人的核心数据发出去，第二遍再补齐。
+    if (gank and enrich and runtimeEasyGankEnabled(self) and !is_bot and puuid.len > 0 and recent_count > 0 and !isJunglePosition(position)) {
         gank_metrics_owned = std.heap.page_allocator.alloc(u8, 256 * 1024) catch null;
         if (gank_metrics_owned) |buffer| {
             if (enrichRecentGankMetrics(self, client, sgp_context, recent_json, puuid, buffer, true) catch null) |enriched| {
@@ -6242,7 +6321,14 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     try writePremadeFields(writer, player, group_members);
     try writer.writeAll(",\"positionGames\":");
     try writer.print("{d},\"positionWinRate\":{d:.4},\"currentChampionGames\":{d},\"currentChampionWinRate\":{d:.4},\"championPoolConcentration\":{d:.4},\"dataComplete\":", .{ recentPositionGames(recent_items, position), recentPositionWinRate(recent_items, position), recentChampionGames(recent_items, champion_id), recentChampionWinRate(recent_items, champion_id), recentChampionConcentration(recent_items) });
-    const complete = is_bot or (history_ready and ranked != .null);
+    // 「这次尝试做完没有」与「数据全不全」是两件事。
+    //
+    // - 快路（`enrich=false`）只发骨架，一律标未完成，让前端知道后面还有富化在跑；
+    // - 连身份都没有的玩家（选人阶段被隐藏的敌方）也不算「失败」：重试不会变好，
+    //   它的身份只会随阶段推进（进入游戏）才出现，那时 `refreshLiveGeneration`
+    //   会换 key 整批重来。把它记成失败只会换来每 10 秒一轮的无意义请求。
+    const identity_known = puuid.len > 0 or numeric_identity > 0;
+    const complete = if (!enrich) false else is_bot or !identity_known or history_read or rank_owned != null;
     try writer.writeAll(if (complete) "true" else "false");
     try writer.writeAll(",\"unavailableSources\":[");
     var missing = false;
@@ -6250,7 +6336,9 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
         try jsonString(writer, "rank");
         missing = true;
     }
-    if (!is_bot and !history_ready) {
+    // 这里用「真有对局」而不是「读到过」：一局都没有时界面就该显「—」，
+    // 但这是「没有」不是「失败」，不参与重试判定。
+    if (!is_bot and !history_has_games) {
         if (missing) try writer.writeByte(',');
         try jsonString(writer, "recentMatches");
     }
@@ -6259,7 +6347,10 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     try writer.writeAll(",\"fetchedAt\":");
     try writeIsoTimestamp(writer, runtimeNowMillis(self));
     try writer.writeAll(",\"expiresAt\":null,\"isStale\":false,\"error\":");
-    if (enrich and !complete) try jsonString(writer, "部分资料读取失败，将自动重试") else try writer.writeAll("null");
+    // 只有「该查也查了、结果空手」才叫读取失败。身份都拿不到（选人敌方被隐藏）
+    // 或快路骨架都不该显示这句话，否则界面会一直挂着「将自动重试」。
+    const read_attempted = enrich and !is_bot and puuid.len > 0 and !isNumericIdentity(puuid);
+    if (read_attempted and !(history_read and rank_owned != null)) try jsonString(writer, "部分资料读取失败，将自动重试") else try writer.writeAll("null");
     try writer.writeAll("},\"side\":");
     try jsonString(writer, side);
     try writer.writeByte('}');
@@ -8985,6 +9076,43 @@ test "decrypts ChampSelect obfuscated PUUIDs before exposing player profiles" {
     var writer = std.Io.Writer.fixed(&output);
     try writeProfile(&writer, participant, "ally", std.json.Value{ .null = {} });
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"puuid\":\"00112233-4455-5677-8899-aabbccddeeff\"") != null);
+}
+
+test "选人阶段敌方身份三种形态都能解析（明文 puuid / obfuscatedPuuid / botUuid）" {
+    // 客户端的 `theirTeam` 换过三代形态：
+    //   最早直接给明文 `puuid`；后来只给混淆过的 `obfuscatedPuuid`；人机给 `botUuid`。
+    // 用户明确要求「保留原来的兼容性，因为最早是可以获取到的」——这三种都必须能出身份，
+    // 否则「选人阶段能看到对面」这个从最早版本就有的能力会在换客户端之后静默消失。
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const cases = [_]struct { json: []const u8, want: []const u8 }{
+        .{
+            .json = "{\"puuid\":\"11111111-2222-3333-4444-555555555555\",\"gameName\":\"敌方明文\",\"championId\":112}",
+            .want = "11111111-2222-3333-4444-555555555555",
+        },
+        .{
+            .json = "{\"obfuscatedPuuid\":\"8161549a-b004-06ec-1d01-c2a8024cf918\",\"gameName\":\"敌方混淆\",\"championId\":112}",
+            .want = "00112233-4455-5677-8899-aabbccddeeff",
+        },
+        .{
+            .json = "{\"botUuid\":\"0000-bot-7\",\"gameName\":\"敌方人机\",\"championId\":1}",
+            .want = "0000-bot-7",
+        },
+    };
+    for (cases) |case| {
+        const enemy = try std.json.parseFromSliceLeaky(std.json.Value, allocator, case.json, .{});
+        var puuid_buffer: [36]u8 = undefined;
+        try std.testing.expectEqualStrings(case.want, resolvedIdentityPuuid(enemy, &puuid_buffer));
+
+        // 走一遍真正的档案写入：敌方卡片必须带出可用身份，而不是退化成 `enemy-slot-N`。
+        var output: [4096]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&output);
+        try writeProfile(&writer, enemy, "enemy", std.json.Value{ .null = {} });
+        var needle_buffer: [64]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buffer, "\"puuid\":\"{s}\"", .{case.want});
+        try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), needle) != null);
+    }
 }
 
 test "快速快照带上召唤师等级，拿不到时写 null" {
