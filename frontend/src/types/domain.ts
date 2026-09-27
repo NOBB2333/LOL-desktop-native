@@ -9,6 +9,8 @@ export interface DataStatus {
   fetchedAt: string;
   expiresAt: string | null;
   isStale: boolean;
+  /** 这一遍为这位玩家花了多少毫秒（后端实测值，用来定位「某个人特别慢」）。 */
+  fetchMs?: number;
   error: string | null;
 }
 
