@@ -177,6 +177,11 @@ const itemIcon = (id: number) => `https://ddragon.leagueoflegends.com/cdn/16.16.
 .recording__self > span:not(.recording__self-title) { color: var(--text-primary); font-size: 9px; font-variant-numeric: tabular-nums; }
 .recording__self b { margin-right: 3px; color: var(--text-muted); font-size: 7px; font-weight: 600; }
 .recording__empty { display: flex; align-items: center; gap: 6px; margin: 10px 0 0; padding: 8px 10px; border: 1px dashed var(--line-strong); border-left: 3px solid var(--amber); color: var(--text-secondary); background: var(--surface-raised); font-size: 9px; line-height: 1.5; }
-@media (max-width: 1100px) { .recording__row { grid-template-columns: 26px minmax(0, 1fr) 24px 44px 30px minmax(0, 96px) 24px; }.recording__ward { display: none; } }
-@media (max-width: 760px) { .recording__sides { grid-template-columns: 1fr; }.recording__scrubber { grid-template-columns: 1fr; justify-items: stretch; }.recording__clock { justify-self: end; } }
+/*
+  刻意**不写**按视口宽度的媒体查询。
+  宿主卡片（`.match-row`）的栅格最小宽度约 990px，外面还套着 `overflow-x: auto`：
+  窗口再窄，卡片本身也不会跟着变窄。这时候按视口收列/改成单列，只会得到「一列占了
+  990px、右边全是空白」的错位版面（实测在 390px 视口下就是这样）。版面跟着**容器的
+  实际宽度**走才不会和上面那张卡打架，窄窗口就横向滚。
+*/
 </style>

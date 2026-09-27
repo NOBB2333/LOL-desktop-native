@@ -273,6 +273,12 @@ puuid 判等，所以「被识别成我」是**名单合并把身份挪了位**�
 - `frames` 为空**不是错误**（开关没开 / 不是本机在打 / 已被回收），所以
   `MatchRecordingPanel` 在空帧时**整块不渲染**；只有「开关开着却没录到」才提示一句。
 - 加命令要同步三处，`scripts/check-bridge-parity.mjs` 会校验（`lol.get_game_recording`）。
+- **别按视口宽度写媒体查询**（09-27 实测踩到）：它挂在 `MatchDetailCard` / `MatchHistoryDetail`
+  里，而 `.match-row` 的栅格最小宽度约 **990px**、外面还套着 `overflow-x: auto` —— 窗口再窄，
+  卡片本身也不会跟着窄。按视口收列/改单列会得到「一列铺满 990px、右边全空」的错位版面
+  （390px 视口下截图一看就露）。版面要跟**容器的实际宽度**走，窄窗口就横向滚。
+  验证这类版面必须用**桌面宽度**截图：Chrome 的 `--window-size` 是**设备像素**，
+  配 `--force-device-scale-factor=2` 会让 CSS 视口只剩一半，静默走进窄屏分支。
 
 ## 打野路线图
 
