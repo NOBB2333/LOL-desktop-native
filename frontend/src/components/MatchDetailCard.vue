@@ -3,6 +3,7 @@ import { computed } from "vue";
 import { ChevronDown, ChevronUp, Coins, Crosshair, HeartPulse, Shield, Swords, TowerControl, Trophy } from "@lucide/vue";
 import type { ItemSummary, MatchSummary, RecentMatch } from "../types/domain";
 import AssetIcon from "./AssetIcon.vue";
+import MatchRecordingPanel from "./MatchRecordingPanel.vue";
 import { championImage, percentOrDash, roleName, shortDate } from "../utils/format";
 
 const props = withDefaults(defineProps<{
@@ -274,6 +275,13 @@ function toggleFromRow(event: MouseEvent) {
           </section>
         </div>
       </template>
+
+      <!--
+        本地录制（可选功能，默认关）：只有这一局在本机被录过才渲染。
+        放在展开区里，是因为战绩页**默认是「完整对局」模式**（走这条展开行、不走
+        右侧详情面板）——只挂在 `MatchHistoryDetail` 上的话，默认视角根本看不到它。
+      -->
+      <MatchRecordingPanel :game-id="props.match.gameId" />
     </section>
   </article>
 </template>

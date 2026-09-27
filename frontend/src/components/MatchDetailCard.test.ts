@@ -18,7 +18,7 @@ describe("MatchDetailCard", () => {
     };
     const wrapper = mount(MatchDetailCard, {
       props: { match },
-      global: { stubs: { AssetIcon: true } },
+      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
     });
 
     expect(wrapper.text()).not.toContain("躺赢局");
@@ -29,7 +29,7 @@ describe("MatchDetailCard", () => {
     const match = structuredClone(fixtureMatches[0]);
     const wrapper = mount(MatchDetailCard, {
       props: { match, expanded: true },
-      global: { stubs: { AssetIcon: true } },
+      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
     });
 
     expect(match.participants).toHaveLength(10);
@@ -45,7 +45,7 @@ describe("MatchDetailCard", () => {
   it("keeps the summoner spells next to the champion avatar, not after the items", () => {
     const wrapper = mount(MatchDetailCard, {
       props: { match: structuredClone(fixtureMatches[0]), expanded: true },
-      global: { stubs: { AssetIcon: true } },
+      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
     });
 
     const children = Array.from(wrapper.get(".participant-line").element.children)
@@ -62,7 +62,7 @@ describe("MatchDetailCard", () => {
   it("draws seven item slots with the trinket last", () => {
     const wrapper = mount(MatchDetailCard, {
       props: { match: structuredClone(fixtureMatches[0]), expanded: true },
-      global: { stubs: { AssetIcon: true } },
+      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
     });
 
     const items = wrapper.get(".participant-line .participant-line__items").element;
@@ -83,7 +83,7 @@ describe("MatchDetailCard", () => {
     ];
     const wrapper = mount(MatchDetailCard, {
       props: { match, expanded: true },
-      global: { stubs: { AssetIcon: true } },
+      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
     });
 
     const slots = Array.from(wrapper.get(".participant-line .participant-line__items").element.children);
@@ -102,7 +102,7 @@ describe("MatchDetailCard", () => {
     const row = { ...structuredClone(fixtureLobby.ally[0].recentMatches[0]), killParticipation: null };
     const wrapper = mount(MatchDetailCard, {
       props: { match: row },
-      global: { stubs: { AssetIcon: true } },
+      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
     });
 
     expect(wrapper.get(".match-row__kda small").text()).toBe("— 参团");
@@ -111,7 +111,7 @@ describe("MatchDetailCard", () => {
   it("keeps the row expanded when the detail area itself is clicked", async () => {
     const wrapper = mount(MatchDetailCard, {
       props: { match: structuredClone(fixtureMatches[0]), expanded: true },
-      global: { stubs: { AssetIcon: true } },
+      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
     });
 
     // 详情区是行的子节点：在里面点任何地方（选文字、点图标）都不该把行收回去。
@@ -131,7 +131,7 @@ describe("MatchDetailCard", () => {
     const stub = { ...full, participants: [full.participants[0]] };
     const wrapper = mount(MatchDetailCard, {
       props: { match: stub, expanded: true, detailLoading: true },
-      global: { stubs: { AssetIcon: true } },
+      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
     });
 
     expect(wrapper.get(".match-row__detail-status").text()).toContain("正在读取");
@@ -142,7 +142,7 @@ describe("MatchDetailCard", () => {
     const stub = { ...full, participants: [full.participants[0]] };
     const wrapper = mount(MatchDetailCard, {
       props: { match: stub, expanded: true, detailError: "这局的完整十人数据读取失败" },
-      global: { stubs: { AssetIcon: true } },
+      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
     });
 
     const status = wrapper.get(".match-row__detail-status");
@@ -161,14 +161,14 @@ describe("MatchDetailCard", () => {
 
     const plain = mount(MatchDetailCard, {
       props: { match: row, expanded: true },
-      global: { stubs: { AssetIcon: true } },
+      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
     });
     expect(plain.find(".match-row__detail").exists()).toBe(false);
     expect(plain.find(".match-row__toggle").exists()).toBe(false);
 
     const expandable = mount(MatchDetailCard, {
       props: { match: row, expanded: true, expandable: true, detailLoading: true },
-      global: { stubs: { AssetIcon: true } },
+      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
     });
     expect(expandable.find(".match-row__toggle").exists()).toBe(true);
     expect(expandable.get(".match-row__detail-status").text()).toContain("正在读取");
