@@ -1,6 +1,6 @@
 import { mount } from "@vue/test-utils";
 import { describe, expect, it } from "vitest";
-import type { MatchParticipant, MatchTimelineEvent, MatchTimelineFrame, MatchTimelineParticipant } from "../types/domain";
+import type { GameRecordingFrame, MatchParticipant, MatchTimelineEvent, MatchTimelineFrame, MatchTimelineParticipant } from "../types/domain";
 import TeamfightList from "./TeamfightList.vue";
 import { deriveTeamfights } from "../matches/teamfights";
 
@@ -86,9 +86,14 @@ function players(redView = false): MatchParticipant[] {
   }));
 }
 
-const AssetIconStub = { props: { id: { default: 0 }, name: { default: "" } }, template: '<i class="asset-icon-stub" />' };
+// 把 `id` 写成 data 属性：出装/头像的用例要靠它断言「画的是哪一件」，
+// 只渲染一个空 <i> 的话所有 id 都读成 NaN，测试看着通过其实什么都没验。
+const AssetIconStub = {
+  props: { id: { default: 0 }, name: { default: "" } },
+  template: '<i class="asset-icon-stub" :data-id="id" />',
+};
 
-function mountList(options: { frames?: MatchTimelineFrame[]; redView?: boolean } = {}) {
+function mountList(options: { frames?: MatchTimelineFrame[]; redView?: boolean; recording?: GameRecordingFrame[] } = {}) {
   return mount(TeamfightList, {
     props: {
       fights: deriveTeamfights(events, seats),
@@ -96,6 +101,7 @@ function mountList(options: { frames?: MatchTimelineFrame[]; redView?: boolean }
       participants: seats,
       players: players(options.redView ?? false),
       frames: options.frames ?? [frame(0), frame(5), frame(10)],
+      recording: options.recording,
       selectedIndex: 0,
     },
     global: { stubs: { AssetIcon: AssetIconStub } },
@@ -166,5 +172,80 @@ describe("每波团面板：指标可用性", () => {
     const wrapper = mountList({ frames: [] });
     expect(wrapper.find(".teamfight-detail__bars").exists()).toBe(false);
     expect(wrapper.get(".teamfight-detail__duelnote").text()).toContain("没有分钟帧");
+  });
+});
+
+/**
+ * 「出装」这一项必须跟**团战那一刻**走。
+ *
+ * 用户 2026-09-29 报的就是这里：标签写着「团战时刻的出装」，画的却是这局终局那六件
+ * （`fullGameRows` 取的是 `participants[].items`）。所以下面既测「有录制 = 当时」，
+ * 也测「没录制 = 终局且**标签要说明**」——同一个格子两套含义，不写清就会被当成算错了。
+ */
+describe("每波团面板：出装跟团战那一刻走", () => {
+  const recordingFrame = (t: number, itemsFor: (seatId: number) => number[]): GameRecordingFrame => ({
+    t,
+    gameId: 1,
+    sampledAt: new Date(0).toISOString(),
+    // 真机形状：puuid **恒为空串**（Live Client Data 的 allPlayers 根本没有这个字段）。
+    players: seats.map((seat) => ({
+      puuid: "",
+      rid: `玩家${seat.participantId}#CN1`,
+      team: seat.team === BLUE ? "ORDER" : "CHAOS",
+      champ: `英雄${seat.championId}`,
+      cid: seat.championId,
+      pos: "MIDDLE",
+      lvl: 10,
+      k: 1,
+      d: 0,
+      a: 1,
+      cs: 100,
+      ward: 3,
+      dead: false,
+      respawn: 0,
+      bot: false,
+      items: itemsFor(seat.participantId),
+      spells: ["闪现", "引燃"],
+    })),
+    me: { rid: "玩家1#CN1", gold: 5000, lvl: 10, ad: 100, ap: 0, armor: 50, mr: 40, ms: 340, hp: 1500, maxHp: 1500 },
+  });
+
+  it("有录制时画的是团战开始那一刻的装备，而不是终局那六件", async () => {
+    // 团战在 174~182 秒 → 取 t<=174 的最后一帧（第 2 帧，t=120）。
+    const before = recordingFrame(120, (id) => [7000 + id, 7100 + id]);
+    const after = recordingFrame(300, (id) => [8000 + id, 8100 + id, 8200 + id]);
+    const wrapper = mountList({ recording: [recordingFrame(0, (id) => [6000 + id]), before, after] });
+    await wrapper.findAll(".teamfight-detail__metrics button")[4].trigger("click");
+    const ids = wrapper.findAll(".teamfight-bars__items .asset-icon-stub").map((icon) => Number(icon.attributes("data-id")));
+    // 每人 2 件、且都是「当时」那一组（7000+/7100+），没有一件来自终局组（8000+/8100+）。
+    expect(ids).toHaveLength(20);
+    expect(ids.every((id) => id >= 7000 && id < 7200)).toBe(true);
+    expect(ids.some((id) => id >= 8000)).toBe(false);
+  });
+
+  it("有录制时副标题写明「团战时刻」并带上时间", async () => {
+    const wrapper = mountList({ recording: [recordingFrame(120, (id) => [7000 + id])] });
+    await wrapper.findAll(".teamfight-detail__metrics button")[4].trigger("click");
+    const caption = wrapper.get(".teamfight-bars__head span").text();
+    expect(caption).toContain("团战时刻");
+  });
+
+  it("没有录制时退回终局出装，而且副标题必须写明是「终局」", async () => {
+    const wrapper = mountList();
+    await wrapper.findAll(".teamfight-detail__metrics button")[4].trigger("click");
+    const ids = wrapper.findAll(".teamfight-bars__items .asset-icon-stub").map((icon) => Number(icon.attributes("data-id")));
+    // 终局那组是 buildRow 里的 3000+index。
+    expect(ids.every((id) => id >= 3000 && id < 3010)).toBe(true);
+    expect(wrapper.get(".teamfight-bars__head span").text()).toContain("终局");
+  });
+
+  it("帧里 puuid 为空（真机形状）时仍然配得上人——绝不能按 puuid 配", async () => {
+    // 「当时」每人的装备按座位号各不相同，配错了就会串人。
+    const wrapper = mountList({ recording: [recordingFrame(120, (id) => [7000 + id])] });
+    await wrapper.findAll(".teamfight-detail__metrics button")[4].trigger("click");
+    const rows = wrapper.findAll(".teamfight-bars__row");
+    // 「出装」保持座位序，所以行 i 的图标 id 就该是 7000 + (i+1)。
+    const ids = rows.map((row) => Number(row.get(".teamfight-bars__items .asset-icon-stub").attributes("data-id")));
+    expect(ids.sort((a, b) => a - b)).toEqual(seats.map((seat) => 7000 + seat.participantId).sort((a, b) => a - b));
   });
 });

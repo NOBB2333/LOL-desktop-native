@@ -1,14 +1,51 @@
 import type { AppConfig, ShortcutDefinition } from "../types/domain";
 import { normalizePlayerTagSettings } from "../tags/settings";
 
-export const CURRENT_CONFIG_VERSION = 24;
+export const CURRENT_CONFIG_VERSION = 25;
 export const defaultOpenGameShortcutKey = "Ctrl+F1";
 
 /** 大乱斗换人前的等待秒数（对齐 AK `benchSwapAccumulatedDelaySeconds` = 2.9s）。 */
 export const defaultAramSwapDelaySeconds = 3;
 
-/** 对局录制的默认采样间隔（秒）。后端同一份默认值，改这里要一起改。 */
-export const defaultRecordingIntervalSeconds = 15;
+/**
+ * 对局录制的默认采样间隔（秒）。后端同一份默认值（`game_recording.zig` 的
+ * `default_interval_seconds`），改这里要一起改。5 秒是用户要的默认值，
+ * 设置页可以改成 5~120 之间的任意值。
+ */
+export const defaultRecordingIntervalSeconds = 5;
+/** 采样间隔的可选范围，与后端 `min/max_interval_seconds` 保持一致（后端会再夹一次）。 */
+export const minRecordingIntervalSeconds = 5;
+export const maxRecordingIntervalSeconds = 120;
+
+/**
+ * 录制的默认保留期（天）。`0` = 永久保留。后端同一份默认值
+ * （`game_recording.zig` 的 `default_retention_days`），改这里要一起改。
+ *
+ * 用户的要求原话：「支持清理，自动清理啊，老旧的录制，比如说一个月前；这块也支持手动设置，
+ * 比如说 3 天、7 天、一个月或者永久保留」。所以默认一个月、四个档位可选。
+ */
+export const defaultRecordingRetentionDays = 30;
+
+/**
+ * 保留期的四个档位。数字是落盘值（天），`0` 表示永久保留。
+ *
+ * 只给四档而不是一个任意数字输入框：「保留 17 天」这种值没有任何使用场景，
+ * 而一个自由输入的数字很容易被填成 0 或负数——0 又恰好是「永久」这个**最危险**的取值
+ * （磁盘只增不减）。固定档位把这个歧义彻底消掉。
+ */
+export const recordingRetentionOptions: { label: string; value: number }[] = [
+  { label: "3 天", value: 3 },
+  { label: "7 天", value: 7 },
+  { label: "一个月", value: 30 },
+  { label: "永久保留", value: 0 },
+];
+
+/** 把保留期归一到一个合法档位：认不出来的一律退回默认（绝不静默变成「永久」）。 */
+export function normalizeRecordingRetentionDays(value: number | undefined): number {
+  if (!Number.isFinite(value)) return defaultRecordingRetentionDays;
+  const days = Math.trunc(value as number);
+  return recordingRetentionOptions.some((option) => option.value === days) ? days : defaultRecordingRetentionDays;
+}
 
 /**
  * `{main_position}`（主玩位置）插在段位与逐场战绩之间。旧版本存下来的默认模板
@@ -167,10 +204,28 @@ export function migrateAppConfig(config: AppConfig) {
     }
   }
   if (config.version < 24) {
-    // v24：**可选**的对局录制，默认**关**。开着才在游戏进行中每 15 秒采一帧存本地，
+    // v24：**可选**的对局录制，默认**关**。开着才在游戏进行中每 5 秒采一帧存本地，
     // 打完可在对局页回放；默认关意味着升级上来的老配置行为完全不变。
     if (!config.providers.recording || typeof config.providers.recording.enabled !== "boolean") {
-      config.providers.recording = { enabled: false, intervalSeconds: defaultRecordingIntervalSeconds };
+      config.providers.recording = { enabled: false, intervalSeconds: defaultRecordingIntervalSeconds, retentionDays: defaultRecordingRetentionDays };
+      changed = true;
+    }
+  }
+  if (config.version < 25) {
+    // v25：录制保留期（自动清理老录制）。默认 30 天——「一个月前的老录制」在应用启动时
+    // 就会被回收；用户可在设置里改成 3 天 / 7 天 / 永久。
+    // ⚠️ 这里**只补字段**，不去猜用户的意图：老配置没有这个概念，就按默认的一个月。
+    // 也**不**顺手把已有的 intervalSeconds 从 15 改成 5——那个值我们已经落盘了，
+    // 用户可能自己调过，迁移里改配置是最容易招人骂的一类改动。
+    const retention = config.providers.recording?.retentionDays;
+    if (!Number.isFinite(retention)) {
+      config.providers.recording = {
+        enabled: config.providers.recording?.enabled ?? false,
+        intervalSeconds: Number.isFinite(config.providers.recording?.intervalSeconds)
+          ? config.providers.recording.intervalSeconds
+          : defaultRecordingIntervalSeconds,
+        retentionDays: defaultRecordingRetentionDays,
+      };
       changed = true;
     }
   }

@@ -17,11 +17,12 @@
  */
 import { computed, ref, watch } from "vue";
 import AssetIcon from "./AssetIcon.vue";
-import type { MatchParticipant, MatchTimelineFrame, MatchTimelineParticipant } from "../types/domain";
+import type { GameRecordingFrame, MatchParticipant, MatchTimelineFrame, MatchTimelineParticipant } from "../types/domain";
 import { clockOf, framesHaveDamage, interpolatedDamage, interpolatedGold, interpolatedTaken, TEAM_BLUE, TEAM_RED, teamLabel } from "../matches/timeline";
 import { describeLocation, type Teamfight } from "../matches/teamfights";
 import { sameTeamAsSeat } from "../matches/lineup";
-import { championImage } from "../utils/format";
+import { buildRecordedSeatLookup, recordedFrameAt, recordedPlayerForSeat } from "../matches/recordingLineup";
+import { championImage, recordingItemImage } from "../utils/format";
 
 const props = defineProps<{
   fights: Teamfight[];
@@ -32,6 +33,15 @@ const props = defineProps<{
   players?: MatchParticipant[];
   /** 每分钟帧（含十人 totalGold / 累计伤害 / 累计承伤）。缺失时对应指标自动降级。 */
   frames?: MatchTimelineFrame[];
+  /**
+   * 本机录制帧（可选）。
+   *
+   * 有它，「出装」这一项画的是**那一波团当时**的装备（按团战开始的秒数取最近一帧）；
+   * 没有就退回这局终局的六件。**两条口径必须在界面上分开写**——同一个位置在两套口径
+   * 下含义不同，不写清楚就会被当成算错了（这也是用户报「每波团的出装是不是没做」的原因：
+   * 标签写着「团战时刻的出装」，画的却是终局那六件）。
+   */
+  recording?: GameRecordingFrame[];
   /** 受控选中下标（父组件持有）；不传则组件内部自持。 */
   selectedIndex?: number;
   /** `split` = 左边团列表、右边详情（默认上下堆叠）。 */
@@ -218,10 +228,10 @@ const fightTaken = computed(() => {
  * 时这两项仍然会置灰，并把原因写在下面那行说明里 —— 不是把功能删掉，
  * 是别让人对着一张全零的图猜「是不是坏了」。
  *
- * 「出装」之所以能放在团战里：团战是**一个时间点**，装备不会在这几秒里换，
- * 所以摆这局终局那六件是站得住的（反过来说，想在上面那个可拖时间轴的面板上看
- * 「任意时刻的出装」就做不到——LCU 的帧和事件里都没有逐次购买事件，
- * 只有 SGP `DETAILS` 有，那属于还没接的活）。
+ * 「出装」放在团战里：团战是**一个时间点**，装备不会在这几秒里换。有本机录制时取的是
+ * **团战开始那一刻**最近的一帧（真正的「当时出装」）；没有录制才退回这局终局那六件，
+ * 并且副标题会写明是终局口径——同一个格子两套含义，不写清就会被当成算错了。
+ * 反过来说，想在可拖时间轴的面板上看「任意时刻的出装」已经由观战面板的录制口径做到了。
  */
 type MetricKey = "fightDamage" | "fightTaken" | "totalDamage" | "totalTaken" | "items";
 const framesWithDamage = computed(() => framesHaveDamage(props.frames ?? []));
@@ -249,6 +259,33 @@ watch(
 const metricLabel = computed(() => METRICS.value.find((item) => item.key === metric.value)?.label ?? "");
 /** 「出装」那一项画的是图标不是柱子，行模板要换一套。 */
 const itemsMetric = computed(() => metric.value === "items");
+
+/**
+ * 「这一波团当时」的十人出装——只有本机录到这一局才拿得到。
+ *
+ * 取团战**开始那一刻**最近的一帧录制（`recordedFrameAt`，不插值：装备是离散事件）。
+ * 存不下来的对局返回空 Map，`barSides` 会自动退回终局口径。
+ */
+const recordedItems = computed(() => {
+  const fight = selectedFight.value;
+  if (!fight) return null;
+  const frame = recordedFrameAt(props.recording, fight.startSeconds);
+  if (!frame) return null;
+  const lookup = buildRecordedSeatLookup(frame);
+  return { frame, lookup };
+});
+
+/** 这一项现在画的是「当时」还是「终局」——标签必须说实话。 */
+const itemsAreAtFight = computed(() => itemsMetric.value && recordedItems.value !== null);
+
+/**
+ * 「出装」这一项的副标题。**两套口径必须写出差别**：
+ * - 有录制 → 明确是「这一波当时」；
+ * - 没录制 → 必须说清是**终局**，否则会被当成「团战时刻的出装算错了」。
+ */
+const itemsCaption = computed(() =>
+  itemsAreAtFight.value ? `团战时刻的出装（本机录制 · ${clockOf(selectedFight.value?.startSeconds ?? 0)}）` : "本局终局出装（这一局没有本机录制）",
+);
 
 /** 座位号 → 完整十人详情（全场伤害/承伤在这里）。配对规则与观战面板共用 `matches/lineup.ts`。 */
 const fullGameRows = computed(() => {
@@ -299,6 +336,24 @@ const metricHasData = computed(() => itemsMetric.value || metricTotal.value > 0)
 const maxValue = computed(() => Math.max(1, ...tableRows.value.map((row) => valueOf(row))));
 
 /**
+ * 座位 → 出装。优先「这一波当时」（本机录制），没有就退回这局终局。
+ *
+ * 配对走 `recordedPlayerForSeat`（按 rid → 只比名字 → 同阵营 + 同英雄，**绝不能按 puuid**：
+ * 录制帧里那个字段恒为空字符串，按它比 100% 配不上）。`lookup` 里的 `claimed` 集合
+ * 保证两个座位不会抢同一个人——所以整张表要**共用同一个 lookup**，这里直接在闭包里取。
+ */
+function itemsOfSeat(participantId: number, championId: number, team: number): { id: number; name: string; iconUrl?: string }[] {
+  const recording = recordedItems.value;
+  if (recording) {
+    const player = fullGameRows.value.get(participantId);
+    const identity = player ? { team, championId, gameName: player.gameName } : null;
+    const recorded = recordedPlayerForSeat(team, participantId, identity, recording.lookup);
+    if (recorded) return recorded.items.map((id) => ({ id, name: "", iconUrl: recordingItemImage(id) }));
+  }
+  return fullGameRows.value.get(participantId)?.items ?? [];
+}
+
+/**
  * 柱状图数据：蓝方一组、红方一组；柱状图按当前指标降序，「出装」保持座位顺序
  * （按值排序对一排图标没有意义，而且会把对位顺序打乱）。
  */
@@ -306,7 +361,7 @@ const barSides = computed(() =>
   [TEAM_BLUE, TEAM_RED].map((team) => {
     const rows = tableRows.value
       .filter((row) => row.team === team)
-      .map((row) => ({ ...row, value: valueOf(row), items: fullGameRows.value.get(row.participantId)?.items ?? [] }));
+      .map((row) => ({ ...row, value: valueOf(row), items: itemsOfSeat(row.participantId, row.championId, row.team) }));
     if (!itemsMetric.value) rows.sort((left, right) => right.value - left.value);
     return { team, rows, total: rows.reduce((sum, row) => sum + row.value, 0) };
   }),
@@ -404,12 +459,13 @@ const killLines = computed(() => {
           <section v-for="side in barSides" :key="side.team" class="teamfight-bars" :class="{ 'teamfight-bars--items': itemsMetric }" :data-team="side.team">
             <header class="teamfight-bars__head">
               <b>{{ teamLabel(side.team) }}</b>
-              <span>{{ itemsMetric ? "团战时刻的出装（6 件）" : `${metricLabel}合计 ${compact(side.total)}` }}</span>
+              <span>{{ itemsMetric ? itemsCaption : `${metricLabel}合计 ${compact(side.total)}` }}</span>
             </header>
             <div v-for="row in side.rows" :key="row.participantId" class="teamfight-bars__row" :data-idle="!row.involved" :title="`${nameOfRow(row)} · ${championNameOf(row.championId)} · ${kdaText(row)}`">
               <AssetIcon kind="champion" :id="row.championId" :name="championNameOf(row.championId)" :fallback-url="championImage(row.championId)" size="xs" />
               <b class="teamfight-bars__name">{{ nameOfRow(row) }}</b>
-              <!-- 出装：团战是一个时间点，装备在这几秒里不会换，所以直接摆这局那六件。 -->
+              <!-- 出装：有本机录制时是**这一波当时**的六件（按团战开始秒数取最近一帧，
+                   装备是离散事件所以不插值）；没有录制才退回这局终局那六件。 -->
               <span v-if="itemsMetric" class="teamfight-bars__items">
                 <AssetIcon v-for="item in row.items.slice(0, 6)" :key="item.id" kind="item" :id="item.id" :name="item.name" :fallback-url="item.iconUrl" size="xs" />
                 <small v-if="!row.items.length">—</small>

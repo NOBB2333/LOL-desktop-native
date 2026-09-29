@@ -6,6 +6,7 @@ import ModeSwitch from "../components/ModeSwitch.vue";
 import PageHeader from "../components/PageHeader.vue";
 import UpdateCheckCard from "../components/UpdateCheckCard.vue";
 import { useAppStore } from "../stores/app";
+import { maxRecordingIntervalSeconds, minRecordingIntervalSeconds, normalizeRecordingRetentionDays, recordingRetentionOptions } from "../utils/config";
 import { normalizePlayerTagSettings, playerTagSettingItems, type PlayerTagSettings } from "../tags/settings";
 
 const app = useAppStore();
@@ -42,6 +43,30 @@ function clampNumericSetting(key: "requestTimeoutSeconds" | "cacheTtlMinutes", m
 function clampForwardedPort() {
   app.config.connection.forwardedPort = clampNumber(app.config.connection.forwardedPort, 0, 65535);
 }
+
+/**
+ * 录制采样间隔。
+ *
+ * 后端取用时另有一套收口（5~120 秒，见 `game_recording.zig` 的 `min/max_interval_seconds`），
+ * 这里按同一区间归一，免得界面写着 1 秒、实际按 5 秒跑。
+ */
+function clampRecordingInterval() {
+  app.config.providers.recording.intervalSeconds = clampNumber(app.config.providers.recording.intervalSeconds, minRecordingIntervalSeconds, maxRecordingIntervalSeconds);
+}
+
+/**
+ * 录制保留期的下拉选项。
+ *
+ * 用固定档位而不是数字输入框：「保留 17 天」没有使用场景，而自由输入很容易填成 0 ——
+ * 0 恰好是「永久保留」这个**最危险**的取值（磁盘只增不减）。档位表见 `utils/config.ts`。
+ * 落盘值认不出来时（手改过配置文件）下拉会显示默认档，但**不动**已存的值。
+ */
+const retentionValue = computed({
+  get: () => normalizeRecordingRetentionDays(app.config.providers.recording.retentionDays),
+  set: (value: number) => {
+    app.config.providers.recording.retentionDays = value;
+  },
+});
 </script>
 
 <template>
@@ -173,12 +198,50 @@ function clampForwardedPort() {
           <div class="settings-row">
             <div class="settings-row__label">
               <strong>对局录制</strong>
-              <small>游戏进行中每 15 秒把本地就能拿到的数据存一帧（战绩、补刀、视野分、装备、等级），打完可以在对局页按时间轴回看。数据只落本机；关掉则不会发生任何事</small>
+              <small>游戏进行中每隔一段时间把本地就能拿到的数据存一帧（战绩、补刀、视野分、装备、等级），打完可以在对局页按时间轴回看。数据只落本机；关掉则不会发生任何事</small>
             </div>
             <div class="settings-row__control">
               <NSwitch v-model:value="app.config.providers.recording.enabled" aria-label="对局录制" />
             </div>
           </div>
+          <!-- 间隔只在开启后才有意义：关着时不显示，免得设置页多一行永远用不上的输入框。 -->
+          <label v-if="app.config.providers.recording.enabled" class="settings-row">
+            <div class="settings-row__label">
+              <strong>录制采样间隔</strong>
+              <small>多久采一帧，默认 5 秒。越小越细、存得越多：5 秒一局约 300~700 帧（单局 1~2MB）。本机最多留最近 3 局，再按下面的保留期自动清理更早的。区间 {{ minRecordingIntervalSeconds }}~{{ maxRecordingIntervalSeconds }} 秒</small>
+            </div>
+            <div class="settings-row__control">
+              <input
+                v-model.number="app.config.providers.recording.intervalSeconds"
+                class="settings-input"
+                type="number"
+                :min="minRecordingIntervalSeconds"
+                :max="maxRecordingIntervalSeconds"
+                aria-label="录制采样间隔"
+                @change="clampRecordingInterval"
+              />
+              <span class="settings-unit">秒</span>
+            </div>
+          </label>
+          <!--
+            保留期（自动清理）。只在开关打开时出现，与上面那行同一个理由：关着的时候
+            这一行永远用不上。默认「一个月」——用户说的就是「老旧的录制，比如说一个月前」。
+          -->
+          <label v-if="app.config.providers.recording.enabled" class="settings-row">
+            <div class="settings-row__label">
+              <strong>录制保留多久</strong>
+              <small>超过这个时间的录制会在应用启动时（以及每次改完设置时）自动清掉。选「永久保留」则只受「最近 3 局」这一条限制。想立刻清可以选一个更短的档位再存一次</small>
+            </div>
+            <div class="settings-row__control">
+              <NSelect
+                v-model:value="retentionValue"
+                size="small"
+                aria-label="录制保留多久"
+                :options="recordingRetentionOptions"
+                style="width: 120px"
+              />
+            </div>
+          </label>
         </div>
 
         <!-- 路径信息 -->

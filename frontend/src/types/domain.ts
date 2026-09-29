@@ -311,7 +311,14 @@ export interface MatchTimelineFrame {
   damage: number[];
   /** 10 项；这一分钟各人的**累计承受伤害**（每波团承伤同理），缺座位/缺字段补 0。 */
   taken: number[];
-  /** 10 项；这一分钟各人的地图位置（观战「小人到处跑」用），0/0 = 该帧没有位置。 */
+  /**
+   * 10 项；这一分钟各人的地图位置（观战小地图的头像用它），0/0 = 该帧没有位置。
+   *
+   * 注意这是**每分钟一个采样点，不是轨迹**：帧之间怎么走的数据不存在。前端仍会把相邻两帧
+   * 之间平滑过渡（`matches/timeline.ts` 的 `animatedPositions`）——**只为画面连贯，不是
+   * 真实路径**（不插值就是「整分钟不动 + 集体闪现」，2026-09-27 试过、被否掉）；
+   * 真数据只有每分钟那一个点，悬停玩家时画的那串点就是它（`positionHistory`）。
+   */
   positions: { x: number; y: number }[];
 }
 
@@ -583,6 +590,60 @@ export interface ChampionOverview {
   dataStatus: DataStatus;
 }
 
+/**
+ * 一个技能的**每级数组**（1..5 级，个别技能 6 级）。
+ *
+ * 原样带出，**不做补齐也不做截断**——长度是几就是几。缺字段是空数组：
+ * 补 0 会让「不知道」看起来像「 0 伤害 / 0 冷却」。
+ */
+export interface ChampionAbility {
+  /** `q` / `w` / `e` / `r`。这是槽位的唯一真源（LCU 直接给，不靠下标猜）。 */
+  slot: string;
+  /** 技能名。LCU 已按客户端语言本地化——国服就是中文。 */
+  name: string;
+  description: string;
+  /** 带 `@TotalDamage@` 这类占位符的模板；占位符的取值要另一份数据，这里原样展示。 */
+  dynamicDescription: string;
+  /** 各级冷却（秒）。亚索 E 会出现 0.5 这种小数。 */
+  cooldown: number[];
+  /** 各级法力消耗。 */
+  cost: number[];
+  /** 施法距离。 */
+  range: number[];
+  /** LCU 资源路径（`/lol-game-data/assets/…`），走 `get_asset` 取图。 */
+  iconPath: string;
+  /** 技能演示视频（webm）；LCU 资源路径下的相对路径。 */
+  videoPath: string;
+  /** 演示视频的封面图。 */
+  videoImagePath: string;
+}
+
+/** 被动：没有等级数组，只有一条文案。 */
+export interface ChampionPassive {
+  name: string;
+  description: string;
+  iconPath: string;
+  videoPath: string;
+  videoImagePath: string;
+}
+
+/**
+ * 单英雄的技能详情。
+ *
+ * 来源是 LCU 本地文件 `/lol-game-data/assets/v1/champions/{id}.json`（不是公网），
+ * 所以技能名和描述**自带客户端语言**。真实每级伤害（AD/AP 系数）**不在**这里——
+ * LCU 那份里 `coefficients` 全是 0，前端因此只展示文案与冷却/耗蓝/射程。
+ */
+export interface ChampionAbilities {
+  championId: number;
+  alias: string;
+  name: string;
+  title: string;
+  passive: ChampionPassive | null;
+  spells: ChampionAbility[];
+}
+
+
 export interface EncounterRecord {
   gameId: number;
   selfPuuid?: string;
@@ -754,7 +815,19 @@ export interface AppConfig {
      * 存一帧（KDA / 补刀 / 视野分 / 装备 / 等级 / 复活倒计时），打完可以在对局页按
      * 时间轴回放。关着时后台那一跳不发任何请求。
      */
-    recording: { enabled: boolean; intervalSeconds: number };
+    recording: {
+      enabled: boolean;
+      intervalSeconds: number;
+      /**
+       * 录制的保留期（天）。**0 = 永久保留**，默认 30 天。
+       *
+       * 界面上给的是「3 天 / 7 天 / 一个月 / 永久」四个选项，落到配置里就是这个数字
+       * （「永久」= 0）。后端 `game_recording.parseSettings` 会再夹一次，
+       * 而且**必须**判字段在不在——它对缺失字段返回的 0 恰好是「永久」这个合法值，
+       * 直接读会把老配置静默升级成「永不清理」。见那条同名后端用例。
+       */
+      retentionDays: number;
+    };
   };
   ai: {
     enabled: boolean;

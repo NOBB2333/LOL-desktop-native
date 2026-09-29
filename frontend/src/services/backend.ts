@@ -11,6 +11,7 @@ import type {
   AppBootstrap,
   AppConfig,
   AssetPayload,
+  ChampionAbilities,
   ChampionOverview,
   ClaimOutcome,
   ClaimSnapshot,
@@ -229,6 +230,21 @@ export const backend = {
     });
     assetRequests.set(key, request);
     return request;
+  },
+  /**
+   * 单英雄的技能详情（技能名/描述/冷却/耗蓝/射程 + 被动）。
+   *
+   * **单开一条命令、按需拉**：一个英雄一份 ~30-70KB 的 LCU 原始 JSON，塞进 245 行的
+   * 英雄列表里会让首屏白白多等几秒。技能名和描述由 LCU **按客户端语言**给出
+   * （国服就是中文），我们不需要自己的翻译表。
+   *
+   * 注意这里**没有**每级伤害数字：LCU 那份里 `coefficients` 全是 0，真实系数只在
+   * CommunityDragon 的 `mSpellCalculations` 里。宁可少给，也不给编出来的数。
+   */
+  async championAbilities(championId: number): Promise<ChampionAbilities> {
+    if (!Number.isFinite(championId) || championId <= 0) throw new Error("无效的英雄 id");
+    if (usesFixtureData()) return browserBackend.championAbilities(championId);
+    return command<ChampionAbilities>("get_champion_abilities", { championId });
   },
   /**
    * 按 LCU 资源路径取图标。

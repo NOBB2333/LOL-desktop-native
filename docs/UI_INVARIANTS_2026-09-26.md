@@ -98,6 +98,24 @@
   全宽时间轴+可拖游标 │ 回放控制条） + `MatchDetailPanel`（团战/事件流）**；
   `人` = 逐局行（他英雄/我英雄/双方 KDA），行可再点开 `MatchDeepDetail`。
   深链 `?tab=players&player=` 仍生效。
+- **`MatchDeepDetail` 一共挂在五个地方，只维护这一份**（09-27 用户要求「抽离成组件，
+  只要维护一套就够了，两个地方都可以看」；09-28 又补了首页）：
+  ① 历史页「对局」页签展开一局；② 历史页「人」页签再钻一层；
+  ③ **战绩页索引模式**右栏 `MatchHistoryDetail` 下面（`MatchesView.vue` 里的 `.matches-deep`）；
+  ④ **战绩页完整对局模式**每行展开之后（走 `MatchDetailCard` 的 **`#deep` 具名插槽**）；
+  ⑤ **首页**最近对局展开之后（同一个 `#deep` 插槽）——用户反馈「首页的下边怎么没有对应的
+  明细图表」，原来首页只挂了卡片、没往插槽里塞东西。
+  - 战绩页 / 首页那几处要的三样数据（`selfPuuid` / `encounterCounts` / `championNameOf`）各自
+    在宿主 view 里补，`champions` / `encounters` 的 queryKey 与历史页完全相同 →
+    各页来回切命中同一份缓存；并且只在 `deepDetailWanted`（索引模式选中了一局 / 展开了一行）
+    为真时才 `enabled`，免得打开页面就白发两个请求（`DashboardView.test.ts` /
+    `MatchesView.test.ts` 各有一条守卫用例）。
+  - 插槽而不是给卡片加一堆 props：`MatchDeepDetail` 自己取数，卡片没必要认识它。
+    **插槽内容只在 `expanded` 为真时渲染**，没展开的行不会多发任何请求
+    （`MatchDetailCard.test.ts` 有守卫用例）。
+  - 视角传的是**这一局里被查询的那个人**（`match.participants[0].puuid`，战绩列表每局只带
+    查询者一条），拿不到时退回当前登录账号（首页的 LCU 兜底快照 `RecentMatch` 根本没这个
+    字段，走的就是这条兜底）。
 - `MatchLineupPanel.vue`、`MatchMetPlayers.vue` **已删**，别捡回来；它的「四指标切换」
   已迁到 `TeamfightList` 详情右上角（`本波输出/本波承伤/全场输出/全场承伤/出装`）。
   「遇到过 N」角标现在长在观战面板玩家行上。
@@ -138,18 +156,52 @@
   「本波输出/本波承伤」**置灰 + 删除线**、默认指标自动跳「全场输出」、上方给琥珀色说明。
   预览开关 `?frameDamage=0` 就是这条真机形状。**注意这是个真判断不是历史包袱**：
   合并失败（离线 / 区服不在 SGP 白名单 / 拿不到 entitlement / 对局太新）时它就会走到降级。
-- **任意时刻的出装做不了**（LCU 无 `ITEM_PURCHASED`）；`.rofl` 解析也给不了伤害时间线
-  （关键帧回放）。**但「终局那六件」有**（十人详情的 `participants[].items`），所以
+- **任意时刻的出装**：官方数据源里没有（LCU 无 `ITEM_PURCHASED` 事件；`.rofl` 解析也给不了
+  伤害时间线）。**但「终局那六件」一直有**（十人详情的 `participants[].items`），所以
   「装备」可以当行指标 / 团战指标用（团战是一个时间点，装备不会换，站得住）。
-  要「拖游标看某一刻的出装」必须走 SGP——**这条路已经通了一半**：`fetchSgpMatchDetails`
-  每次拉时间线时本来就会取回整份 `DETAILS`，里面有 `ITEM_PURCHASED` / `SKILL_LEVEL_UP` /
-  `WARD_PLACED` 等本地完全没有的事件（实测 336 条 `ITEM_PURCHASED`）。
-  差的是「把这些事件也写进输出 + 前端按游标还原装备栏」，未开工。
+  - ✅ **09-27 起，「此刻出装」有了**——但走的是**本机录制**而不是 SGP：观战面板拿到
+    `props.recording`（见「本地录制」那一节）时，「装备」这一项变成**游标那一刻**身上的
+    装备、K/D/A 胶囊也变成那一刻的战绩；没录到就原样退回终局口径。**两条路都要留着**：
+    录制是可选开关 + 只对本机打过的局有效，所以终局口径永远不是冗余分支。
+  - 另一条（未开工）：`fetchSgpMatchDetails` 每次拉时间线时会取回整份 `DETAILS`，里面
+    有 `ITEM_PURCHASED` / `SKILL_LEVEL_UP` / `WARD_PLACED` 等本地完全没有的事件
+    （实测 336 条 `ITEM_PURCHASED`）。差的是「把这些事件写进输出 + 前端按游标还原装备栏」。
+    好处是**覆盖所有对局**（不要求本机录过），坏处是依赖公网 + entitlement。
 - 观战面板硬约定：**小地图常驻**（别再做出「地图 / 实时伤害」那种切换）；
   玩家行**两行封顶**（①名字 + 遇到过的角标 · KDA 胶囊 · 经济胶囊 ②**由
   `.spectate__rowbar` 的切换器决定**：输出/承伤/推塔/装备——前三项柱状图、第四项 6 件
   图标），塞不下的补刀/视野挂 `title`；等级角标用全 app 徽章语言（不另配色）；
   游标时间气泡贴边要改对齐方向。
+  - ⚠️ **小地图走位：平滑过渡，但绝不许往未知坐标靠**（09-27 一天内改过两版，**09-28 定稿**，
+  勿再回退）。位置数据是**每分钟一个采样点**，两帧之间这位玩家实际怎么走的、数据里根本没有。
+  - ⚠️ **但「匀速」也是错的**（09-28 用户指出）：人物移动不一定是匀速——传送 / 闪现 / 回城
+    是**瞬间**换位置，按整分钟线性插值会把一次闪烁拉成一分钟的慢走。
+    处理在 `matches/timeline.ts` 的 `easedFraction(fraction, distance)`：位移
+    `<= INSTANT_MOVE_DISTANCE`（3200 世界单位）时**照旧线性**；超过就按
+    `fraction / INSTANT_MOVE_SHARE`（`0.12`，即**前 12% 的时间走完全程**）压成缓动，
+    剩下的时间小人贴在新位置上不动。参数是估算（LCU 不给位移类型），
+    ⚠️ 但 `fraction` 是**整分钟的比例**、不是秒——写 `1/60` 那种会算出「只是稍微快一点」的错觉。
+    回归用例：`never relies on puuid — it is empty on every real frame` 同组的
+    `map movement is not uniform` 三条。
+    两版之间的取舍是实测出来的：
+  - **不插值**（09-27 第一版 `sampledPositions`：取「游标之前最近的一帧」原样返回）→ 十个小人
+    **整分钟纹丝不动、然后集体闪现**。用户当场否掉：「原本在地图上来回跑那个移动没有了，
+    现在变成了瞬间跳」。
+  - **平滑插值**（09-28 起 `animatedPositions`）＝现在的做法。它**只是为了让画面连贯，
+    不是真实路径**，所以地图 `title`（`MAP_GRANULARITY_NOTE`）+ 底部提示条都必须把这一点
+    写出来，别让人以为看到的是采到的 60fps 走位。
+  - **唯一不许做的是「往未知坐标插值」**——这才是当初「有时候会往人没去过的地方走」的**真 bug**。
+    旧实现只判了左端（`if (!known) return {x:0,y:0}`），右端是 `(0,0)` 时照样按比例插过去，
+    小人就被拉向地图角落。现在两端任一端未知就**原地保留已知的那一端**；两端都未知才交 `0/0`
+    给上游跳过。回归用例：`map positions glide between per-minute samples without inventing
+    unknown spots` / `never interpolates toward an unknown position` / `does not let one unknown
+    seat poison the others`。
+  - **真数据只有每分钟那一个点**，由悬停采样点承担：`positionHistory` 画淡色小点，**只画点、
+    不连线**（点之间没数据，连起来就是编）。因为头像是插值到两帧之间的，**不再掐掉尾巴**——
+    最后那个真采样点标的是「最后一次确认他在哪」，留着才对得上账。
+  - 金币 / 等级 / 累计伤害当然也插值——它们本该连续。
+  - 不插值时的观感问题必须在界面上写出来（地图 `title` + 底部提示条），
+    否则「一分钟才动一次」会被当成渲染卡顿。
 - **时间轴事件标记是三种形状**（09-26 用户明确要求，覆盖更早的「只用细刻度」约定）：
   **击杀 = 细竖刻度（2×12）· 野怪 = 实心菱形（7×7 `rotate(45deg)`，amber）·
   推塔 = 空心圆环（8×8、`border-radius:50%`、1.5px 描边 + 底色填充）**。
@@ -261,12 +313,40 @@ puuid 判等，所以「被识别成我」是**名单合并把身份挪了位**�
 
 ## 本地录制（可选功能，默认关）
 
-- 设置里的「对局录制」= `config.providers.recording.{enabled, intervalSeconds}`。**默认关**，
-  关着时后台那一跳只比一次配置指纹、**不发任何请求**（用户明确要求「先做成可选的」）。
+- 设置里的「对局录制」= `config.providers.recording.{enabled, intervalSeconds, retentionDays}`。
+  **默认关**，关着时后台那一跳只比一次配置指纹、**不发任何请求**（用户明确要求「先做成可选的」）。
+  - `retentionDays`：**保留期（天），`0` = 永久**，默认 **30**。设置页给的是固定档位
+    「3 天 / 7 天 / 一个月 / 永久保留」（`recordingRetentionOptions`）——不用数字输入框是因为
+    自由输入很容易填成 0，而 0 恰好是「永久保留」这个**最危险**的取值（磁盘只增不减）。
+  - ⚠️ **后端解析必须判字段在不在**，不能直接 `jsonInt("retentionDays")`：它对**缺失字段**
+    也返回 0，而 0 在这里是合法值 → 所有 v24 及以前的老配置会被静默升级成「永不清理」，
+    用户要的「自动清理老录制」就永远不会发生。同名前端迁移也是同一个坑（`config.version < 25`）。
 - 只在**真在局内**（phase ∈ GameStart / InProgress / Reconnect）采；采的是本机
   `127.0.0.1:2999`（Live Client Data），**不走公网**。SSH 隧道下本地 2999 不在本机 → 不采。
-- 引擎在 `src/backend/game_recording.zig`：15 秒一帧（5~120 可配）、单局上限 360 帧、
-  只保留最近 **3** 局，落在 SQLite 的 `gameReplay` / `gameReplayMeta`。
+- 引擎在 `src/backend/game_recording.zig`：**默认 5 秒**一帧（`5~120` 可配，设置页里
+  「对局录制」打开后才出现「录制采样间隔」输入框）、单局上限 **720 帧**（5 秒 × 720 = 60 分钟），
+  落在 SQLite 的 `gameReplay` / `gameReplayMeta`。
+  - ⚠️ **改默认值要同步四处**：`game_recording.zig` 的 `default_interval_seconds` /
+    `default_retention_days`、`src/backend.zig` 的 `default_config` 字面量、
+    `frontend/src/utils/config.ts` 的 `defaultRecordingIntervalSeconds` /
+    `defaultRecordingRetentionDays`、`fixtures/data.ts` 的 `defaultConfig`。
+    前端另有一份 `min/maxRecordingIntervalSeconds` 与后端 `min/max_interval_seconds` 对齐——
+    两边不一致就会出现「界面写着 1 秒、实际按 5 秒跑」。
+  - ⚠️ **改配置版本号要同步四处**（这次是 24 → 25）：`default_config` 的 `"version"`、
+    前端 `CURRENT_CONFIG_VERSION`、`migrateAppConfig` 里的新分支、`fixtureConfig.version`。
+    fixture 那处最容易漏——漏了 `config.test.ts` 的「迁移是幂等的」几条会立刻红
+    （`migrateAppConfig` 因为 `version < CURRENT` 恒返回 `true`）。
+- **清理有两条规则，一起判**（`pruneRecordings`，命中任一即删，帧跟着删）：
+  ① 只留最近 `kept_games = 3` 局；② `retentionDays > 0` 时按 `updated_at` 超期回收。
+  只做 ① 的话，「三个月没打、库里躺着三局占地方」永远清不掉，所以 ② 是必需的。
+  - **触发时机**：`captureTick` 检测到**配置指纹变化**时立刻清一次（含开机第一跳），
+    所以「把保留期改成 3 天」是**存下就生效**，不用等打完下一局；老录制在应用启动时被回收。
+    另外每写一帧也会清一次。
+  - **开关关着也照清**：保留期说的是「留多久」，跟「现在录不录」是两件事。
+  - ⚠️ **时钟不可靠时绝不删**（`runtimeNowMillis` 在 io 未接上时返回 0 → 「过期多久」算出负数）：
+    `now_seconds == 0` 一律判为「没过期」。宁可多留，也不能误删用户的录制。
+  - `retentionDays` 为负数当脏数据 **退回默认 30 天**，而不是夹成 1 天或当成永久
+    （「保留 1 天」等于把录制删光，不该是脏数据的归宿）。
 - ⚠️ **局号只能从 gameflow session 取，不要从 `allgamedata` 取**（09-27 踩过大坑）：
   Live Client Data 的 `gameData` 里**根本没有 `gameId`**——只有
   `gameMode` / `gameTime` / `mapName` / `mapNumber` / `mapTerrain` 五个字段
@@ -282,13 +362,55 @@ puuid 判等，所以「被识别成我」是**名单合并把身份挪了位**�
   `> 0` = 功能好好的、只是这一局没录。两句混成一句时，用户完全没法判断是自己用错了
   还是功能坏了——当时就是这个把排查带偏的。`recordedGames` 由后端在
   `lol.get_game_recording` 里回（`gameReplayMeta` 的条数）。
-- 单帧实测约 **3 KB**（十人各 ~280B + 本人 ~130B）；30 分钟一局 ≈ **360 KB**，
-  顶格 360 帧 ≈ 1.1 MB，保留 3 局总计 **≤ ~3 MB**。所以不需要按时间清理。
+- 单帧实测约 **3 KB**（十人各 ~280B + 本人 ~130B）；默认 5 秒时 30 分钟一局 ≈ **330 帧
+  ≈ 1 MB**，顶格 720 帧 ≈ 2.2 MB。体积上限靠**两条规则**兜住：局数 ≤ 3 局 + 保留期
+  （默认 30 天），所以稳态占用 **≤ ~7 MB**。
+- **取数只有一个口**：`composables/useGameRecording.ts`（queryKey `["game-recording", mode, gameId]`）。
+  现在唯一的消费方是观战面板的「此刻装备 / 此刻 K/D/A」。传参用 **getter**
+  （`() => props.gameId`）而不是 `props.gameId`：宿主换一局时不重建组件，传值会让它一直盯着旧局号。
+  - ⚠️ 09-28 之前还有一个独立的「本地录制 · 时间轴」面板（`MatchRecordingPanel`）也读它，
+    用户认为那块与观战面板重复（它当初要解决的「战绩/装备不随时间变」已经由观战面板的
+    「此刻」口径覆盖），**组件已删除**。别把它捡回来。
+- **观战面板怎么用录制**（09-27 起的口径）：
+  - `MatchDeepDetail` 取数后把 `frames` 作为 `recording` prop 传给 `MatchSpectatePanel`；
+    面板**自己不取数**（它是纯展示组件，加了 `useQuery` 会让它的单测缺 QueryClient 直接挂）。
+  - 游标 → 帧：取 `t <= 游标` 的**最后一帧**（录制帧 5 秒一个，这里**不做插值**：
+    装备是离散事件，「上一帧身上是什么」就是准确答案，插值反而会造出一件不存在的出装）。
+    游标早于第一帧时退回第一帧。
+  - 座位 → 人：**必须按召唤师名（rid）配对，绝不能按 puuid**。⚠️ 09-28 定稿：
+    `allPlayers` 的官方字段集是 `championName / isBot / isDead / items / level / position /
+    rawChampionName / respawnTimer / runes / scores / skinID / summonerName / summonerSpells / team`
+    —— **根本没有 `puuid`**（后端 `jsonField` 拿不到就写 `""`）。旧口径「按 puuid 配」在真机上
+    **永远配不上** → 静默退回终局口径，表现就是用户报的「拖时间轴战绩和装备不变」。
+    配对逻辑抽在 `matches/recordingLineup.ts` 的 `recordedPlayerForSeat`，三级降级：
+    ① 整条 rid（`名字#编号`）相等 → ② 只比名字部分（十人详情里没有 `tagLine`；腾讯区服
+    记录里的 `rid` 也可能只有名字）→ ③ 同阵营 + 同英雄 → 同阵营任意没被认领的。
+    一次配对用一个 `claimed` 集合**防止两个座位抢同一个人**（同队两个同名/同英雄时靠这个兜住）。
+    ⚠️ 帧里可能只有 5 个人（训练/自定义），配不上的座位就空着，别把它当错误。
+    回归用例：`recordingLineup.test.ts` 12 条 + `MatchSpectatePanel.test.ts` 里那条
+    「帧里 puuid 为空（真机形状）时仍然按 rid 配上」。
+  - **阵亡灰化 + 复活读秒**（09-28 加）：`allPlayers[].isDead` / `respawnTimer` **是真字段**
+    （实测录制帧里 `dead` 会 0→1→0 翻转、`respawn` 从 ~20 递减），所以**只有「有本机录制」时**
+    才拿得到；每分钟一个采样的时间线帧里**没有**阵亡状态——没有录制时**不灰化、不读秒**，
+    原样显示（别去伪造一个「猜的」死亡区间）。实现：`MatchSpectatePanel` 的 `deathStateOf()` →
+    `.spectate__dot.is-dead`（灰边 + `opacity:.72` + 子 `.asset-icon` 加 `grayscale`，
+    人**仍停在原地**）+ `.spectate__dot-timer`（右下角红底倒计时，`Math.ceil`）。
+  - **阵亡期间必须钉住，不许再动**（09-29 修）：上一版阵亡只做了灰化，**位置照旧走
+    `animatedPositions` 插值** → 用户看到「人死了还能动」。修法 `matches/timeline.ts` 的
+    `freezePositionWhileDead(positions, frames, seconds, index, dead)`：`dead` 为真时把圆点
+    钉在**最后一次活着时**的坐标（`lastKnownPositionBefore`），不参与插值。
+    回归用例 `MatchSpectatePanel.test.ts` 的「观战面板：阵亡后不能再动」三条——第三条同时
+    钉住两个人（一个死一个活）证明**只对死人生效、不误伤活人**。
+  - 配不上人 / 没有帧 → 原样退回十人详情的**终局**装备与 KDA，并去掉 `data-live` 标记。
+  - 有录制时必须在通栏写一句「本局有本机录制 · 装备与 K/D/A 跟随游标」——同一枚 KDA 胶囊
+    在两种模式下含义不同，不写就会被当成算错了。回归用例见 `MatchSpectatePanel.test.ts`
+    的「观战面板：本机录制的『此刻』口径」四条。
 - **页面只画真采到的字段**（KDA / 补刀 / 视野分 / 装备 / 等级 / 复活倒计时）。官方接口
   **没有伤害字段**，也没有 ITEM_PURCHASED 事件——装备变化只能靠相邻两帧对比，精度 = 采样间隔。
   别为了「曲线好看」去编伤害。
-- `frames` 为空**不是错误**（开关没开 / 不是本机在打 / 已被回收），所以
-  `MatchRecordingPanel` 在空帧时**整块不渲染**；只有「开关开着却没录到」才提示，见上一条。
+- `frames` 为空**不是错误**（开关没开 / 不是本机在打 / 已被回收）→ 观战面板**什么都不显示**
+  （不出现「此刻」标记、KDA 与装备退回终局口径）；只有「开关开着却没录到」才值得提示，
+  靠 `recordedGames` 区分，见上一条。
 - 加命令要同步三处，`scripts/check-bridge-parity.mjs` 会校验（`lol.get_game_recording`）。
 - **别按视口宽度写媒体查询**（09-27 实测踩到）：它挂在 `MatchDetailCard` / `MatchHistoryDetail`
   里，而 `.match-row` 的栅格最小宽度约 **990px**、外面还套着 `overflow-x: auto` —— 窗口再窄，
@@ -296,6 +418,48 @@ puuid 判等，所以「被识别成我」是**名单合并把身份挪了位**�
   （390px 视口下截图一看就露）。版面要跟**容器的实际宽度**走，窄窗口就横向滚。
   验证这类版面必须用**桌面宽度**截图：Chrome 的 `--window-size` 是**设备像素**，
   配 `--force-device-scale-factor=2` 会让 CSS 视口只剩一半，静默走进窄屏分支。
+
+## 每波团的装备口径（09-29 加）
+
+- 「出装」这一档**必须跟团战那一刻走，不是终局**。实现：`MatchSpectatePanel` 之外的
+  `TeamfightList.vue` 接一个 `recording` prop（由 `MatchDetailPanel` / `MatchDeepDetail`
+  一路透传下来），用 `recordedFrameAt(frames, selectedFight.startSeconds)` 取**团战开始那一刻**
+  的帧，再交给 `recordingLineup.ts` 的 `recordedPlayerForSeat` 把座位配到人。
+- **有录制**：标题写「团战时刻的出装（本机录制 · 04:18）」，画的是那一刻的六件。
+  **没有录制**：标题写「本局终局出装（这一局没有本机录制）」，画终局那六件。
+  ⚠️ 这两个措辞**不能省也不能互相冒充**——同一排图标在两种口径下含义完全不同，不写就会被
+  当成「装备显示错了」。判据是 `itemsAreAtFight`（`recordedItems.value !== null`），不是
+  `frames.length`（帧在、但这波团之前没人被配上也算「没有真数据」）。
+- 出装这一档**不需要 `framesWithDamage`**（它不吃伤害字段），所以哪怕分钟帧里没有伤害、
+  「本波」两项被置灰，出装照样可选、照样是按团战时刻画的。
+- 回归用例：`TeamfightList.test.ts`「每波团面板：出装跟团战那一刻走」四条 —— 有录制 / 无录制 /
+  副标题措辞 / 帧里 puuid 为空。
+
+## 英雄技能面板（09-29 加）
+
+- 数据源 = **LCU 的单英雄文件** `GET /lol-game-data/assets/v1/champions/{id}.json`
+  （走已有桥能力，缓存 kind `championAbilities`，前缀 `v1:`）。**不要**换成 CommunityDragon 的
+  `characters/<alias>/<alias>.bin.json`：那份文件里的技能文件夹名是**任意的**
+  （`OlafAxeThrowCastAbility` / `FeastAbility` / `SingedPAbility`），按名字匹配对 **245 个英雄里
+  有 115 个会配错**；要拿顺序只能再去读 `CharacterRecords/Root.spells`，徒增一次请求。
+- 这份文件**已经带 `spellKey`（`q`/`w`/`e`/`r`）= 权威槽位**，**名字与描述也已经按客户端语言
+  本地化**（不用自带翻译表），还带 `cooldownCoefficients` / `costCoefficients` / `range`。
+  实测 **173/173** 个英雄四个槽位 + 被动全都齐。
+- ⚠️ **LCU 没有真实的每级伤害**：`coefficients` 全是 0，`dynamicDescription` 里是
+  `@TotalDamage@` 这类**占位符**。→ 面板**原样展示占位符并加一句说明**，**绝不替它填数字**。
+  真实数值只在 CommunityDragon 的 `mSpellCalculations.mFormulaParts` 里有（要自己套英雄等级/
+  装备/AP 系数算），本轮不做。
+- `cooldown` / `cost` / `range` 是**按等级的有序数组**：写的时候**不许补零也不许截断**
+  （缺失写 `[]`，绝不用 `[0,0,0]` 顶替「不知道」）；展示只取**前 5 级**。
+  `0.5` 这类小数**原样保留**（别被四舍五入成 `0`）。
+- 入口在英雄页每行/每卡的「查看技能」按钮：**一次只开一个**（`openChampionId` 单值），
+  再点同一个即收起。`championId` 变化时**必须把标签重置回 Q**（否则换英雄后停在上一个英雄
+  点过的 R 上）。
+- 回归用例：`ChampionAbilityPanel.test.ts` 10 条 + `champion_abilities.zig` 6 条。
+  后端那条模块**必须在 `backend.zig` 的 `test {}` 里 `refAllDecls`**，否则只被 `main.zig`
+  调用的 `pub fn` 拿不到语义分析 → 用例全绿但打包挂（见 MEMORY 的 Zig 惰性分析）。
+- 开关口径：**只有「本机开着客户端」才取得到**（离线拿不到）。失败文案必须**明确说是需要开
+  客户端**，并写清「上面那份英雄列表与 OP.GG 统计不受影响」——不然会被当成整页坏了。
 
 ## 打野路线图
 

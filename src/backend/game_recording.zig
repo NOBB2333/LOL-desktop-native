@@ -13,8 +13,9 @@
 //! - **开关默认关**：关着时后台那一跳只比一次配置指纹，**不发任何请求**。
 //! - 只在**真正在局内**（gameflow phase ∈ GameStart / InProgress / Reconnect）才采，
 //!   采的是已有本地接口（实测 allgamedata 约 42ms / 70KB），**不走公网**。
-//! - 每局帧数上限 `max_frames_per_game`（15s × 360 ≈ 90 分钟），只保留最近
-//!   `kept_games` 局，更早的连帧一起删掉。单帧约 1~3KB。
+//! - 每局帧数上限 `max_frames_per_game`，只保留最近 `kept_games` 局，更早的连帧一起删掉。
+//!   单帧约 1~3KB（十人各十几个字段）。默认间隔 5 秒 = 一局最多 720 帧 ≈ 1~2MB，
+//!   三局上限约 3~6MB，所以**不需要定时清理**。
 //! - 只落本地 SQLite（`gameReplay` / `gameReplayMeta`），跟战局文件、公网都无关。
 const std = @import("std");
 const native_sdk = @import("native_sdk");
@@ -22,15 +23,24 @@ const storage = @import("storage");
 const backend = @import("../backend.zig");
 const build_options = @import("build_options");
 
-/// 默认采样间隔（秒）。用户明确要 15 秒。
-pub const default_interval_seconds: i64 = 15;
-/// 允许的区间：比 5 秒更密没必要（一帧就是一次本地往返），比 120 秒更疏就看不出走势了。
+/// 默认采样间隔（秒）。用户明确要 **5 秒**（原先是 15 秒），并且要能在设置里自己调。
+pub const default_interval_seconds: i64 = 5;
+/// 允许的区间：比 5 秒更密没必要（一帧就是一次本地往返，2999 接口虽然便宜但也没必要更密，
+/// 而且 `items[]` 差分只在装备变化上才有意义）；比 120 秒更疏就看不出走势了。
 pub const min_interval_seconds: i64 = 5;
 pub const max_interval_seconds: i64 = 120;
-/// 一局最多存多少帧。15 秒 × 360 = 90 分钟，够覆盖任何一局。
-pub const max_frames_per_game: usize = 360;
+/// 一局最多存多少帧。间隔默认 5 秒，720 帧 = 60 分钟，够覆盖任何一局（超过 60 分钟的
+/// 极端对局只保留前 60 分钟）；按用户把间隔调成 30 秒算，也就是 6 小时的余量。
+pub const max_frames_per_game: usize = 720;
 /// 只保留最近几局。多了磁盘会慢慢涨，而且旧局本来就没人看。
 pub const kept_games: usize = 3;
+/// 录制的保留期（天）。**0 = 永久保留**，默认 30 天——用户明确要求「老旧的录制自动清理，
+/// 比如说一个月前」，同时又要能自己选 3 天 / 7 天 / 一个月 / 永久。与前端
+/// `utils/config.ts` 的 `defaultRecordingRetentionDays` 必须一致。
+pub const default_retention_days: i64 = 30;
+/// 保留期的上限（10 年）。再大就等于永久，但没有 0 那种「一次都不清」的语义，
+/// 这样界面给个超大的数字也不会把清理逻辑彻底关掉。
+pub const max_retention_days: i64 = 3650;
 /// 键类型名。存放格式：`gameReplay` / `<gameId>:<6 位序号>`，序号补零让字典序 = 时间序。
 pub const replay_kind = "gameReplay";
 pub const replay_meta_kind = "gameReplayMeta";
@@ -41,6 +51,7 @@ const frame_capacity: usize = 16 * 1024;
 pub const Settings = struct {
     enabled: bool = false,
     interval_seconds: i64 = default_interval_seconds,
+    retention_days: i64 = default_retention_days,
 };
 
 pub fn parseSettings(config_json: []const u8) Settings {
@@ -57,6 +68,20 @@ pub fn parseSettings(config_json: []const u8) Settings {
     const interval = backend.jsonInt(recording, "intervalSeconds");
     if (interval > 0) {
         settings.interval_seconds = @max(min_interval_seconds, @min(max_interval_seconds, interval));
+    }
+    // ⚠️ 不能直接 `jsonInt`：它对**缺失字段**也返回 0，而 0 在这里是「永久保留」这个
+    // 有意义的取值。老配置（v24 及以前）根本没有 `retentionDays`，必须落到默认的 30 天，
+    // 而不是被当成「用户选了永久」。所以先判字段在不在。
+    if (recording.object.get("retentionDays")) |raw| {
+        const days: i64 = switch (raw) {
+            .integer => |n| n,
+            .float => |n| @intFromFloat(n),
+            .string => |text| std.fmt.parseInt(i64, std.mem.trim(u8, text, " \t\r\n"), 10) catch default_retention_days,
+            else => default_retention_days,
+        };
+        // 0 是合法的「永久」；负数当脏数据，退回**默认值**而不是夹成 1 天——
+        // 「保留 1 天」等于把录制删光，不该是脏数据的归宿。
+        settings.retention_days = if (days == 0) 0 else if (days < 0) default_retention_days else @min(max_retention_days, days);
     }
     return settings;
 }
@@ -75,8 +100,14 @@ pub fn captureTick(self: *backend.Runtime, io: std.Io) bool {
         self.recording_config_hash = hash;
         self.recording_wanted = settings.enabled;
         self.recording_interval_ms = settings.interval_seconds * 1000;
+        self.recording_retention_days = settings.retention_days;
         // 刚打开开关就先采一帧，不用干等一个间隔。
         self.recording_last_frame_ms = 0;
+        // 配置一变（含开机第一跳）就立刻按新的保留期清一次。这样：
+        // 「把保留期从 30 天改成 3 天」是**存下就生效**的，不用等打完下一局；
+        // 「一个月前的老录制」在应用启动时就会被回收。开关关着也照清——保留期说的是
+        // 「留多久」，跟「现在录不录」是两件事。
+        pruneNow(self);
     }
     if (!self.recording_wanted) return false;
 
@@ -87,6 +118,20 @@ pub fn captureTick(self: *backend.Runtime, io: std.Io) bool {
     // 无论采没采到都把节拍推一格：不在局内时每一跳都去问一次 LCU 是白花钱。
     self.recording_last_frame_ms = now;
     return captureFrame(self, io) catch false;
+}
+
+/// 按 `self.recording_retention_days` 立刻清一次。给 `captureTick` 的配置变更分支用。
+fn pruneNow(self: *backend.Runtime) void {
+    const store = if (self.storage) |*value| value else return;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    pruneRecordings(store, arena.allocator(), self.recording_retention_days, nowSeconds(self));
+}
+
+/// 当前 Unix 秒。`io` 没接上时返回 0 —— 那会让「已过期多久」算出负数，于是**不清理**
+/// （宁可留着，也不要在时钟不可靠时误删用户的录制）。
+fn nowSeconds(self: *backend.Runtime) i64 {
+    return @divTrunc(backend.runtimeNowMillis(self), 1000);
 }
 
 fn copyConfig(self: *backend.Runtime, buffer: []u8) usize {
@@ -200,7 +245,7 @@ fn appendFrame(self: *backend.Runtime, live_json: []const u8, catalog_json: []co
     try meta_writer.writeByte('}');
     store.put(replay_meta_kind, meta_key, meta_writer.buffered()) catch {};
 
-    pruneOldGames(store, allocator);
+    pruneRecordings(store, allocator, self.recording_retention_days, nowSeconds(self));
     return true;
 }
 
@@ -219,19 +264,34 @@ fn recordedGameCount(store: *storage.Store, allocator: std.mem.Allocator) usize 
     return entries.len;
 }
 
-/// 只保留最近 `kept_games` 局：多出来的按「写入时间最旧」回收，连同它的帧一起删。
-fn pruneOldGames(store: *storage.Store, allocator: std.mem.Allocator) void {
+/// 回收录制：**两条规则一起判**，命中任一就删（连它的帧一起删）。
+///
+/// 1. **超出局数**：只留最近 `kept_games` 局（`list` 已经是「写入时间新的在前」，
+///    所以尾部就是要回收的旧局）。
+/// 2. **超出保留期**：`retention_days > 0` 时，`updated_at` 早于
+///    `now_seconds - retention_days × 86400` 的一律删掉；`retention_days == 0`
+///    表示永久保留，这一条不生效（用户选项里的「永久」）。
+///
+/// 两条都在这里做的原因：局数上限防的是「连着打十把」，保留期防的是「三个月没打、
+/// 但库里躺着三局占地方」。只做前者的话，长时间不玩就永远留着那三局。
+///
+/// `now_seconds` 显式传进来（不在这里读时钟）是为了可测：用例可以直接指定「现在」。
+fn pruneRecordings(store: *storage.Store, allocator: std.mem.Allocator, retention_days: i64, now_seconds: i64) void {
     const entries = store.list(allocator, replay_meta_kind) catch return;
     // `freeEntries` 是命名空间上的静态函数（没有 self），必须走类型名调用。
     defer storage.Store.freeEntries(allocator, entries);
-    if (entries.len <= kept_games) return;
-    // `list` 已经是「写入时间新的在前」，所以尾部就是要回收的旧局。
-    for (entries[kept_games..]) |entry| {
+    const cutoff: i64 = if (retention_days > 0) now_seconds - retention_days * 86400 else 0;
+    for (entries, 0..) |entry, index| {
+        const too_many = index >= kept_games;
+        // `cutoff == 0` = 永久保留；`now_seconds == 0`（时钟没接上）时过期量算出来是负数，
+        // 一律判为「没过期」——宁可多留，也不要在时钟不可靠时误删。
+        const too_old = cutoff > 0 and now_seconds > 0 and entry.updated_at < cutoff;
+        if (!too_many and !too_old) continue;
         const frame_count = frameCountOf(entry.value);
-        var index: usize = 0;
-        while (index < frame_count) : (index += 1) {
+        var frame_index: usize = 0;
+        while (frame_index < frame_count) : (frame_index += 1) {
             var key_buffer: [96]u8 = undefined;
-            const frame_key = std.fmt.bufPrint(&key_buffer, "{s}:{d:0>6}", .{ entry.key, index }) catch continue;
+            const frame_key = std.fmt.bufPrint(&key_buffer, "{s}:{d:0>6}", .{ entry.key, frame_index }) catch continue;
             store.remove(replay_kind, frame_key) catch {};
         }
         store.remove(replay_meta_kind, entry.key) catch {};
@@ -564,7 +624,8 @@ test "只保留最近几局：回收旧局时连它的帧一起删" {
     try testing.expectEqual(@as(usize, total_games), before.len);
     storage.Store.freeEntries(testing.allocator, before);
 
-    pruneOldGames(&store, testing.allocator);
+    // 保留期传 0 = 永久、now 传 0 → 这条只验「局数」那一条规则（另一条由下面的用例管）。
+    pruneRecordings(&store, testing.allocator, 0, 0);
 
     const after = try store.list(testing.allocator, replay_meta_kind);
     defer storage.Store.freeEntries(testing.allocator, after);
@@ -573,4 +634,96 @@ test "只保留最近几局：回收旧局时连它的帧一起删" {
     const frames = try store.list(testing.allocator, replay_kind);
     defer storage.Store.freeEntries(testing.allocator, frames);
     try testing.expectEqual(@as(usize, kept_games) * frames_per_game, frames.len);
+}
+
+/// 往库里塞一局（meta + N 帧）。`updated_at` 由 `Store.put` 写成**当前**时间，
+/// 所以按时间判断的用例要改「现在」而不是改写入时间——见下面那两条。
+fn seedGame(store: *storage.Store, game_id: i64, frame_count: usize) !void {
+    var meta_key_buffer: [32]u8 = undefined;
+    const meta_key = try std.fmt.bufPrint(&meta_key_buffer, "{d}", .{game_id});
+    var meta_json_buffer: [128]u8 = undefined;
+    const meta_json = try std.fmt.bufPrint(&meta_json_buffer, "{{\"gameId\":{d},\"frameCount\":{d}}}", .{ game_id, frame_count });
+    try store.put(replay_meta_kind, meta_key, meta_json);
+    for (0..frame_count) |frame| {
+        var frame_key_buffer: [64]u8 = undefined;
+        const frame_key = try std.fmt.bufPrint(&frame_key_buffer, "{d}:{d:0>6}", .{ game_id, frame });
+        try store.put(replay_kind, frame_key, "{\"t\":0}");
+    }
+}
+
+const day_seconds: i64 = 86400;
+
+test "保留期到了就自动连着帧一起清掉，没到就一局不动" {
+    var store = try storage.Store.open(testing.allocator, testing.io, ":memory:");
+    defer store.deinit();
+    const frames_per_game: usize = 2;
+    try seedGame(&store, 1, frames_per_game);
+    try seedGame(&store, 2, frames_per_game);
+    const written_at = (try store.getUpdatedAt(replay_meta_kind, "1")).?;
+
+    // 保留 30 天、「现在」= 写入后第 10 天 → 谁都没过期（局数也没超）→ 一局都不能少。
+    pruneRecordings(&store, testing.allocator, default_retention_days, written_at + 10 * day_seconds);
+    const fresh = try store.list(testing.allocator, replay_meta_kind);
+    defer storage.Store.freeEntries(testing.allocator, fresh);
+    try testing.expectEqual(@as(usize, 2), fresh.len);
+
+    // 保留 3 天、「现在」= 写入后第 10 天 → 两局都超期，连帧一起回收。
+    pruneRecordings(&store, testing.allocator, 3, written_at + 10 * day_seconds);
+    const expired = try store.list(testing.allocator, replay_meta_kind);
+    defer storage.Store.freeEntries(testing.allocator, expired);
+    try testing.expectEqual(@as(usize, 0), expired.len);
+    const frames = try store.list(testing.allocator, replay_kind);
+    defer storage.Store.freeEntries(testing.allocator, frames);
+    try testing.expectEqual(@as(usize, 0), frames.len);
+}
+
+test "保留期 0 = 永久：再老也不清，但局数上限仍然生效" {
+    var store = try storage.Store.open(testing.allocator, testing.io, ":memory:");
+    defer store.deinit();
+    try seedGame(&store, 1, 1);
+    try seedGame(&store, 2, 1);
+    const written_at = (try store.getUpdatedAt(replay_meta_kind, "1")).?;
+
+    // 一年后再来清，两局都应该还在（没有超期这一说）。
+    pruneRecordings(&store, testing.allocator, 0, written_at + 365 * day_seconds);
+    const kept = try store.list(testing.allocator, replay_meta_kind);
+    defer storage.Store.freeEntries(testing.allocator, kept);
+    try testing.expectEqual(@as(usize, 2), kept.len);
+}
+
+test "保留期 0 也不是「什么都不管」：局数上限照样只留最近几局" {
+    var store = try storage.Store.open(testing.allocator, testing.io, ":memory:");
+    defer store.deinit();
+    const total_games = kept_games + 2;
+    for (0..total_games) |game| try seedGame(&store, @intCast(game + 1), 1);
+
+    pruneRecordings(&store, testing.allocator, 0, 0);
+    const after = try store.list(testing.allocator, replay_meta_kind);
+    defer storage.Store.freeEntries(testing.allocator, after);
+    try testing.expectEqual(@as(usize, kept_games), after.len);
+}
+
+test "时钟没接上（now = 0）时绝不按时间清——宁可多留也不能误删" {
+    var store = try storage.Store.open(testing.allocator, testing.io, ":memory:");
+    defer store.deinit();
+    try seedGame(&store, 1, 1);
+    // `runtimeNowMillis` 在 io 未接上时返回 0，于是「过期多久」会算成负数。
+    pruneRecordings(&store, testing.allocator, 30, 0);
+    const kept = try store.list(testing.allocator, replay_meta_kind);
+    defer storage.Store.freeEntries(testing.allocator, kept);
+    try testing.expectEqual(@as(usize, 1), kept.len);
+}
+
+test "retentionDays：缺失落默认 30 天，显式 0 才是永久，负数当脏数据" {
+    // ⚠️ 关键点：`jsonInt` 对**缺失字段**也返回 0，而 0 在这里是「永久保留」这个有意义的
+    // 取值。不判字段在不在的话，所有老配置（v24 及以前没有这个字段）都会被静默升级成
+    // 「永久不清理」，用户要的「自动清理老旧录制」就永远不会发生。
+    try testing.expectEqual(default_retention_days, parseSettings("{}").retention_days);
+    try testing.expectEqual(default_retention_days, parseSettings("{\"providers\":{\"recording\":{\"enabled\":true}}}").retention_days);
+    try testing.expectEqual(@as(i64, 0), parseSettings("{\"providers\":{\"recording\":{\"retentionDays\":0}}}").retention_days);
+    try testing.expectEqual(@as(i64, 3), parseSettings("{\"providers\":{\"recording\":{\"retentionDays\":3}}}").retention_days);
+    try testing.expectEqual(@as(i64, 7), parseSettings("{\"providers\":{\"recording\":{\"retentionDays\":\"7\"}}}").retention_days);
+    try testing.expectEqual(max_retention_days, parseSettings("{\"providers\":{\"recording\":{\"retentionDays\":99999}}}").retention_days);
+    // 负数不能默默变成「永久」。
+    try testing.expectEqual(default_retention_days, parseSettings("{\"providers\":{\"recording\":{\"retentionDays\":-5}}}").retention_days);
 }

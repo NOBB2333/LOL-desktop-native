@@ -2,7 +2,7 @@ import { mount } from "@vue/test-utils";
 import type { VueWrapper } from "@vue/test-utils";
 import { beforeEach, describe, expect, it } from "vitest";
 import { nextTick } from "vue";
-import type { MatchParticipant, MatchSummary, MatchTimeline, MatchTimelineEvent, MatchTimelineFrame } from "../types/domain";
+import type { GameRecordingFrame, GameRecordingPlayer, MatchParticipant, MatchSummary, MatchTimeline, MatchTimelineEvent, MatchTimelineFrame } from "../types/domain";
 import MatchSpectatePanel from "./MatchSpectatePanel.vue";
 import { deriveTeamfights } from "../matches/teamfights";
 
@@ -146,7 +146,7 @@ function timeline(frames: MatchTimelineFrame[], list: MatchTimelineEvent[] = eve
 /** 头像用桩替掉：真组件会去拉远程图，这里只关心「这一行挂了几个图标」。 */
 const AssetIconStub = { props: { id: { default: 0 }, name: { default: "" } }, template: '<i class="asset-icon-stub" />' };
 
-function mountPanel(options: { frames?: MatchTimelineFrame[]; redView?: boolean; events?: MatchTimelineEvent[] } = {}) {
+function mountPanel(options: { frames?: MatchTimelineFrame[]; redView?: boolean; events?: MatchTimelineEvent[]; recording?: GameRecordingFrame[] } = {}) {
   const frames = options.frames ?? [frame(0), frame(26)];
   const list = options.events ?? events;
   return mount(MatchSpectatePanel, {
@@ -157,9 +157,53 @@ function mountPanel(options: { frames?: MatchTimelineFrame[]; redView?: boolean;
       fights: deriveTeamfights(list, seats),
       selectedFightIndex: 0,
       selfPuuid: options.redView ? "puuid-6" : "puuid-1",
+      recording: options.recording ?? [],
     },
     global: { stubs: { AssetIcon: AssetIconStub } },
   });
+}
+
+/**
+ * 本机录制的某一帧。
+ *
+ * 真机上这是后端按采样间隔存下来的快照（见 `backend/game_recording.zig`）：每人当时的
+ * 装备（只有 itemID）与 K/D/A。这里给十个人同一份数值——用例关心的是「游标拖到哪一刻
+ * 取哪一帧」，不是十个人之间的差异。
+ *
+ * ⚠️ `puuid` **必须是空串**，照真机来：Live Client Data 的 `allPlayers` 里**根本没有
+ * `puuid` 字段**（官方字段集只有 championName/isBot/isDead/items/level/position/
+ * rawChampionName/respawnTimer/runes/scores/skinID/summonerName/summonerSpells/team），
+ * 所以后端写出来恒为 `""`。桩里如果填上能对上的 puuid，就会把
+ * 「按 puuid 配对所以永远配不上」这个真 bug **遮住**——2026-09-29 正是这么漏掉的，
+ * 用户侧表现是「拖时间轴，战绩和装备一点都不变」。
+ */
+function recordingFrame(t: number, kills: number, items: number[], overrides: Partial<Record<number, Partial<GameRecordingPlayer>>> = {}): GameRecordingFrame {
+  return {
+    t,
+    gameId: 1,
+    sampledAt: "2026-09-27T10:00:00.000Z",
+    players: seats.map((seat) => ({
+      puuid: "",
+      rid: `玩家${seat.participantId}#CN1`,
+      team: seat.team === BLUE ? "ORDER" : "CHAOS",
+      champ: `英雄${seat.championId}`,
+      cid: seat.championId,
+      pos: "MIDDLE",
+      lvl: 10,
+      k: kills,
+      d: 0,
+      a: 0,
+      cs: 150,
+      ward: 5,
+      dead: false,
+      respawn: 0,
+      bot: false,
+      items,
+      spells: [],
+      ...overrides[seat.participantId],
+    })),
+    me: null,
+  };
 }
 
 /** 第二行那十根柱子的宽度（百分比）。 */
@@ -333,5 +377,214 @@ describe("观战面板：真机数据形状", () => {
     el.dispatchEvent(pointerEvent("pointermove", 300));
     await nextTick();
     expect(wrapper.get(".spectate__clock strong").text()).toBe("00:00");
+  });
+});
+
+/**
+ * 本机录制接进观战面板（2026-09-27）。
+ *
+ * 官方数据源里只有**终局**装备与终局 KDA，中间过程看不到——「那一刻他什么装备、几杀几死」
+ * 这两项只能靠本机录制（设置里可选的开关，默认关）。所以两个方向都要钉住：
+ * 有录制时跟着游标走；没录到这一局时原样退回终局口径（数值和版面都不变）。
+ */
+describe("观战面板：本机录制的「此刻」口径", () => {
+  const RECORDING = [recordingFrame(60, 1, [100]), recordingFrame(600, 5, [200, 300])];
+
+  it("有录制时 K/D/A 跟着游标走（不再永远是终局值）", async () => {
+    const wrapper = mountPanel({ recording: RECORDING });
+    // 默认停在终局（26:00）→ 取 600 秒那一帧。
+    expect(wrapper.findAll(".spectate-kda").map((chip) => chip.text())).toEqual(Array.from({ length: 10 }, () => "5/0/0"));
+    // 拖回开局 → 只能拿到最早的那一帧（60 秒）；两帧之间没有数据，不做插值。
+    await wrapper.get(".spectate__timeline").trigger("keydown", { key: "Home" });
+    expect(wrapper.findAll(".spectate-kda").map((chip) => chip.text())).toEqual(Array.from({ length: 10 }, () => "1/0/0"));
+
+    // 口径必须写在界面上：这两项现在是「游标那一刻」，不是终局。
+    expect(wrapper.get(".spectate__rowbar").text()).toContain("本局有本机录制");
+    expect(wrapper.get(".spectate-kda").attributes("data-live")).toBe("true");
+    expect(wrapper.get(".spectate-player__stats").attributes("title")).toContain("那一刻");
+  });
+
+  it("有录制时「装备」那一行也跟着游标换（终局出装 → 此刻出装）", async () => {
+    const wrapper = mountPanel({ recording: RECORDING });
+    await wrapper.findAll(".spectate__rowswitch button")[3].trigger("click");
+    expect(wrapper.get(".spectate__rowbar").text()).toContain("此刻出装");
+    // 终局那一帧每人两件。
+    expect(wrapper.findAll(".spectate-player__items .asset-icon-stub")).toHaveLength(20);
+
+    await wrapper.get(".spectate__timeline").trigger("keydown", { key: "Home" });
+    // 第 60 秒那一帧每人一件——数量变了，说明读的确实是录制，而不是十人详情的终局装备。
+    expect(wrapper.findAll(".spectate-player__items .asset-icon-stub")).toHaveLength(10);
+  });
+
+  it("录制帧里配不上这个人（puuid 缺席）时退回终局口径，而不是显示成没装备", async () => {
+    const partial: GameRecordingFrame[] = [{ ...recordingFrame(600, 9, [200]), players: [] }];
+    const wrapper = mountPanel({ recording: partial });
+    await wrapper.findAll(".spectate__rowswitch button")[3].trigger("click");
+    // 十人详情里每人一件装备（见 `players()`），十个人一个都不能少。
+    expect(wrapper.findAll(".spectate-player__items .asset-icon-stub")).toHaveLength(10);
+    // K/D/A 退回十人详情的终局值（第一行是 3/2/5），且不再标成「此刻」。
+    expect(wrapper.findAll(".spectate-kda")[0].text()).toBe("3/2/5");
+    expect(wrapper.get(".spectate-kda").attributes("data-live")).toBeUndefined();
+  });
+
+  it("没有录制时一切照旧：终局 KDA、终局出装，通栏不出现录制提示", async () => {
+    const wrapper = mountPanel();
+    expect(wrapper.find(".spectate__rowbar-note[data-tone='recording']").exists()).toBe(false);
+    expect(wrapper.findAll(".spectate-kda")[0].text()).toBe("3/2/5");
+    await wrapper.findAll(".spectate__rowswitch button")[3].trigger("click");
+    expect(wrapper.get(".spectate__rowbar").text()).toContain("终局出装");
+  });
+
+  /**
+   * 回归：**录制帧里 `puuid` 是空的**（真机如此，见 `recordingFrame` 的注释）。
+   *
+   * 这条用例是这次报障的正身——用户说「拖动时间轴，人的战绩和装备完全没有变化」。
+   * 旧实现只按 `entry.puuid === player.puuid` 配，帧里 puuid 恒空 → 永远配不上 →
+   * 静默退回终局值。桩里一旦不写假 puuid（照真机写 ""），这条就会红；
+   * 修好之后必须靠 `rid`（名字部分）配上。
+   */
+  it("帧里 puuid 为空（真机形状）时仍然按 rid 配上，K/D/A 与装备跟着游标走", async () => {
+    const pct: GameRecordingFrame[] = [recordingFrame(60, 1, [100]), recordingFrame(600, 5, [200, 300])];
+    // 自证桩确实是「空 puuid」这一形状，免得哪天桩被改回去、用例又变成假绿。
+    expect(pct[0].players.every((entry) => entry.puuid === "")).toBe(true);
+
+    const wrapper = mountPanel({ recording: pct });
+    // 终局 → 600 秒那一帧的 5/0/0，而不是十人详情的终局 3/2/5。
+    expect(wrapper.findAll(".spectate-kda")[0].text()).toBe("5/0/0");
+    expect(wrapper.get(".spectate-kda").attributes("data-live")).toBe("true");
+
+    await wrapper.get(".spectate__timeline").trigger("keydown", { key: "Home" });
+    expect(wrapper.findAll(".spectate-kda")[0].text()).toBe("1/0/0");
+  });
+
+  it("名字与英雄都对不上时，退到「同阵营」兜底（宁可给错人也不整行空掉）", async () => {
+    // 帧里十个人换了名、也换了英雄 → 前两档（rid / 名字 / 同英雄）全落空，
+    // 落到最后一档「同阵营任意未被认领的人」。这是**刻意的**兜底：整行空掉比给错人
+    // 更糟（用户看不出是数据缺还是坏了），而且真机上同阵营人数与帧内人数是对得上的。
+    const frames: GameRecordingFrame[] = [
+      {
+        ...recordingFrame(600, 9, [999]),
+        players: recordingFrame(600, 9, [999]).players.map((entry) => ({ ...entry, rid: "陌生人#XXX", cid: 1, champ: "别人" })),
+      },
+    ];
+    const wrapper = mountPanel({ recording: frames });
+    expect(wrapper.findAll(".spectate-kda")[0].text()).toBe("9/0/0");
+  });
+
+  it("帧里五个人全被认领之后，不会被同一个座位重复吃掉（不出现「两个人同一个数」）", async () => {
+    // 只留我方 5 人（真机训练/自定义局就是这样），且名字英雄全对不上 →
+    // 前 5 个座位各拿一个，后 5 个座位拿不到（返回 null，退回终局值），
+    // 而不是 10 个座位都指向同一个人。
+    const five = recordingFrame(600, 4, [200]).players.slice(0, 5).map((entry) => ({ ...entry, rid: "陌生人#XXX", cid: 1 }));
+    const wrapper = mountPanel({ recording: [{ ...recordingFrame(600, 4, [200]), players: five }] });
+    const chips = wrapper.findAll(".spectate-kda").map((chip) => chip.text());
+    expect(chips.filter((text) => text === "4/0/0")).toHaveLength(5);
+    // 剩下 5 个座位拿不到录制 → 退回十人详情的终局值，而不是继续吃那 5 个人。
+    expect(chips.filter((text) => text !== "4/0/0")).toHaveLength(5);
+  });
+});
+
+/**
+ * 阵亡状态：用户要「死了之后头像变灰、给复活读秒」。
+ *
+ * 数据只在**本机录制**里（`allPlayers[].isDead` 是实时值，官方战绩接口没有「某一刻死没死」），
+ * 所以没录制时**不能编**——灰化和读秒都必须消失。
+ */
+describe("观战面板：阵亡状态灰化与复活读秒", () => {
+  it("录制说这个人此刻死了 → 头像标灰 + 出复活读秒", async () => {
+    const frames = [recordingFrame(600, 5, [200], { 1: { dead: true, respawn: 7.4 } })];
+    const wrapper = mountPanel({ recording: frames });
+    const dots = wrapper.findAll(".spectate__dot");
+    const dead = dots.filter((dot) => dot.classes().includes("is-dead"));
+    expect(dead).toHaveLength(1);
+    expect(dead[0].text()).toBe("8"); // ceil(7.4)
+    expect(dead[0].attributes("title")).toContain("已阵亡");
+  });
+
+  it("没录到这一局时不知道死没死 → 一个灰头像、一个读秒都不画", async () => {
+    const wrapper = mountPanel();
+    expect(wrapper.findAll(".spectate__dot.is-dead")).toHaveLength(0);
+    expect(wrapper.findAll(".spectate__dot-timer")).toHaveLength(0);
+  });
+});
+
+/**
+ * 「人死了之后他还能动」——用户 2026-09-29 报的。
+ *
+ * **不是数据问题**：客户端分钟帧里的 `positions` 一直是对的（每帧十个人、坐标全非零）。
+ * 是我们自己在**两帧之间做平滑插值**（`animatedPositions`，为了走位好读）：阵亡那一刻
+ * 人倒在倒地处，下一分钟帧他已经在泉水 → 插值就把尸体**从倒地处一路拖回泉水**。
+ *
+ * 修法 = 阵亡期间把坐标**钉在他最后一次活着的采样点**（`freezePositionWhileDead`）。
+ * 这一组用例盯的是「面板真的这么画」——map 上的圆点用 `left`/`top` 百分比定位。
+ */
+describe("观战面板：阵亡后不能再动", () => {
+  /** 第 1 个座位（蓝方）在地图左下 → 右上，一路走。其余座位不动。 */
+  function walking(minute: number, x: number, y: number): MatchTimelineFrame {
+    const base = frame(minute);
+    return { ...base, positions: base.positions!.map((point, slot) => (slot === 0 ? { x, y } : point)) };
+  }
+
+  /** map 上第 `seat` 个圆点的定位百分比。 */
+  const dotAt = (wrapper: VueWrapper, index: number) => {
+    const style = wrapper.findAll(".spectate__dot")[index].attributes("style") ?? "";
+    return { left: style.match(/left:\s*([\d.]+)%/)?.[1], top: style.match(/top:\s*([\d.]+)%/)?.[1] };
+  };
+
+  it("阵亡期间拖时间轴，圆点钉在倒地处一动不动", async () => {
+    // 第 20 分钟他在 (3000, 3000)，第 21 分钟（已阵亡）帧里他到 (14000, 14000) 了。
+    const frames = [walking(20, 3000, 3000), walking(21, 14000, 14000)];
+    const recording = [recordingFrame(1260, 5, [200], { 1: { dead: true, respawn: 30 } })];
+    const wrapper = mountPanel({ frames, recording });
+
+    // 游标落在第 21 分钟 → 但人已阵亡，位置必须是「最后一次活着」的那点。
+    await wrapper.get(".spectate__timeline").trigger("keydown", { key: "End" });
+    await nextTick();
+    const before = dotAt(wrapper, 0);
+
+    // 往回拖一点点（仍在他倒地之后、同一分钟窗口内）——插值本来会让它移动。
+    await wrapper.get(".spectate__timeline").trigger("keydown", { key: "ArrowLeft", shiftKey: true });
+    await nextTick();
+    expect(dotAt(wrapper, 0)).toEqual(before);
+  });
+
+  it("活着的时候照旧随游标移动（钉死只对死人生效，不误伤活人）", async () => {
+    const frames = [walking(20, 3000, 3000), walking(21, 14000, 14000)];
+    // 没有任何录制 → 不知道死没死 → 纯插值，位置应当随游标连续变化。
+    const wrapper = mountPanel({ frames });
+    await wrapper.get(".spectate__timeline").trigger("keydown", { key: "End" });
+    await nextTick();
+    const end = dotAt(wrapper, 0);
+    await wrapper.get(".spectate__timeline").trigger("keydown", { key: "Home" });
+    await nextTick();
+    expect(dotAt(wrapper, 0)).not.toEqual(end);
+  });
+
+  it("阵亡之后被钉住，活着的人照旧走插值（同一时刻两者位置不同）", async () => {
+    // 走路幅度刻意压在 `INSTANT_MOVE_DISTANCE`（3200）以内：这样插值是**线性**的，
+    // 游标落在两帧中间时活人正好在半路上，死人则钉在起点 —— 两者必须能分辨出来。
+    // （用大跨度位移会被 `easedFraction` 在前 12% 就送到底，两条线又重合了，测不出东西。）
+    const frames = [walking(20, 3000, 3000), walking(21, 3400, 3200)];
+    const dead = [recordingFrame(1230, 5, [200], { 1: { dead: true, respawn: 30 } })];
+    const alive = [recordingFrame(1230, 5, [200], { 1: { dead: false, respawn: 0 } })];
+    const panels = [mountPanel({ frames, recording: alive }), mountPanel({ frames, recording: dead })];
+    // 游标落在**两帧中间**（20:30 = 1230 秒，全场 1560 秒 → 横向 78.8% 处）。
+    const clientX = Math.round((1230 / 1560) * 600);
+    for (const panel of panels) {
+      const timelineEl = panel.get(".spectate__timeline");
+      const el = timelineEl.element as HTMLElement;
+      el.getBoundingClientRect = () =>
+        ({ left: 0, right: 600, top: 0, bottom: 40, width: 600, height: 40, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
+      const created = new Event("pointerdown", { bubbles: true });
+      Object.defineProperty(created, "clientX", { value: clientX });
+      timelineEl.element.dispatchEvent(created);
+      await nextTick();
+    }
+    // 先证明游标真的落到 20:30 了（否则下面「两者不同」可能只是两个都没动）。
+    expect(panels[0].get(".spectate__clock strong").text()).toBe("20:30");
+    const [aliveDot, deadDot] = [dotAt(panels[0], 0), dotAt(panels[1], 0)];
+    expect(aliveDot).not.toEqual(deadDot);
+    // 而且是**死人更靠起点**（钉住），不是反过来。
+    expect(Number.parseFloat(deadDot.left!)).toBeLessThan(Number.parseFloat(aliveDot.left!));
   });
 });

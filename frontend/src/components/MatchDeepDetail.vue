@@ -10,7 +10,15 @@
  * - 「当前选中第几波团」由这里持有：观战面板的时间轴/地图钉点选，与下方
  *   「每波团」的摘要条是**同一个选中态**，两处永远同步。
  *
- * 两份数据各自独立加载：哪份到了就画哪块，互不阻塞。
+ * **五处都挂这个组件**（2026-09-28 起），任何一处改了五处一起变，所以只维护这一份：
+ * 1. 历史页「对局」页签 → 展开一局
+ * 2. 历史页「人」页签 → 展开某一局的「全局对局信息」
+ * 3. 战绩页·索引模式 → 右侧详情面板下面的 `.matches-deep`
+ * 4. 战绩页·完整对局模式 → `MatchDetailCard` 的 `#deep` 插槽
+ * 5. **首页**最近对局 → 同一个 `#deep` 插槽（用户反馈「首页的下边怎么没有对应的明细图表」）
+ *
+ * 三份数据各自独立加载：哪份到了就画哪块，互不阻塞。第三份是本机录制（可选功能，默认关）：
+ * 有它观战面板的「装备」与 K/D/A 才会跟着游标走，没有就退回终局口径。
  */
 import { computed, ref } from "vue";
 import { useQuery } from "@tanstack/vue-query";
@@ -20,6 +28,7 @@ import MatchSummaryStrip from "./MatchSummaryStrip.vue";
 import { deriveTeamfights } from "../matches/teamfights";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
+import { useGameRecording } from "../composables/useGameRecording";
 
 const props = defineProps<{
   gameId: number;
@@ -57,6 +66,15 @@ const timeline = useQuery({
 /** 每波团在这里推导一次，观战面板（时间轴高亮段 + 地图钉）与详情面板共用同一份。 */
 const fights = computed(() => (timeline.data.value ? deriveTeamfights(timeline.data.value.events, timeline.data.value.participants) : []));
 
+/**
+ * 本机对这一局的录制（可选功能，默认关）。
+ *
+ * 拿它把观战面板缺的两项补齐——官方数据里只有「终局装备」和「终局 KDA」，而本机录制
+ * 每分钟（默认 5 秒）都存了当时的装备与战绩，所以拖游标就能看到**那一刻**的装备和
+ * K/D/A。没录到就是空数组，观战面板自动退回原来的「终局」口径。
+ */
+const { frames: recordingFrames } = useGameRecording(() => props.gameId);
+
 /** 选中的团战（下标）。观战面板点时间轴/地图钉、详情面板点摘要条，都改这一个值。 */
 const selectedFightIndex = ref(0);
 
@@ -83,7 +101,7 @@ function selectFight(index: number) {
     <MatchSummaryStrip v-if="timeline.data.value" :timeline="timeline.data.value" :champion-name-of="championNameOf" :fights="fights" />
 
     <section class="match-deep__block">
-      <h4>观战面板 <small>拖时间轴回看每一刻的等级 / 金币 / 走位；点团战段或地图上的编号钉跳到那一波</small></h4>
+      <h4>观战面板 <small>拖时间轴回看每一刻的等级 / 金币；点团战段或地图上的编号钉跳到那一波。走位是每分钟一个采样点，中间由界面插值补成连续（悬停某位玩家看他整局的**真**采样点）</small></h4>
       <MatchSpectatePanel
         v-if="detail.data.value && timeline.data.value"
         :detail="detail.data.value"
@@ -94,6 +112,7 @@ function selectFight(index: number) {
         :self-puuid="selfPuuid"
         :encounter-counts="encounterCounts"
         :seek-seconds="seekSeconds"
+        :recording="recordingFrames"
         @select-fight="selectFight"
         @seek-consumed="seekSeconds = null"
       />
@@ -110,6 +129,7 @@ function selectFight(index: number) {
       :fights="fights"
       :selected-fight-index="selectedFightIndex"
       :players="detail.data.value?.participants"
+      :recording="recordingFrames"
       @select-fight="selectFight"
       @seek-time="seekSeconds = $event"
     />

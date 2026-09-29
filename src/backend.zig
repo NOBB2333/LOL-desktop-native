@@ -22,6 +22,7 @@ const match_timeline = @import("backend/timeline.zig");
 const player_stats = @import("backend/player_stats.zig");
 const launcher_ipc = @import("backend/launcher_ipc.zig");
 const assets_ipc = @import("backend/assets_ipc.zig");
+const champion_abilities = @import("backend/champion_abilities.zig");
 const claim_ipc = @import("backend/claim_ipc.zig");
 const gameflow_ipc = @import("backend/gameflow_ipc.zig");
 const game_recording = @import("backend/game_recording.zig");
@@ -32,6 +33,9 @@ test {
     std.testing.refAllDecls(storage);
     std.testing.refAllDecls(player_tag_service);
     std.testing.refAllDecls(player_signals);
+    // 技能详情模块的 pub fn 只被下面那张 handler 表引用，而 Zig 是**惰性分析**：
+    // 不显式拉一次，模块里的用例可能连语义检查都不做（测试全绿但 exe 编译挂）。
+    std.testing.refAllDecls(champion_abilities);
 }
 
 test "慢查询期间状态可读取且切换模式后旧结果被拒绝" {
@@ -280,6 +284,8 @@ pub const command_table = [_]CommandSpec{
     .{ .name = "lol.get_game_recording", .lane = .query },
     .{ .name = "lol.search_summoner", .lane = .query },
     .{ .name = "lol.get_champions", .lane = .query },
+    // 单英雄技能详情：一个英雄一条 LCU 请求（~30-70KB 原始 JSON），所以按需拉、不塞进列表。
+    .{ .name = "lol.get_champion_abilities", .lane = .query },
     .{ .name = "lol.get_asset", .lane = .query },
     .{ .name = "lol.get_encounters", .lane = .query },
     // 每人两次 LCU 往返，走 query 通道按需触发；上限见 backend/player_stats.zig。
@@ -336,10 +342,10 @@ test "未登记命令回落到默认 query 通道" {
 }
 
 const default_config =
-    "{\"version\":24,\"appearance\":{\"theme\":\"system\",\"colorMode\":\"dark\",\"compact\":false}," ++
+    "{\"version\":25,\"appearance\":{\"theme\":\"system\",\"colorMode\":\"dark\",\"compact\":false}," ++
     "\"connection\":{\"kind\":\"local\",\"sshTarget\":\"\",\"identityFile\":\"\",\"forwardedPort\":0}," ++
     "\"automation\":{\"enabled\":false,\"advisoryMode\":true,\"autoAccept\":false,\"autoAcceptDelaySeconds\":0,\"autoPick\":false,\"autoPickDelaySeconds\":1,\"autoPickStrategy\":\"show-and-lock-in\",\"autoBan\":false,\"pickChampionIds\":[],\"banChampionIds\":[],\"aramGrab\":false,\"aramChampionIds\":[],\"aramSwapDelaySeconds\":3,\"shortcutSendIntervalMs\":65,\"shortcutRecentGameCount\":5,\"shortcuts\":[{\"id\":\"encounter\",\"label\":\"发送遇到记录\",\"key\":\"Ctrl+F5\",\"target\":\"encounter\",\"template\":\"{encounter}\",\"enabled\":true},{\"id\":\"premade\",\"label\":\"发送已知组队\",\"key\":\"Ctrl+F9\",\"target\":\"premade\",\"template\":\"{position} {name}：组队 {premade}\",\"enabled\":true},{\"id\":\"jungle-preference\",\"label\":\"发送打野偏好\",\"key\":\"Ctrl+F7\",\"target\":\"jungle\",\"template\":\"{name}：{jungle_preference}\",\"enabled\":true},{\"id\":\"enemy\",\"label\":\"发送敌方评估\",\"key\":\"Ctrl+F11\",\"target\":\"enemy\",\"template\":\"{team}{position} {current_champion}：{rank} 主玩{main_position} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"ally\",\"label\":\"发送我方评估\",\"key\":\"Ctrl+F12\",\"target\":\"ally\",\"template\":\"{team}{position} {current_champion}：{rank} 主玩{main_position} {recent_wins}胜{recent_losses}负，{recent_games}\",\"enabled\":true},{\"id\":\"open-game\",\"label\":\"打开对局速看\",\"key\":\"Ctrl+F1\",\"target\":\"lobby\",\"template\":\"对局速看：{team} {name}\",\"enabled\":true}]}," ++
-    "\"providers\":{\"statsProvider\":\"auto\",\"requestTimeoutSeconds\":6,\"cacheTtlMinutes\":120,\"hideUnfinishedMatches\":false,\"rankedOnly\":false,\"clearLobbyAfterGame\":true,\"lobbyRoster\":true,\"recording\":{\"enabled\":false,\"intervalSeconds\":15}}," ++
+    "\"providers\":{\"statsProvider\":\"auto\",\"requestTimeoutSeconds\":6,\"cacheTtlMinutes\":120,\"hideUnfinishedMatches\":false,\"rankedOnly\":false,\"clearLobbyAfterGame\":true,\"lobbyRoster\":true,\"recording\":{\"enabled\":false,\"intervalSeconds\":5,\"retentionDays\":30}}," ++
     "\"ai\":{\"enabled\":false,\"provider\":\"deepseek\",\"protocol\":\"openai\",\"baseUrl\":\"https://api.deepseek.com\",\"model\":\"deepseek-v4-flash\",\"apiKey\":\"\",\"automaticPregameAnalysis\":false}}";
 
 const fixture_connection =
@@ -374,6 +380,8 @@ pub const Runtime = struct {
     recording_config_hash: u64 = 0,
     recording_wanted: bool = false,
     recording_interval_ms: i64 = game_recording.default_interval_seconds * 1000,
+    /// 录制保留期（天，0 = 永久）。配置变更时刷新，见 `game_recording.captureTick`。
+    recording_retention_days: i64 = game_recording.default_retention_days,
     recording_last_frame_ms: i64 = 0,
     cache_platform: [32]u8 = undefined,
     cache_platform_len: usize = 0,
@@ -690,6 +698,7 @@ pub const Runtime = struct {
             .{ .name = "lol.get_game_recording", .context = self, .invoke_fn = game_recording.getGameRecording },
             .{ .name = "lol.search_summoner", .context = self, .invoke_fn = searchSummoner },
             .{ .name = "lol.get_champions", .context = self, .invoke_fn = assets_ipc.getChampions },
+            .{ .name = "lol.get_champion_abilities", .context = self, .invoke_fn = champion_abilities.getChampionAbilities },
             .{ .name = "lol.get_asset", .context = self, .invoke_fn = assets_ipc.getAsset },
             .{ .name = "lol.get_encounters", .context = self, .invoke_fn = getEncounters },
             .{ .name = "lol.get_player_stats", .context = self, .invoke_fn = player_stats.getPlayerStats },

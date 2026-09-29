@@ -2,6 +2,7 @@ import type {
   AppBootstrap,
   AppConfig,
   BanSummary,
+  ChampionAbilities,
   ChampionOverview,
   ClaimSnapshot,
   ClientInstallations,
@@ -500,6 +501,50 @@ export const fixtureChampions: ChampionOverview[] = champions.map(([id, name, al
   dataStatus: fixtureStatus(),
 }));
 
+/**
+ * fixture 的技能详情：**形状必须照真机来**。
+ *
+ * 真机是 LCU 的 `/lol-game-data/assets/v1/champions/{id}.json`：`spells[]` 带
+ * `spellKey`（q/w/e/r）、名字已本地化、每级数组长度 5~6。这里刻意让四个槽位都齐、
+ * 名字用中文、冷却/耗蓝/射程是**真数组**（不是空数组）——空数组会让预览里
+ * 「看不到数组渲染长什么样」，等真机出现 5 个数字时才发现布局挤爆。
+ *
+ * ⚠️ 这里**不能**填每级伤害：真机上 LCU 的 `coefficients` 全是 0，真实系数只在
+ * CommunityDragon 里。fixture 里编一个，就会掩盖「这一项本来就没做」。
+ */
+export function createFixtureChampionAbilities(championId: number): ChampionAbilities {
+  const row = champions.find(([id]) => id === championId) ?? champions[0];
+  const [id, name, alias] = row;
+  const slotNames: Record<string, string> = { q: "一技能", w: "二技能", e: "三技能", r: "终极技" };
+  return {
+    championId: id,
+    alias,
+    name,
+    title: name,
+    passive: {
+      name: "被动技能",
+      description: `${name} 的被动效果（fixture 文案）`,
+      iconPath: `/lol-game-data/assets/ASSETS/Characters/${alias}/HUD/Icons2D/${alias}_Passive.png`,
+      videoPath: `champion-abilities/${id}/ability_${id}_P1.webm`,
+      videoImagePath: `champion-abilities/${id}/ability_${id}_P1.jpg`,
+    },
+    spells: (["q", "w", "e", "r"] as const).map((slot, index) => ({
+      slot,
+      name: slotNames[slot],
+      description: `${name} 的${slotNames[slot]}（fixture 文案）`,
+      dynamicDescription: `造成 <magicDamage>@TotalDamage@ 魔法伤害</magicDamage>`,
+      // 真机的长度是 5 或 6（技能最多点 5 级，有的技能多一格）。这里用 5。
+      cooldown: Array.from({ length: 5 }, () => 6 + index * 2),
+      cost: Array.from({ length: 5 }, () => 40 + index * 10),
+      range: Array.from({ length: 5 }, () => 400 + index * 150),
+      iconPath: `/lol-game-data/assets/ASSETS/Characters/${alias}/HUD/Icons2D/${alias}_${slot.toUpperCase()}.png`,
+      videoPath: `champion-abilities/${id}/ability_${id}_${slot.toUpperCase()}1.webm`,
+      videoImagePath: `champion-abilities/${id}/ability_${id}_${slot.toUpperCase()}1.jpg`,
+    })),
+  };
+}
+
+
 const fixtureEncounterPlayers = [...fixtureLobby.ally.slice(1), ...fixtureLobby.enemy];
 export const fixtureEncounters: EncounterRecord[] = Array.from({ length: 3 }, (_, gameIndex) => {
   // 必须和 `fixtureMatches` 对齐同一局：同 id、同时间、同胜负。
@@ -622,7 +667,7 @@ export const fixtureClaims: ClaimSnapshot = {
 };
 
 export const fixtureConfig: AppConfig = {
-  version: 24,
+  version: 25,
   appearance: { theme: "mint", colorMode: "light", compact: false },
   playerTags: { ...defaultPlayerTagSettings },
   connection: { kind: "local", sshTarget: "", identityFile: "", forwardedPort: 0 },
@@ -651,7 +696,7 @@ export const fixtureConfig: AppConfig = {
       { id: "open-game", label: "打开对局速看", key: "Ctrl+F1", target: "lobby", template: "对局速看：{team} {name}，近10场 {recent_wins}胜{recent_losses}负，KDA {kda}", enabled: true },
     ],
   },
-  providers: { statsProvider: "auto", requestTimeoutSeconds: 6, cacheTtlMinutes: 120, hideUnfinishedMatches: false, rankedOnly: false, clearLobbyAfterGame: true, lobbyRoster: true, recording: { enabled: false, intervalSeconds: 15 } },
+  providers: { statsProvider: "auto", requestTimeoutSeconds: 6, cacheTtlMinutes: 120, hideUnfinishedMatches: false, rankedOnly: false, clearLobbyAfterGame: true, lobbyRoster: true, recording: { enabled: false, intervalSeconds: 5, retentionDays: 30 } },
   ai: { enabled: false, provider: "deepseek", protocol: "openai", baseUrl: "https://api.deepseek.com", model: "deepseek-v4-flash", apiKey: "", automaticPregameAnalysis: false },
 };
 
@@ -993,15 +1038,15 @@ export function createFixtureMatchTimeline(gameId: number, options: { frameDamag
 /**
  * 预览用的「本地录制」帧序列。
  *
- * 真机上这是**游戏进行中**每 15 秒把本机 Live Client Data 采一帧存进 SQLite 的结果
- * （见后端 `backend/game_recording.zig`）。预览里没有客户端，所以按同一份十人名单
- * 合成一份**确定性**的帧（不用随机数，否则每次刷新曲线都在跳，看着像坏了）。
+ * 真机上这是**游戏进行中**每 N 秒（默认 5 秒，设置页可改）把本机 Live Client Data 采一帧
+ * 存进 SQLite 的结果（见后端 `backend/game_recording.zig`）。预览里没有客户端，所以按同一
+ * 份十人名单合成一份**确定性**的帧（不用随机数，否则每次刷新曲线都在跳，看着像坏了）。
  *
  * 默认回空帧——真机上新装的人、没开开关的人、或者不是本机在打的人，看到的正是
  * 「这一局没有录制」这条空状态，预览里必须能复现它，不能默认造一份假录制出来。
  */
 export function createFixtureGameRecording(gameId: number, options: { selfTeam?: number; intervalSeconds?: number } = {}): GameRecording {
-  const intervalSeconds = options.intervalSeconds ?? 15;
+  const intervalSeconds = options.intervalSeconds ?? 5;
   const selfTeam = options.selfTeam ?? TEAM_BLUE;
   const otherTeam = selfTeam === TEAM_BLUE ? TEAM_RED : TEAM_BLUE;
   const match = createFixtureMatchDetail(gameId, { selfTeam });

@@ -100,6 +100,18 @@ export const meterClass = (value: number) => `meter-${Math.min(100, Math.max(0, 
 export const championImage = (id: number) => championAlias[id] ? `./fixtures/champions/${championAlias[id]}.png` : "";
 
 /**
+ * 本机录制里装备的兜底图标。
+ *
+ * 录制帧只存 itemID（`GameRecordingPlayer.items` 就是一串 id），名字和图标都得现拼。
+ * 原生环境下 `AssetIcon kind="item"` 本来就会走 LCU 取图，这条只是**预览 / 取不到 LCU 时**
+ * 的兜底，所以直接指 Data Dragon。版本号写死是有意的：装备图标跨版本会换，但「兜底图能用」
+ * 比「版本号永远最新」重要，而且它只在预览里生效。
+ *
+ * 两个消费方（录制时间轴面板、观战面板的「此刻出装」）必须用同一份，所以放这里。
+ */
+export const recordingItemImage = (id: number) => `https://ddragon.leagueoflegends.com/cdn/16.16.1/img/item/${id}.png`;
+
+/**
  * 默认召唤师头像。
  *
  * LCU 的好友对象里 `icon` 可能没有值（离线好友常见），`0` 不是一个能取到的头像 id。

@@ -3,7 +3,6 @@ import { Coins, Crosshair, Download, HeartPulse, Shield, Swords, Target, X } fro
 import { computed } from "vue";
 import type { BanSummary, MatchParticipant, MatchSummary } from "../types/domain";
 import AssetIcon from "./AssetIcon.vue";
-import MatchRecordingPanel from "./MatchRecordingPanel.vue";
 import { backend, isTauri } from "../services/backend";
 import { championImage, percentOrDash, roleName, shortDate } from "../utils/format";
 
@@ -126,10 +125,10 @@ function downloadCsv() {
     </section>
 
     <!--
-      本地录制（可选功能，默认关）：只有这一局在本机被录过才出现。
-      开关没开 / 不是本机在打 / 已经超出保留局数，这里什么都不渲染，版面与以前一致。
+      这里原来还有一块「本地录制 · 时间轴」（2026-09-28 用户要求删除）。
+      它当初存在就是为了解决「战绩/装备不随时间变化」，而同一份 `MatchDeepDetail`
+      里的观战面板已经用「此刻出装 · 跟随游标」把这件事做了，单独再列一张表是重复。
     -->
-    <MatchRecordingPanel :game-id="match.gameId" />
   </article>
 </template>
 

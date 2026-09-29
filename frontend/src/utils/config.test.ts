@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { fixtureConfig } from "../fixtures/data";
-import { CURRENT_CONFIG_VERSION, defaultAramSwapDelaySeconds, defaultAssessmentTemplate, defaultOpenGameShortcutKey, migrateAppConfig } from "./config";
+import { CURRENT_CONFIG_VERSION, defaultAramSwapDelaySeconds, defaultAssessmentTemplate, defaultOpenGameShortcutKey, defaultRecordingRetentionDays, migrateAppConfig, normalizeRecordingRetentionDays } from "./config";
 
 describe("config migration", () => {
   it("adds the jungle shortcut to an existing config without changing custom shortcuts", () => {
@@ -107,5 +107,37 @@ describe("config migration", () => {
     expect(legacy.automation.aramGrab).toBe(false);
     expect(legacy.automation.aramChampionIds).toEqual([]);
     expect(legacy.automation.aramSwapDelaySeconds).toBe(defaultAramSwapDelaySeconds);
+  });
+
+  it("给 v24 及更早的配置补上录制保留期，且不动用户已存的间隔", () => {
+    // v25：录制保留期（自动清理老录制）。
+    // 两条都要：①缺字段补默认的一个月；②**不能顺手改用户已存的 intervalSeconds**——
+    // 那是已经落盘的真实偏好，迁移里改配置是最招人骂的一类改动。
+    const legacy = structuredClone(fixtureConfig);
+    legacy.version = 24;
+    delete (legacy.providers.recording as Partial<typeof legacy.providers.recording>).retentionDays;
+    legacy.providers.recording.intervalSeconds = 30;
+
+    expect(migrateAppConfig(legacy)).toBe(true);
+    expect(legacy.version).toBe(CURRENT_CONFIG_VERSION);
+    expect(legacy.providers.recording.retentionDays).toBe(defaultRecordingRetentionDays);
+    expect(legacy.providers.recording.intervalSeconds).toBe(30);
+  });
+
+  it("显式选了「永久保留」的配置不会被迁移回默认值", () => {
+    // 0 是合法取值（永久），不能在迁移里被「补默认」的逻辑吃掉。
+    const config = structuredClone(fixtureConfig);
+    config.providers.recording.retentionDays = 0;
+    migrateAppConfig(config);
+    expect(config.providers.recording.retentionDays).toBe(0);
+  });
+
+  it("保留期档位归一：认不出来的值退回默认，绝不静默变成「永久」", () => {
+    expect(normalizeRecordingRetentionDays(3)).toBe(3);
+    expect(normalizeRecordingRetentionDays(0)).toBe(0);
+    expect(normalizeRecordingRetentionDays(undefined)).toBe(defaultRecordingRetentionDays);
+    expect(normalizeRecordingRetentionDays(Number.NaN)).toBe(defaultRecordingRetentionDays);
+    expect(normalizeRecordingRetentionDays(17)).toBe(defaultRecordingRetentionDays);
+    expect(normalizeRecordingRetentionDays(-1)).toBe(defaultRecordingRetentionDays);
   });
 });

@@ -3,7 +3,6 @@ import { computed } from "vue";
 import { ChevronDown, ChevronUp, Coins, Crosshair, HeartPulse, Shield, Swords, TowerControl, Trophy } from "@lucide/vue";
 import type { ItemSummary, MatchSummary, RecentMatch } from "../types/domain";
 import AssetIcon from "./AssetIcon.vue";
-import MatchRecordingPanel from "./MatchRecordingPanel.vue";
 import { championImage, percentOrDash, roleName, shortDate } from "../utils/format";
 
 const props = withDefaults(defineProps<{
@@ -277,11 +276,15 @@ function toggleFromRow(event: MouseEvent) {
       </template>
 
       <!--
-        本地录制（可选功能，默认关）：只有这一局在本机被录过才渲染。
-        放在展开区里，是因为战绩页**默认是「完整对局」模式**（走这条展开行、不走
-        右侧详情面板）——只挂在 `MatchHistoryDetail` 上的话，默认视角根本看不到它。
+        宿主要往展开区里再塞一块「完整详情」（观战面板 + 每波团 + 事件流）就走这个插槽。
+        用插槽而不是给这个组件加一串 props：那一块自己取数（`MatchDeepDetail`），卡片没必要
+        认识它——首页 / 战绩页 / 对局页都用同一个插槽，形状完全一致。
+
+        原来的「本地录制 · 时间轴」独立块已经删掉了（2026-09-28 用户要求）：它存在的原因
+        就是「战绩不随时间变、装备不随时间变」，而这两件事现在由观战面板的
+        「此刻出装 / 此刻 K/D/A」直接覆盖，单独再列一张表是重复。
       -->
-      <MatchRecordingPanel :game-id="props.match.gameId" />
+      <slot name="deep" />
     </section>
   </article>
 </template>

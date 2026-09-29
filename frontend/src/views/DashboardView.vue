@@ -5,6 +5,7 @@ import { computed, ref } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 import AssetIcon from "../components/AssetIcon.vue";
 import LoadingState from "../components/LoadingState.vue";
+import MatchDeepDetail from "../components/MatchDeepDetail.vue";
 import MatchDetailCard from "../components/MatchDetailCard.vue";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
@@ -66,6 +67,53 @@ const { matchForRow, loading: expandedDetailLoading, error: expandedDetailError 
   subjectPuuid: computed(() => rows.value.find((match) => match.gameId === expandedMatchId.value)?.participants?.[0]?.puuid ?? app.connection.puuid ?? ""),
   selfPuuid: computed(() => app.connection.puuid ?? ""),
 });
+
+/**
+ * 首页展开行里也要那一套「完整对局详情」（观战面板 + 每波团 + 事件流）。
+ *
+ * 用户反馈：「首页的下边怎么没有对应的明细图表」——因为这一页原来只挂了
+ * `MatchDetailCard`，没往它的 `#deep` 插槽里塞东西。
+ *
+ * 下面三样是 `MatchDeepDetail` 的入参，与历史页 / 战绩页**同一份 queryKey**，
+ * 三页之间来回走直接命中同一份缓存：
+ * - `selfPuuid`：后端账号归属校验 + 界面上「我」的定位；
+ * - `encounterCounts`：「遇到过 N」角标（与历史页同一口径：本地相遇档案按 gameId 去重）；
+ * - `championNameOf`：事件流 / 地图只给英雄 id，要换成名字。
+ *
+ * 闸门是 `deepDetailWanted`：没展开任何一行就不发这两个请求，首页首屏零额外开销。
+ */
+const selfPuuid = computed(() => app.connection.puuid ?? "");
+const deepDetailWanted = computed(() => expandedMatchId.value !== null);
+const deepEncounters = useQuery({
+  queryKey: computed(() => ["encounter-history", app.mode]),
+  queryFn: () => backend.encounters(undefined, 100),
+  enabled: computed(() => app.initialized && deepDetailWanted.value),
+});
+const encounterCounts = computed(() => {
+  const byPuuid = new Map<string, Set<number>>();
+  for (const record of deepEncounters.data.value ?? []) {
+    if (record.liveSnapshot || !record.puuid?.trim()) continue;
+    const games = byPuuid.get(record.puuid) ?? new Set<number>();
+    if (record.gameId > 0) games.add(record.gameId);
+    byPuuid.set(record.puuid, games);
+  }
+  return Object.fromEntries([...byPuuid].map(([puuid, games]) => [puuid, games.size]));
+});
+const champions = useQuery({
+  queryKey: computed(() => ["champions", app.mode]),
+  queryFn: () => backend.champions(),
+  enabled: computed(() => app.initialized && deepDetailWanted.value),
+});
+const championNameById = computed(() => new Map((champions.data.value ?? []).map((champion) => [champion.id, champion.name])));
+const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄 #${id}`;
+/**
+ * 深详情的「视角」＝这一局里被查看的那个人。
+ *
+ * 列表接口每局只带查询者本人一条 `participants`（见 `useMatchDetail`），所以第一条就是
+ * 被查的人；查自己时就是我。LCU 兜底快照（`RecentMatch`）根本没这个字段，
+ * 那就退回当前登录账号——与 `MatchDeepDetail` 里 `targetPuuid` 缺省的语义一致。
+ */
+const targetPuuidOf = (match: (typeof rows.value)[number]) => match.participants?.[0]?.puuid ?? selfPuuid.value;
 const source = computed(() => rows.value[0]?.dataStatus);
 const sourceLabel = computed(() => {
   if (!source.value && app.connection.status === "connected") return "客户端已连接 · 正在同步";
@@ -374,17 +422,33 @@ function toggleMatch(gameId: number) {
         </header>
 
         <div class="match-list">
-          <MatchDetailCard
-            v-for="match in rows.slice(0, 10)"
-            :key="match.gameId"
-            :match="matchForRow(match)"
-            :expandable="true"
-            :expanded="expandedMatchId === match.gameId"
-            :detail-loading="expandedMatchId === match.gameId && expandedDetailLoading"
-            :detail-error="expandedMatchId === match.gameId ? expandedDetailError : ''"
-            @toggle="toggleMatch(match.gameId)"
-            compact
-          />
+          <template v-for="match in rows.slice(0, 10)" :key="match.gameId">
+            <MatchDetailCard
+              :match="matchForRow(match)"
+              :expandable="true"
+              :expanded="expandedMatchId === match.gameId"
+              :detail-loading="expandedMatchId === match.gameId && expandedDetailLoading"
+              :detail-error="expandedMatchId === match.gameId ? expandedDetailError : ''"
+              @toggle="toggleMatch(match.gameId)"
+              compact
+            >
+              <!--
+                十人阵容下面接上「完整对局详情」（观战面板 + 每波团 + 事件流）。
+                与历史页、战绩页是**同一个组件、同一份数据**——用户要求首页也要有
+                （原来只有卡片，展开后到十人表就结束了）。
+                插槽内容只在 `expanded` 为真时渲染，没展开的行一个请求都不多发。
+              -->
+              <template #deep>
+                <MatchDeepDetail
+                  :game-id="match.gameId"
+                  :target-puuid="targetPuuidOf(match)"
+                  :self-puuid="selfPuuid"
+                  :encounter-counts="encounterCounts"
+                  :champion-name-of="championNameOf"
+                />
+              </template>
+            </MatchDetailCard>
+          </template>
           <div v-if="!rows.length" class="empty-state">
             暂无最近战绩
           </div>

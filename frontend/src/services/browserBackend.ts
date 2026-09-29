@@ -11,6 +11,7 @@
  */
 import { isNative } from "./native";
 import {
+  createFixtureChampionAbilities,
   createFixtureGameRecording,
   createFixtureJunglePath,
   createFixtureLobby,
@@ -38,6 +39,7 @@ import { shortcutTemplateKeys } from "../shortcuts/template";
 import type {
   AppBootstrap,
   AppConfig,
+  ChampionAbilities,
   ChampionOverview,
   ClaimItem,
   ClaimOutcome,
@@ -314,7 +316,7 @@ export const browserBackend = {
       // 默认 `recordedGames=0` = 本机从来没采到过（功能没生效）；
       // `?recordedGames=2` = 功能好好的，只是这一局没录。
       const recorded = Math.trunc(Number(params?.get("recordedGames") ?? "0"));
-      return { gameId, intervalSeconds: 15, recordedGames: Number.isFinite(recorded) && recorded > 0 ? recorded : 0, frames: [] };
+      return { gameId, intervalSeconds: 5, recordedGames: Number.isFinite(recorded) && recorded > 0 ? recorded : 0, frames: [] };
     }
     return createFixtureGameRecording(gameId, { selfTeam: previewSelfTeam() });
   },
@@ -355,6 +357,10 @@ export const browserBackend = {
   },
   champions(): ChampionOverview[] {
     return structuredClone(fixtureChampions);
+  },
+  /** 技能详情：真机一次只拉一个英雄，预览里照做（不去拉远程图，走静态兜底）。 */
+  championAbilities(championId: number): ChampionAbilities {
+    return createFixtureChampionAbilities(championId);
   },
   playerStats(puuids: string[]): PlayerStatSummary[] {
     return createFixturePlayerStats(puuids);

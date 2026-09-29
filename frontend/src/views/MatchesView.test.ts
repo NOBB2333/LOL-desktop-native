@@ -65,6 +65,10 @@ vi.mock("../services/backend", () => ({
     encounters: async () => [],
     friends: async () => ({ groups: [], friends: [] }),
     matchDetail: async () => null,
+    // 深详情（`MatchDeepDetail`）还要这几样：面板自己取数，缺一个就会在挂载时抛异常。
+    matchTimeline: async () => null,
+    champions: async () => [],
+    gameRecording: async () => ({ gameId: 0, intervalSeconds: 5, recordedGames: 0, frames: [] }),
     // 被查玩家的等级和段位由这个命令补回来（真机上是本地 LCU 的响应）。
     searchSummoner: async (query: string) => ({
       query,
@@ -154,6 +158,52 @@ describe("MatchesView 过滤口径", () => {
     } finally {
       fixtureConfig.providers.rankedOnly = previous;
       backendState.matchRows = [];
+    }
+  });
+});
+
+/**
+ * 历史页那套「完整详情」（观战面板 + 每波团 + 事件流）在战绩页**两种模式里都要挂上**，
+ * 而且必须是同一份组件——用户的要求原话是「抽离成组件…只要维护一套就够了，两个地方都可以看」。
+ *
+ * 这条用例只钉「挂没挂上 + 是不是同一块」：具体画什么由 `MatchDeepDetail` 自己的用例管。
+ */
+describe("MatchesView 的完整详情复用", () => {
+  const viewStubs = (card: object) => ({
+    PageHeader: { template: "<header><slot /></header>" },
+    LoadingState: { template: "<div />" },
+    MatchDetailCard: card,
+    MatchHistoryDetail: { template: "<div />" },
+    AssetIcon: { template: "<i />" },
+  });
+  const mountWith = async (card: object) => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = mount(MatchesView, { global: { plugins: [[VueQueryPlugin, { queryClient }]], stubs: viewStubs(card) } });
+    await flushPromises();
+    return wrapper;
+  };
+
+  it("索引模式的右栏下面挂一块，完整对局模式则通过插槽塞进展开区", async () => {
+    backendState.matchRows = [structuredClone(fixtureMatches[0])];
+    const previous = typeof localStorage === "undefined" ? null : localStorage.getItem("lol-desktop-match-view");
+    try {
+      route.query = {};
+
+      // ① 索引模式：右栏详情卡下面。
+      localStorage.setItem("lol-desktop-match-view", "index");
+      const indexed = await mountWith({ template: "<div />" });
+      expect(indexed.find(".matches-deep").exists()).toBe(true);
+
+      // ② 完整对局模式（默认模式）：插槽里的东西得是**真的** MatchDeepDetail，
+      //    不是空插槽——空插槽看起来「挂上了」，实际什么都不显示。
+      localStorage.setItem("lol-desktop-match-view", "detail");
+      const detailed = await mountWith({ template: '<div class="card-probe"><slot name="deep" /></div>' });
+      expect(detailed.find(".card-probe .match-deep").exists()).toBe(true);
+      expect(detailed.findAll(".card-probe .match-deep")).toHaveLength(1);
+    } finally {
+      backendState.matchRows = [];
+      if (previous === null) localStorage.removeItem("lol-desktop-match-view");
+      else localStorage.setItem("lol-desktop-match-view", previous);
     }
   });
 });

@@ -21,28 +21,40 @@
  * 经济、游标时间挤在同一块（看比赛时这三个数就是要一起读的），目标物（塔/大小龙、
  * 拿了什么龙）分到两翼，不再和比分抢注意力。
  *
- * 游标（scrub）是核心：分钟帧是 60 秒一拍，按帧插值后拖到任意一秒都能给出
- * 「这时候谁几级、身上多少钱、站在图里哪里、双方经济差多少」。时间轴与经济差图
+ * 游标（scrub）是核心：分钟帧是 60 秒一拍，拖到任意一秒就能给出「这时候谁几级、身上
+ * 多少钱、双方经济差多少」——这三项是累积量，帧之间按比例过渡只是让读数顺一点。
+ * **走位是插值的**：位置只有每分钟一个采样点，**不插值就会变成「整分钟不动 + 集体闪现」**
+ * （2026-09-27 一度这么改过，当晚被用户否掉：「原本在地图上来回跑那个移动没有了，现在
+ * 变成了瞬间跳」）。所以位置在相邻两帧之间平滑过渡——**这是为了让画面连贯，不是真实
+ * 路径**，地图的 `title` 里写明了；真正的数据点走悬停采样点（只画点不连线）。
+ * 时间轴与经济差图
  * **两处都能拖**——那张图横轴本来就是分钟，能看却不能拖反而别扭（用户明确要求）。
  *
  * 十人行的第二行是**可切换**的：输出 / 承伤 / 推塔 / 装备。切换器长在十人列**正上方**
  * 那条通栏里（不是地图角上、也不是底部控制条里）——它管的就是下面那十行，摆远一点
  * 就变成「不容易找到」（用户反馈过两次）。口径也会写在通栏里。
- * 仍然拿不到的是**逐技能伤害**、**任一时刻的出装**与**对塔伤害的时间曲线**：
- * 前两者只有 SGP DETAILS 有（未开工），第三个 LCU 帧里根本没有该字段；
- * 更要紧的是真机的分钟帧里**连对英雄伤害都没有**，所以「输出/承伤」会自动降级成
- * 全场总账并把口径写出来（见 `matches/timeline.ts` 的 `framesHaveDamage`）。
+ *
+ * **「装备」与 K/D/A 的「此刻」口径**（2026-09-27 接入）：官方数据源里只有终局装备与终局
+ * 战绩，中间过程拿不到。本机对局录制（可选功能，`props.recording`）按采样间隔存了每人
+ * 当时的装备与 K/D/A，所以拿到录制帧时这两项跟着游标走，并按 puuid 配对到座位；
+ * 没录到就退回终局口径，版面与以前完全一致。
+ *
+ * 仍然拿不到的是**逐技能伤害**与**对塔伤害的时间曲线**：前者只有 SGP DETAILS 有（未开工），
+ * 后者 LCU 帧里根本没有该字段；更要紧的是真机的分钟帧里**连对英雄伤害都没有**，所以
+ * 「输出/承伤」会自动降级成全场总账并把口径写出来（见 `matches/timeline.ts` 的
+ * `framesHaveDamage`）。
  */
 import { computed, ref, watch } from "vue";
 import map11 from "../assets/map11.png";
 import AssetIcon from "./AssetIcon.vue";
 import { mapToImagePosition } from "../live/gameMap";
-import type { MatchParticipant, MatchSummary, MatchTimeline } from "../types/domain";
-import { TEAM_BLUE, TEAM_RED, clockOf, compactGold, eventTitle, framesHaveDamage, interpolatedDamage, interpolatedGold, interpolatedLevel, interpolatedPositions, interpolatedTaken, isKill, monsterLabel, pathFrom, signedGold, splitBySign } from "../matches/timeline";
+import type { GameRecordingFrame, GameRecordingPlayer, ItemSummary, MatchParticipant, MatchSummary, MatchTimeline } from "../types/domain";
+import { TEAM_BLUE, TEAM_RED, animatedPositions, clockOf, compactGold, eventTitle, framesHaveDamage, freezePositionWhileDead, interpolatedDamage, interpolatedGold, interpolatedLevel, interpolatedTaken, isKill, monsterLabel, pathFrom, positionHistory, signedGold, splitBySign } from "../matches/timeline";
 import { describeLocation, type Teamfight } from "../matches/teamfights";
 import { pairSeatsWithPlayers, realSeats } from "../matches/lineup";
+import { buildRecordedSeatLookup, recordedFrameAt, recordedPlayerForSeat, seatTeamOf } from "../matches/recordingLineup";
 import { structureStatesAt } from "../matches/structures";
-import { championImage } from "../utils/format";
+import { championImage, recordingItemImage } from "../utils/format";
 
 const props = defineProps<{
   /** 完整十人详情：名字 / 终局 KDA / 终局装备都从这里来。 */
@@ -56,6 +68,15 @@ const props = defineProps<{
   encounterCounts?: Record<string, number>;
   /** 外部（点事件流、点团战条）要求把游标挪到这一秒。 */
   seekSeconds?: number | null;
+  /**
+   * 本机对这一局的录制帧（可选功能，默认关）。
+   *
+   * 官方数据里只有**终局**装备与 KDA，中间过程看不到；本机录制按采样间隔存了每人
+   * 当时的装备 / KDA / 补刀，所以游标拖到哪一刻，「装备」与 K/D/A 就显示那一刻的值。
+   * 传空数组（没开开关 / 不是本机打的 / 已回收）时，这两项退回原来的终局口径，
+   * 版面与以前完全一致。
+   */
+  recording?: GameRecordingFrame[];
 }>();
 
 const emit = defineEmits<{ "select-fight": [index: number]; "seek-consumed": [] }>();
@@ -85,13 +106,26 @@ const seatPairing = computed(() => pairSeatsWithPlayers(props.timeline.participa
 const seatPlayers = computed(() =>
   realSeats(props.timeline.participants).map((seat) => ({ seat, player: seatPairing.value.get(seat.participantId) ?? null })),
 );
+/**
+ * 座位号 → **绝对阵营**码（100/200）。录制帧里的 `team` 是 `ORDER`/`CHAOS`，
+ * 必须换算到同一套绝对值才能配对，所以这里从时间线座位直接取（它本来就是绝对阵营）。
+ */
+const seatTeams = computed(() => new Map(realSeats(props.timeline.participants).map((seat) => [seat.participantId, seat.team])));
 const bluePlayers = computed(() => seatPlayers.value.filter((entry) => entry.seat.team === TEAM_BLUE));
 const redPlayers = computed(() => seatPlayers.value.filter((entry) => entry.seat.team === TEAM_RED));
 
-/** 游标时刻的插值快照：等级 / 金币 / 走位 / 累计输出 / 累计承伤。帧缺失时为 null，界面按「没有这帧数据」降级。 */
+/** 游标时刻的插值快照：等级 / 金币 / 累计输出 / 累计承伤。帧缺失时为 null，界面按「没有这帧数据」降级。 */
 const levelsAt = computed(() => interpolatedLevel(props.timeline.frames, seconds.value));
 const goldAt = computed(() => interpolatedGold(props.timeline.frames, seconds.value));
-const positionsAt = computed(() => interpolatedPositions(props.timeline.frames, seconds.value));
+/**
+ * 游标这一刻各人的**位置**（在前后两分钟帧之间平滑过渡）。
+ *
+ * 位置数据是「每分钟一个采样点」，两帧之间真实怎么走的没人知道；这里插值**只是为了让
+ * 画面连贯**（不插值就是十个小人整分钟不动、然后集体闪现，2026-09-27 实测被用户否掉）。
+ * 所以地图上必须说明这是插值（`MAP_GRANULARITY_NOTE`），并且另外提供悬停采样点
+ * （`trailDots`）作为**真**数据。详见 `matches/timeline.ts` 的 `animatedPositions`。
+ */
+const positionsAt = computed(() => animatedPositions(props.timeline.frames, seconds.value));
 /** 累计对英雄伤害——拖游标就能看它一路涨上去（LCU 分钟帧里本来就有这个字段）。 */
 const damageAt = computed(() => interpolatedDamage(props.timeline.frames, seconds.value));
 /** 累计承受伤害，同一批帧里也有。 */
@@ -101,11 +135,103 @@ const levelOf = (participantId: number) => levelsAt.value?.[participantId - 1] ?
 const goldOf = (participantId: number) => goldAt.value?.[participantId - 1] ?? 0;
 const damageOf = (participantId: number) => damageAt.value?.[participantId - 1] ?? 0;
 const takenOf = (participantId: number) => takenAt.value?.[participantId - 1] ?? 0;
-/** 座位号 → 这一局的完整十人详情（「推塔」「装备」两项只有总账，逐帧里没有）。 */
+/** 座位号 → 这一局的完整十人详情（「推塔」这一项只有总账，逐帧里没有）。 */
 const playerOf = (participantId: number) => seatPlayers.value.find((entry) => entry.seat.participantId === participantId)?.player ?? null;
 
-/** 击杀比随游标累计——拖回 5 分钟就看到 5 分钟时的比分。 */
-const tallyAt = computed(() => {
+// ── 本机录制：装备与 K/D/A 的「此刻」口径 ────────────────────────────────
+/**
+ * 本机确实录到了这一局——只有这时「装备」和 K/D/A 才能跟着游标走。
+ * 没录到的对局一切照旧（终局口径），版面一个字都不变。
+ */
+const hasRecording = computed(() => Boolean(props.recording?.length));
+
+/**
+ * 游标对应的那一帧录制：取 `t <= 游标` 的**最后一帧**（不是插值）。
+ *
+ * 具体选择规则与理由在 `matches/recordingLineup.ts` 的 `recordedFrameAt`（与团战面板共用）。
+ */
+const recordingAt = computed<GameRecordingFrame | null>(() => recordedFrameAt(props.recording, seconds.value));
+
+/**
+ * 座位号 → 录制帧里对应的那个人。
+ *
+ * **绝不能按 puuid 配**：Live Client Data 的 `allPlayers` 里根本没有 `puuid` 字段
+ * （官方文档的字段集只有 championName/isBot/isDead/items/level/position/
+ * rawChampionName/respawnTimer/runes/scores/skinID/summonerName/summonerSpells/team），
+ * 落盘帧里它恒为 `""`。之前就是按 puuid 比，配对 100% 失败又静默退回终局值，
+ * 用户看到的现象是「拖时间轴战绩和装备完全不动」。
+ *
+ * 现在按 `rid`（`名字#编号`，就是 Live Client 的 `riotId`）配，配不上再退
+ * 「绝对阵营 + 英雄」。规则与理由都写在 `matches/recordingLineup.ts`。
+ */
+const recordedLookup = computed(() => buildRecordedSeatLookup(recordingAt.value));
+
+const recordedPlayerOf = (participantId: number): GameRecordingPlayer | null => {
+  if (!recordingAt.value) return null;
+  const player = playerOf(participantId);
+  const identity = player
+    ? { team: seatTeamOf(player), championId: player.championId, gameName: player.gameName }
+    : null;
+  return recordedPlayerForSeat(seatTeams.value.get(participantId) ?? 0, participantId, identity, recordedLookup.value);
+};
+
+/**
+ * 「装备」那一行画的图标。
+ *
+ * 有本机录制 → **游标那一刻**身上的装备（用户要的「瞬时装备」，官方数据里没有）；
+ * 没录到 → 退回十人详情的**终局出装**（原行为）。
+ */
+const itemsOf = (participantId: number): ItemSummary[] => {
+  const recorded = recordedPlayerOf(participantId);
+  if (recorded) return recorded.items.map((id) => ({ id, name: "", iconUrl: recordingItemImage(id) }));
+  return playerOf(participantId)?.items ?? [];
+};
+
+/**
+ * 一行上那枚 K/D/A 胶囊的取值。
+ *
+ * 有本机录制 → **游标那一刻**的战绩（用户要的「瞬时战绩」）；没有 → 十人详情里的终局 KDA。
+ * `live` 只用来决定要不要在悬浮说明里注明口径——同一枚胶囊在两种模式下含义不同，
+ * 不写清就会被当成算错了。
+ */
+const kdaOf = (participantId: number) => {
+  const recorded = recordedPlayerOf(participantId);
+  if (recorded) return { kills: recorded.k, deaths: recorded.d, assists: recorded.a, live: true };
+  const player = playerOf(participantId);
+  return { kills: player?.kills ?? 0, deaths: player?.deaths ?? 0, assists: player?.assists ?? 0, live: false };
+};
+
+/**
+ * KDA 胶囊的悬浮说明：写明是「游标那一刻」还是「全场终局」。
+ *
+ * 两种口径下同一枚胶囊的含义完全不同（3/0/1 是「第 8 分钟时」还是「打完了」），
+ * 所以有录制时把终局值也一并写出来，用户能自己对照，不会以为数字算错了。
+ */
+const kdaTitle = (participantId: number) => {
+  const kda = kdaOf(participantId);
+  const player = playerOf(participantId);
+  if (!kda.live) return statTitle(player);
+  return `本机录制：${clockOf(seconds.value)} 那一刻的 K/D/A（取采样间隔内最近一帧）。全场终局：${statTitle(player)}`;
+};
+
+/**
+ * 这个人**此刻死没死**，以及还要等多久复活。
+ *
+ * 死没死只有本机录制拿得到（Live Client Data 的 `allPlayers[].isDead` 是**实时**值，
+ * 落盘后才有历史；官方战绩接口里没有「某一刻死没死」）。所以：
+ * - 有录制帧 → 用那一帧的 `dead` / `respawn`；
+ * - 没录制 → **不知道**，返回 null，界面不画灰、也不编一个复活倒计时。
+ *
+ * 用户要的正是这个：死亡时人还在地图上（位置确实没变），但头像该灰掉、并给出复活读秒。
+ * 死亡瞬间位置本来就不会动（尸体留在原地），所以这里**不动位置**，只改外观。
+ */
+const deathStateOf = (participantId: number): { dead: boolean; respawn: number } | null => {
+  const recorded = recordedPlayerOf(participantId);
+  if (!recorded) return null;
+  return { dead: recorded.dead, respawn: recorded.respawn };
+};
+
+/** 击杀比随游标累计——拖回 5 分钟就看到 5 分钟时的比分。 */const tallyAt = computed(() => {
   let blue = 0;
   let red = 0;
   for (const event of props.timeline.events) {
@@ -140,7 +266,9 @@ const ROW_METRICS = computed<{ key: RowMetricKey; label: string; caption: string
   { key: "damage", label: "输出", caption: framesWithDamage.value ? "到此刻累计输出" : "全场输出", kind: "bar" },
   { key: "taken", label: "承伤", caption: framesWithDamage.value ? "到此刻累计承伤" : "全场承伤", kind: "bar" },
   { key: "tower", label: "推塔", caption: "全场对塔伤害", kind: "bar" },
-  { key: "items", label: "装备", caption: "终局出装", kind: "items" },
+  // 有本机录制时这一项从「终局出装」升级成「此刻出装」：官方接口根本没有任意时刻的出装，
+  // 只有本机在局内采下来的快照才有。没录到就对用户保持原来的说法。
+  { key: "items", label: "装备", caption: hasRecording.value ? "此刻出装 · 跟随游标" : "终局出装", kind: "items" },
 ]);
 const rowMetric = ref<RowMetricKey>("damage");
 const rowMetricDef = computed(() => ROW_METRICS.value.find((item) => item.key === rowMetric.value) ?? ROW_METRICS.value[0]);
@@ -354,26 +482,49 @@ const sparkline = computed(() => {
  *
  * 纯点只能看出「这儿有个人」，认人得靠颜色和位置反推；换成头像 + 阵营色外圈之后，
  * 「谁在哪」一眼就能读出来（这也是观战界面里唯一能同时看到双方站位的地方）。
+ *
+ * 坐标来自 `positionsAt`——分钟帧之间的**平滑过渡**（详见那里与 `MAP_GRANULARITY_NOTE`：
+ * 走位看着连续是为了好读，采样粒度本身仍是 60 秒）。悬停某一行可以看到他整局的
+ * **真采样点**（`trailDots`）。
  */
 const dots = computed(() => {
   const positions = positionsAt.value;
   if (!positions) return [];
+  const frames = props.timeline.frames;
   return seatPlayers.value
     .map(({ seat, player }) => {
-      const position = positions[seat.participantId - 1];
+      const index = seat.participantId - 1;
+      const death = deathStateOf(seat.participantId);
+      const dead = death?.dead === true;
+      // 阵亡时把人**钉在倒下的位置**（插值会让尸体从倒地处一路飘回泉水，看着就是「死了还在动」）。
+      const position = freezePositionWhileDead(positions, frames, seconds.value, index, dead);
       if (!position || (position.x <= 0 && position.y <= 0)) return null;
       const { left, top } = mapToImagePosition(position.x, position.y, 1, 1);
+      const respawn = death?.respawn ?? 0;
+      const championName = player ? props.championNameOf(seat.championId) : `座位 ${seat.participantId}`;
       return {
         key: seat.participantId,
         championId: seat.championId,
         tone: seat.team === TEAM_BLUE ? "blue" : "red",
+        dead,
+        respawn,
         style: { left: `${left * 100}%`, top: `${top * 100}%` },
         // 悬浮说明给「谁在哪儿」的完整信息；头像自身的可读名（aria-label / title）走英雄名——
         // 那是一张英雄头像，读屏把它念成「玩家名 · 时间」是错的。
-        title: player ? `${player.gameName} · ${props.championNameOf(seat.championId)} · ${clockOf(seconds.value)}` : `座位 ${seat.participantId}`,
+        title: player
+          ? `${player.gameName} · ${championName} · ${clockOf(seconds.value)}${dead ? ` · 已阵亡，${Math.max(0, Math.ceil(respawn))} 秒后复活` : ""}`
+          : `座位 ${seat.participantId}`,
       };
     })
-    .filter(Boolean) as { key: number; championId: number; tone: string; style: Record<string, string>; title: string }[];
+    .filter(Boolean) as {
+    key: number;
+    championId: number;
+    tone: string;
+    dead: boolean;
+    respawn: number;
+    style: Record<string, string>;
+    title: string;
+  }[];
 });
 
 /**
@@ -430,6 +581,14 @@ const metBadgeOf = (puuid?: string) => {
 };
 const isSelf = (puuid?: string) => Boolean(puuid && puuid === props.selfPuuid);
 
+/**
+ * 地图走位的口径说明（挂在整张地图的 `title` 上）。
+ *
+ * 必须写在界面上：不写的话「小人一分钟才动一次」会被当成渲染卡顿，而真实情况是——
+ * 客户端的分钟帧里一分钟只有一个坐标，两帧之间根本没有数据。
+ */
+const MAP_GRANULARITY_NOTE = "位置数据每分钟只有一个采样点（客户端不给分钟之间的数据）。小人在分钟之间是**插值过去**的——为了让画面连贯，不是真实路径；真实能拿到的只有每分钟那一个点。悬停某位玩家可以看到他整局的（真）采样点。";
+
 const compactNumber = (value: number) => new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 }).format(value ?? 0);
 /**
  * 行里只放得下「KDA · 经济」两枚胶囊（用户明确要求两行封顶：名字+数字一行、第二行一项数据），
@@ -449,7 +608,11 @@ const statTitle = (player?: MatchParticipant | null) => {
  * 不写清就会被当成同一口径。
  */
 const rowValueTitle = (participantId: number) => {
-  if (rowMetric.value === "items") return "终局出装（LCU 拿不到任意时刻的出装）";
+  if (rowMetric.value === "items") {
+    return hasRecording.value
+      ? `本机录制：${clockOf(seconds.value)} 那一刻身上的装备（官方接口没有任意时刻的出装，这一份来自本机在局内采到的快照）`
+      : "终局出装（LCU 拿不到任意时刻的出装；在设置里打开「对局录制」才能看到过程中的出装）";
+  }
   const value = compactNumber(rowValueOf(participantId));
   if (rowMetric.value === "tower") return `全场对防御塔造成的伤害 ${value}`;
   const kind = rowMetric.value === "damage" ? "对英雄伤害" : "承受伤害";
@@ -459,6 +622,27 @@ const rowValueTitle = (participantId: number) => {
 
 /** 鼠标停在某个玩家行上，就让地图上他的那个点亮起来——十个人挤在图上时靠这个认人。 */
 const hoveredSeat = ref<number | null>(null);
+
+/**
+ * 悬停某位玩家时，把他**到游标为止每分钟的采样点**淡淡地标在地图上。
+ *
+ * 这是整块地图上**唯一真实**的位置信息：一分钟一个坐标点，**点与点之间不连线**——中间是
+ * 直线、是绕路、还是回城瞬移，数据里没有，连起来就是编。点本身就是「原始数据长什么样」，
+ * 拖游标时能看到头像在这串点之间滑过去，也一眼知道自己看到的平滑走位是插出来的。
+ *
+ * 不掐掉最后一个点：头像现在是**插值**（`animatedPositions`）到的位置，通常落在最后两个
+ * 采样点之间，所以"游标那一帧的点"和头像位置并不重合，画出来才对得上账。
+ */
+const trailDots = computed(() => {
+  if (hoveredSeat.value === null) return [];
+  const points = positionHistory(props.timeline.frames, seconds.value, hoveredSeat.value - 1);
+  const total = Math.max(1, points.length);
+  return points.map((point, order) => {
+    const { left, top } = mapToImagePosition(point.x, point.y, 1, 1);
+    // 越接近游标越深：一眼看出哪头是「刚才」、哪头是「开局」。
+    return { key: `${hoveredSeat.value}-${order}`, style: { left: `${left * 100}%`, top: `${top * 100}%`, opacity: `${(0.2 + 0.5 * ((order + 1) / total)).toFixed(2)}` } };
+  });
+});
 </script>
 
 <template>
@@ -533,6 +717,13 @@ const hoveredSeat = ref<number | null>(null);
       <span class="spectate__rowbar-caption">{{ rowMetricDef.caption }}<template v-if="rowMetricDef.kind === 'bar'"> · 蓝 {{ compactNumber(rowMetricTotal[TEAM_BLUE] ?? 0) }} / 红 {{ compactNumber(rowMetricTotal[TEAM_RED] ?? 0) }}</template></span>
       <!-- 降级要说出来：这一局没拿到逐分钟伤害，这两项给的是全场总账。 -->
       <span v-if="!framesWithDamage" class="spectate__rowbar-note" title="这一局没取到逐分钟伤害：客户端本地的分钟帧里没有伤害字段，要去同一局的 SGP 时间线里拿，这次没拿到">输出 / 承伤为全场总账</span>
+      <!-- 有本机录制也必须说出来：这会儿「装备」和 K/D/A 的含义跟没录制时**不一样**了。 -->
+      <span
+        v-if="hasRecording"
+        class="spectate__rowbar-note"
+        data-tone="recording"
+        title="这一局本机录到了：装备与 K/D/A 都取「游标那一刻」（采样间隔内最近一帧），不是终局值；官方接口本身没有任意时刻的出装与战绩"
+      >本局有本机录制 · 装备与 K/D/A 跟随游标</span>
     </div>
 
     <!-- 舞台：蓝队列 | 小地图（常驻）| 红队列 -->
@@ -547,31 +738,45 @@ const hoveredSeat = ref<number | null>(null);
           <div class="spectate-player__body" :class="{ 'is-self': isSelf(entry.player?.puuid) }">
             <p class="spectate-player__line">
               <b :title="championNameOf(entry.seat.championId)">{{ entry.player?.gameName ?? championNameOf(entry.seat.championId) }}<i v-if="metBadgeOf(entry.player?.puuid)">{{ metBadgeOf(entry.player?.puuid) }}</i></b>
-              <span class="spectate-player__stats" :title="statTitle(entry.player)">
-                <span class="spectate-kda"><b>{{ entry.player?.kills ?? 0 }}</b><i>/</i><b class="is-death">{{ entry.player?.deaths ?? 0 }}</b><i>/</i><b class="is-assist">{{ entry.player?.assists ?? 0 }}</b></span>
+              <!-- K/D/A 跟着游标走（仅当本机录到了这一局）：拖时间轴就能看到「那一刻他几杀几死」。 -->
+              <span class="spectate-player__stats" :title="kdaTitle(entry.seat.participantId)">
+                <span class="spectate-kda" :data-live="kdaOf(entry.seat.participantId).live ? 'true' : undefined"><b>{{ kdaOf(entry.seat.participantId).kills }}</b><i>/</i><b class="is-death">{{ kdaOf(entry.seat.participantId).deaths }}</b><i>/</i><b class="is-assist">{{ kdaOf(entry.seat.participantId).assists }}</b></span>
                 <span class="spectate-gold"><i class="coin" aria-hidden="true" />{{ compactGold(goldOf(entry.seat.participantId)) }}</span>
               </span>
             </p>
-            <!-- 第二行：柱状图（输出/承伤/推塔）或终局出装，由上方通栏的切换器决定。 -->
+            <!-- 第二行：柱状图（输出/承伤/推塔）或出装，由上方通栏的切换器决定。
+                 「装备」在有本机录制时是**此刻**出装（跟随游标），否则退回终局出装。 -->
             <span v-if="rowMetricDef.kind === 'bar'" class="spectate-player__damage" :title="rowValueTitle(entry.seat.participantId)">
               <span class="spectate-player__damage-track"><i :style="{ width: rowPercent(rowValueOf(entry.seat.participantId)) }" /></span>
               <b>{{ compactNumber(rowValueOf(entry.seat.participantId)) }}</b>
             </span>
             <span v-else class="spectate-player__items" :title="rowValueTitle(entry.seat.participantId)">
-              <AssetIcon v-for="item in (entry.player?.items ?? []).slice(0, 6)" :key="item.id" kind="item" :id="item.id" :name="item.name" :fallback-url="item.iconUrl" size="xs" />
-              <small v-if="!entry.player?.items?.length">—</small>
+              <AssetIcon v-for="item in itemsOf(entry.seat.participantId).slice(0, 6)" :key="`${entry.seat.participantId}-${item.id}`" kind="item" :id="item.id" :name="item.name" :fallback-url="item.iconUrl" size="xs" />
+              <small v-if="!itemsOf(entry.seat.participantId).length">—</small>
             </span>
           </div>
         </div>
       </div>
 
       <!-- 中间列：小地图常驻（不再有「地图 / 实时伤害」切换）。英雄头像压在建筑层之上。 -->
-      <div class="spectate__map">
+      <div class="spectate__map" :title="MAP_GRANULARITY_NOTE">
         <img class="spectate__plate" :src="map11" alt="召唤师峡谷地图" />
         <!-- 建筑层：22 座塔 + 6 座水晶；被推掉的画成空心灰，拖时间轴就能看着它们一座座掉。 -->
         <span v-for="structure in structureMarkers" :key="structure.key" class="spectate__structure" :class="{ 'is-down': structure.destroyed }" :data-kind="structure.kind" :data-tone="structure.tone" :style="structure.style" :title="structure.title" />
-        <span v-for="dot in dots" :key="dot.key" class="spectate__dot" :class="{ 'is-hot': hoveredSeat === dot.key }" :data-tone="dot.tone" :style="dot.style" :title="dot.title">
+        <!-- 悬停某位玩家时的历史采样点：只画点、不连线（点之间没有数据，连起来就是编出来的路线）。这就是真数据。 -->
+        <span v-for="trail in trailDots" :key="trail.key" class="spectate__trail" :style="trail.style" />
+        <span
+          v-for="dot in dots"
+          :key="dot.key"
+          class="spectate__dot"
+          :class="{ 'is-hot': hoveredSeat === dot.key, 'is-dead': dot.dead }"
+          :data-tone="dot.tone"
+          :style="dot.style"
+          :title="dot.title"
+        >
           <AssetIcon kind="champion" round :id="dot.championId" :name="championNameOf(dot.championId)" :fallback-url="championImage(dot.championId)" size="xs" />
+          <!-- 阵亡读秒：只在本机录到这一局的这一刻时才画（没录到 = 不知道死没死，不编数字）。 -->
+          <i v-if="dot.dead" class="spectate__dot-timer">{{ Math.max(0, Math.ceil(dot.respawn)) }}</i>
         </span>
         <button
           v-for="pin in fightPins"
@@ -592,8 +797,9 @@ const hoveredSeat = ref<number | null>(null);
           <div class="spectate-player__body" :class="{ 'is-self': isSelf(entry.player?.puuid) }">
             <p class="spectate-player__line">
               <b :title="championNameOf(entry.seat.championId)"><i v-if="metBadgeOf(entry.player?.puuid)">{{ metBadgeOf(entry.player?.puuid) }}</i>{{ entry.player?.gameName ?? championNameOf(entry.seat.championId) }}</b>
-              <span class="spectate-player__stats" :title="statTitle(entry.player)">
-                <span class="spectate-kda"><b>{{ entry.player?.kills ?? 0 }}</b><i>/</i><b class="is-death">{{ entry.player?.deaths ?? 0 }}</b><i>/</i><b class="is-assist">{{ entry.player?.assists ?? 0 }}</b></span>
+              <!-- 与蓝方同构：K/D/A 在有本机录制时跟着游标走。 -->
+              <span class="spectate-player__stats" :title="kdaTitle(entry.seat.participantId)">
+                <span class="spectate-kda" :data-live="kdaOf(entry.seat.participantId).live ? 'true' : undefined"><b>{{ kdaOf(entry.seat.participantId).kills }}</b><i>/</i><b class="is-death">{{ kdaOf(entry.seat.participantId).deaths }}</b><i>/</i><b class="is-assist">{{ kdaOf(entry.seat.participantId).assists }}</b></span>
                 <span class="spectate-gold"><i class="coin" aria-hidden="true" />{{ compactGold(goldOf(entry.seat.participantId)) }}</span>
               </span>
             </p>
@@ -603,8 +809,8 @@ const hoveredSeat = ref<number | null>(null);
               <span class="spectate-player__damage-track"><i :style="{ width: rowPercent(rowValueOf(entry.seat.participantId)) }" /></span>
             </span>
             <span v-else class="spectate-player__items" :title="rowValueTitle(entry.seat.participantId)">
-              <small v-if="!entry.player?.items?.length">—</small>
-              <AssetIcon v-for="item in (entry.player?.items ?? []).slice(0, 6)" :key="item.id" kind="item" :id="item.id" :name="item.name" :fallback-url="item.iconUrl" size="xs" />
+              <small v-if="!itemsOf(entry.seat.participantId).length">—</small>
+              <AssetIcon v-for="item in itemsOf(entry.seat.participantId).slice(0, 6)" :key="`${entry.seat.participantId}-${item.id}`" kind="item" :id="item.id" :name="item.name" :fallback-url="item.iconUrl" size="xs" />
             </span>
           </div>
           <span class="spectate-player__portrait">
@@ -696,7 +902,7 @@ const hoveredSeat = ref<number | null>(null);
         <span><i data-kind="monster" />野怪</span>
         <span><i data-kind="building" />推塔</span>
       </span>
-      <span class="spectate__controls-hint">时间轴与经济差图都能按住拖动擦洗；点事件流里的某条也能跳到那一刻</span>
+      <span class="spectate__controls-hint">时间轴与经济差图都能按住拖动擦洗；点事件流里的某条也能跳到那一刻。走位是每分钟一个采样点、中间由界面插值补成连续（悬停某位玩家看他整局**真**采样点）</span>
     </div>
   </div>
 </template>
@@ -803,6 +1009,9 @@ const hoveredSeat = ref<number | null>(null);
 .spectate-kda b.is-death { color: var(--red); }
 .spectate-kda b.is-assist { color: var(--blue); }
 .spectate-kda i { color: var(--line-strong); font-style: normal; }
+/* 有本机录制时 KDA 是「游标那一刻」而不是终局值 —— 换一道 accent 描边把这枚胶囊和
+   上面那些「终局读数」（金币、等级）区分开，免得被当成算错。 */
+.spectate-kda[data-live="true"] { border-color: var(--accent); background: var(--accent-soft); }
 /* 金币胶囊：队色之外唯一带自己颜色的读数 —— 全 app 只有它用 `--gold`，配上金币图标
    一眼就能和旁边的伤害数字（柱状图 + 无图标）区分开。 */
 .spectate-gold { padding: 1px 6px; gap: 3px; border-color: var(--gold-soft); background: var(--gold-soft); color: var(--gold); font-weight: 700; }
@@ -834,12 +1043,24 @@ const hoveredSeat = ref<number | null>(null);
 /* 水晶比塔大一圈、转 45° 成正菱形：形状本身就能把「塔」和「水晶」分开。 */
 .spectate__structure[data-kind="inhibitor"] { width: 11px; height: 11px; margin: -5.5px 0 0 -5.5px; border-radius: 1px; transform: rotate(45deg); }
 .spectate__structure.is-down { border-color: rgba(255, 255, 255, .34); border-style: dashed; background: transparent; box-shadow: none; opacity: .72; }
+/* 悬停某位玩家时的历史采样点：**只有点、没有连线**。
+   点之间有直线还是绕路，数据里没有；连起来画的就是一条编出来的路线（这正是原来那版
+   线性插值被投诉「往人没去过的地方走」的原因）。点比头像小得多，也不吃指针事件，
+   免得挡住地图上本来就能点的团战钉。透明度由内联样式按时间先后给。 */
+.spectate__trail { position: absolute; z-index: 0; width: 5px; height: 5px; margin: -2.5px 0 0 -2.5px; border: 1px solid rgba(255, 255, 255, .7); border-radius: 50%; background: #ffd166; pointer-events: none; }
 /* 地图上的十个点画**英雄头像**：纯色圆点只能看出「这儿有人」，认人得靠反推。
    底图是深色，所以外圈用写死的亮色（主题 token 会糊进底图），头像本身裁成圆。 */
 .spectate__dot { position: absolute; z-index: 1; display: grid; place-items: center; width: 24px; height: 24px; margin: -12px 0 0 -12px; border: 2px solid #57b4ff; border-radius: 50%; background: #0b1210; box-shadow: 0 1px 3px rgba(0, 0, 0, .55); transition: transform .12s, box-shadow .12s; }
 .spectate__dot[data-tone="red"] { border-color: #ff7a7a; }
 .spectate__dot :deep(.asset-icon) { border: 0; border-radius: 50%; }
 .spectate__dot.is-hot { z-index: 3; transform: scale(1.3); box-shadow: 0 0 0 3px rgba(255, 255, 255, .6); }
+/* 阵亡：头像灰度 + 降透明，再压一个复活读秒。
+   位置**不动**（尸体就留在原地），只改外观——用户要的就是「人还在那儿，但一眼看出死了」。
+   `data-tone` 的描边也一并褪掉，否则灰头像配亮色描边反而更显眼。 */
+.spectate__dot.is-dead { border-color: var(--line-strong); background: #1b1f1d; opacity: .72; }
+.spectate__dot.is-dead[data-tone="red"] { border-color: var(--line-strong); }
+.spectate__dot.is-dead :deep(.asset-icon) { filter: grayscale(1) brightness(.65); }
+.spectate__dot-timer { position: absolute; right: -6px; bottom: -6px; display: grid; place-items: center; min-width: 15px; height: 14px; padding: 0 2px; border: 1px solid rgba(255, 255, 255, .28); border-radius: 3px; color: #fff; background: #b23b3b; font-size: 9px; font-style: normal; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; }
 
 /* 第二行的第二个选项是**终局出装**：六个格子平铺，红方镜像靠右。
    LCU 只在 SGP DETAILS 里给逐次购买，拿不到任意时刻的出装，所以这里就是终局那六件；
@@ -918,6 +1139,9 @@ const hoveredSeat = ref<number | null>(null);
 .spectate__rowbar-caption { color: var(--text-secondary); font-size: 10px; font-variant-numeric: tabular-nums; }
 /* 降级说明：真机的分钟帧里没有伤害字段，那两项给的是全场总账——写在读数旁边，别藏进 tooltip。 */
 .spectate__rowbar-note { padding: 0 6px; border-radius: 4px; color: var(--amber); background: var(--amber-soft); font-size: 9px; }
+/* 「本局有本机录制」是**能力说明**不是降级警告，用 accent 而不是 amber：amber 在这个
+   通栏里已经表示「这次没取到数据」，两种语气混在一起会让人以为录制也出问题了。 */
+.spectate__rowbar-note[data-tone="recording"] { color: var(--accent); background: var(--accent-soft); }
 .spectate__rowswitch { display: inline-flex; align-items: center; gap: 2px; padding: 2px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
 .spectate__rowswitch button { padding: 3px 12px; border: 0; border-radius: 4px; color: var(--text-secondary); background: transparent; cursor: pointer; font: inherit; font-size: 11px; transition: color .12s, background .12s; }
 .spectate__rowswitch button:hover:not(.is-active) { color: var(--text-primary); background: var(--surface-raised); }

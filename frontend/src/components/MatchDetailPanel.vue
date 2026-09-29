@@ -15,7 +15,7 @@
  */
 import { Castle, Flame, Swords, TowerControl } from "@lucide/vue";
 import { computed, markRaw } from "vue";
-import type { MatchParticipant, MatchTimeline, MatchTimelineEvent } from "../types/domain";
+import type { GameRecordingFrame, MatchParticipant, MatchTimeline, MatchTimelineEvent } from "../types/domain";
 import AssetIcon from "./AssetIcon.vue";
 import TeamfightList from "./TeamfightList.vue";
 import { clockOf, eventDetail, eventTitle, isKill, teamLabel } from "../matches/timeline";
@@ -32,6 +32,11 @@ const props = defineProps<{
   selectedFightIndex?: number;
   /** 十人完整详情：团战面板的「全场输出 / 全场承伤」两个指标从这里取。 */
   players?: MatchParticipant[];
+  /**
+   * 本机录制帧（可选）。有了它，「出装」这一项才画得出**那一波团当时**的装备；
+   * 没有就退回这局终局的六件——那时的标签会写清是终局口径，不能含糊。
+   */
+  recording?: GameRecordingFrame[];
 }>();
 
 const emit = defineEmits<{ "select-fight": [index: number]; "seek-time": [seconds: number] }>();
@@ -187,6 +192,7 @@ function iconOf(event: MatchTimelineEvent) {
         :participants="timeline.participants"
         :players="players"
         :frames="timeline.frames"
+        :recording="recording"
         :selected-index="selectedFightIndex"
         @select="emit('select-fight', $event)"
       >

@@ -18,7 +18,7 @@ describe("MatchDetailCard", () => {
     };
     const wrapper = mount(MatchDetailCard, {
       props: { match },
-      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
+      global: { stubs: { AssetIcon: true } },
     });
 
     expect(wrapper.text()).not.toContain("躺赢局");
@@ -29,7 +29,7 @@ describe("MatchDetailCard", () => {
     const match = structuredClone(fixtureMatches[0]);
     const wrapper = mount(MatchDetailCard, {
       props: { match, expanded: true },
-      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
+      global: { stubs: { AssetIcon: true } },
     });
 
     expect(match.participants).toHaveLength(10);
@@ -45,7 +45,7 @@ describe("MatchDetailCard", () => {
   it("keeps the summoner spells next to the champion avatar, not after the items", () => {
     const wrapper = mount(MatchDetailCard, {
       props: { match: structuredClone(fixtureMatches[0]), expanded: true },
-      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
+      global: { stubs: { AssetIcon: true } },
     });
 
     const children = Array.from(wrapper.get(".participant-line").element.children)
@@ -62,7 +62,7 @@ describe("MatchDetailCard", () => {
   it("draws seven item slots with the trinket last", () => {
     const wrapper = mount(MatchDetailCard, {
       props: { match: structuredClone(fixtureMatches[0]), expanded: true },
-      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
+      global: { stubs: { AssetIcon: true } },
     });
 
     const items = wrapper.get(".participant-line .participant-line__items").element;
@@ -83,7 +83,7 @@ describe("MatchDetailCard", () => {
     ];
     const wrapper = mount(MatchDetailCard, {
       props: { match, expanded: true },
-      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
+      global: { stubs: { AssetIcon: true } },
     });
 
     const slots = Array.from(wrapper.get(".participant-line .participant-line__items").element.children);
@@ -102,7 +102,7 @@ describe("MatchDetailCard", () => {
     const row = { ...structuredClone(fixtureLobby.ally[0].recentMatches[0]), killParticipation: null };
     const wrapper = mount(MatchDetailCard, {
       props: { match: row },
-      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
+      global: { stubs: { AssetIcon: true } },
     });
 
     expect(wrapper.get(".match-row__kda small").text()).toBe("— 参团");
@@ -111,7 +111,7 @@ describe("MatchDetailCard", () => {
   it("keeps the row expanded when the detail area itself is clicked", async () => {
     const wrapper = mount(MatchDetailCard, {
       props: { match: structuredClone(fixtureMatches[0]), expanded: true },
-      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
+      global: { stubs: { AssetIcon: true } },
     });
 
     // 详情区是行的子节点：在里面点任何地方（选文字、点图标）都不该把行收回去。
@@ -131,7 +131,7 @@ describe("MatchDetailCard", () => {
     const stub = { ...full, participants: [full.participants[0]] };
     const wrapper = mount(MatchDetailCard, {
       props: { match: stub, expanded: true, detailLoading: true },
-      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
+      global: { stubs: { AssetIcon: true } },
     });
 
     expect(wrapper.get(".match-row__detail-status").text()).toContain("正在读取");
@@ -142,7 +142,7 @@ describe("MatchDetailCard", () => {
     const stub = { ...full, participants: [full.participants[0]] };
     const wrapper = mount(MatchDetailCard, {
       props: { match: stub, expanded: true, detailError: "这局的完整十人数据读取失败" },
-      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
+      global: { stubs: { AssetIcon: true } },
     });
 
     const status = wrapper.get(".match-row__detail-status");
@@ -161,19 +161,59 @@ describe("MatchDetailCard", () => {
 
     const plain = mount(MatchDetailCard, {
       props: { match: row, expanded: true },
-      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
+      global: { stubs: { AssetIcon: true } },
     });
     expect(plain.find(".match-row__detail").exists()).toBe(false);
     expect(plain.find(".match-row__toggle").exists()).toBe(false);
 
     const expandable = mount(MatchDetailCard, {
       props: { match: row, expanded: true, expandable: true, detailLoading: true },
-      global: { stubs: { AssetIcon: true, MatchRecordingPanel: true } },
+      global: { stubs: { AssetIcon: true } },
     });
     expect(expandable.find(".match-row__toggle").exists()).toBe(true);
     expect(expandable.get(".match-row__detail-status").text()).toContain("正在读取");
     // 行身也是可点区域：只有右上角小箭头能点的体验太差。
     await expandable.get(".match-row__identity").trigger("click");
     expect(expandable.emitted("toggle")).toHaveLength(1);
+  });
+});
+
+/**
+ * 展开区最底下那个 `deep` 插槽（战绩页把历史页那套「完整详情」塞进来的入口）。
+ *
+ * 两条都要钉住：
+ * 1. 插槽的东西**只在展开时**出现——没展开就渲染，等于一屏十局各发一份时间线请求；
+ * 2. 不传插槽时展开区的形状不变（首页 / 对局页 / 抽屉都走这条路径）。
+ */
+describe("MatchDetailCard 的 deep 插槽", () => {
+  const slot = { deep: '<div class="deep-probe">完整详情</div>' };
+
+  it("只在展开时才渲染插槽内容", () => {
+    const match = structuredClone(fixtureMatches[0]);
+    const collapsed = mount(MatchDetailCard, {
+      props: { match, expanded: false },
+      slots: slot,
+      global: { stubs: { AssetIcon: true } },
+    });
+    expect(collapsed.find(".deep-probe").exists()).toBe(false);
+
+    const expanded = mount(MatchDetailCard, {
+      props: { match, expanded: true },
+      slots: slot,
+      global: { stubs: { AssetIcon: true } },
+    });
+    expect(expanded.find(".deep-probe").exists()).toBe(true);
+    // 插槽落在展开区**里面**（不是另起一块），所以顺序上排在十人明细之后。
+    expect(expanded.get(".match-row__detail .deep-probe").text()).toBe("完整详情");
+  });
+
+  it("不传插槽时展开区照旧（宿主不需要为这个插槽改任何东西）", () => {
+    const match = structuredClone(fixtureMatches[0]);
+    const wrapper = mount(MatchDetailCard, {
+      props: { match, expanded: true },
+      global: { stubs: { AssetIcon: true } },
+    });
+    expect(wrapper.find(".deep-probe").exists()).toBe(false);
+    expect(wrapper.findAll(".participant-line")).toHaveLength(10);
   });
 });

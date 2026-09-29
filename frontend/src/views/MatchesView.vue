@@ -5,6 +5,7 @@ import { computed, ref, watch } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 import AssetIcon from "../components/AssetIcon.vue";
 import LoadingState from "../components/LoadingState.vue";
+import MatchDeepDetail from "../components/MatchDeepDetail.vue";
 import MatchDetailCard from "../components/MatchDetailCard.vue";
 import MatchHistoryDetail from "../components/MatchHistoryDetail.vue";
 import PageHeader from "../components/PageHeader.vue";
@@ -154,6 +155,51 @@ const expandedMatchDetail = useMatchDetail({
   }),
   selfPuuid: computed(() => app.connection.puuid ?? ""),
 });
+
+// ── 深详情（观战面板 / 每波团 / 事件流）的取数 ──────────────────────────
+/**
+ * 历史页那两个页签本来就把这一套挂在自己身上，战绩页原来没有——所以这里补齐它要的三样：
+ * - `selfPuuid`：后端账号归属校验 + 界面上「我」的定位；
+ * - `encounterCounts`：「遇到过 N」角标，与历史页同一份口径（本地相遇档案按 gameId 去重）；
+ * - `championNameOf`：事件流 / 地图只给英雄 id，要换成名字。
+ *
+ * 三份都在**真正可能渲染深详情时**才启用（索引模式选中了一局、或展开对局模式点开了一行），
+ * 免得打开战绩页就白发两个请求。`champions` / `encounters` 的 queryKey 与历史页完全相同，
+ * 两边来回切时直接命中同一份缓存。
+ */
+const selfPuuid = computed(() => app.connection.puuid ?? "");
+const deepDetailWanted = computed(() =>
+  viewMode.value === "index" ? Boolean(detailOpen.value && selectedMatch.value) : expandedId.value !== null);
+const encounters = useQuery({
+  queryKey: computed(() => ["encounter-history", app.mode]),
+  queryFn: () => backend.encounters(undefined, 100),
+  enabled: computed(() => app.initialized && deepDetailWanted.value),
+});
+const encounterCounts = computed(() => {
+  const byPuuid = new Map<string, Set<number>>();
+  for (const record of encounters.data.value ?? []) {
+    if (record.liveSnapshot || !record.puuid?.trim()) continue;
+    const games = byPuuid.get(record.puuid) ?? new Set<number>();
+    if (record.gameId > 0) games.add(record.gameId);
+    byPuuid.set(record.puuid, games);
+  }
+  return Object.fromEntries([...byPuuid].map(([puuid, games]) => [puuid, games.size]));
+});
+const champions = useQuery({
+  queryKey: computed(() => ["champions", app.mode]),
+  queryFn: () => backend.champions(),
+  enabled: computed(() => app.initialized && deepDetailWanted.value),
+});
+const championNameById = computed(() => new Map((champions.data.value ?? []).map((champion) => [champion.id, champion.name])));
+const championNameOf = (id: number) => championNameById.value.get(id) ?? `英雄 #${id}`;
+/**
+ * 深详情的「视角」＝这一局里**被查询的那个人**。
+ *
+ * 战绩列表每局只带查询者本人一条 `participants`（见 `useMatchDetail` 的说明），所以
+ * 第一条就是被查的人；查自己时就是我。一条都没有时退回当前登录账号——`MatchDeepDetail`
+ * 的 `targetPuuid` 缺省就是「我」，语义一致。
+ */
+const targetPuuidOf = (match: MatchSummary) => match.participants[0]?.puuid ?? selfPuuid.value;
 async function searchSummoner() {
   const query = summonerQuery.value.trim();
   searchError.value = "";
@@ -314,7 +360,11 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
     <LoadingState v-if="matches.isLoading.value" label="正在刷新完整战绩" />
     <template v-else>
       <section class="matches-summary"><div><span>最近 10 局</span><strong>{{ summaryRows.length }} <small>场</small></strong></div><div><span>胜率</span><strong>{{ completedRows.length ? Math.round(wins / completedRows.length * 100) : 0 }}<small>%</small></strong></div><div><span>平均 KDA</span><strong>{{ averageKda }}</strong></div><div><span>平均伤害</span><strong>{{ averageDamage }}<small>k</small></strong></div><div class="matches-summary__result"><Filter :size="14" /><span>{{ viewMode === "detail" ? "当前 10 局聚合 · 点击箭头展开十人阵容" : "最近 10 局聚合 · 详情随左侧选中对局更新" }}</span></div></section>
-      <section v-if="viewMode === 'detail'" class="match-table-shell"><header class="match-table-heading"><div><span class="eyebrow">RECENT GAMES / DETAIL ROW</span><h2>完整对局</h2></div><span class="match-table-heading__hint">保留完整信息；点击右侧箭头展开十人阵容与 BP</span></header><div class="match-list match-list--full"><MatchDetailCard v-for="match in filtered" :key="match.gameId" :match="expandedMatchDetail.matchForRow(match)" :expanded="expandedId === match.gameId" :detail-loading="expandedId === match.gameId && expandedMatchDetail.loading.value" :detail-error="expandedId === match.gameId ? expandedMatchDetail.error.value : ''" @toggle="toggleExpanded(match.gameId)" /><div v-if="!filtered.length" class="empty-state">没有匹配的对局</div></div></section>
+      <section v-if="viewMode === 'detail'" class="match-table-shell"><header class="match-table-heading"><div><span class="eyebrow">RECENT GAMES / DETAIL ROW</span><h2>完整对局</h2></div><span class="match-table-heading__hint">保留完整信息；点击右侧箭头展开十人阵容与 BP、观战面板与事件流</span></header><div class="match-list match-list--full"><template v-for="match in filtered" :key="match.gameId"><MatchDetailCard :match="expandedMatchDetail.matchForRow(match)" :expanded="expandedId === match.gameId" :detail-loading="expandedId === match.gameId && expandedMatchDetail.loading.value" :detail-error="expandedId === match.gameId ? expandedMatchDetail.error.value : ''" @toggle="toggleExpanded(match.gameId)"><!--
+                历史页「展开一局」的那套完整详情，原样放进战绩页的展开区。
+                战绩页默认就是这个模式，所以不放进来的话，要看得先跳到历史页去。
+                插槽内容只在 `expanded` 为真时渲染，没展开的行不会多发任何请求。
+              --><template #deep><MatchDeepDetail :game-id="match.gameId" :target-puuid="targetPuuidOf(match)" :self-puuid="selfPuuid" :encounter-counts="encounterCounts" :champion-name-of="championNameOf" /></template></MatchDetailCard></template><div v-if="!filtered.length" class="empty-state">没有匹配的对局</div></div></section>
       <section v-else class="matches-workspace">
         <aside class="matches-index" aria-label="最近对局列表">
           <header class="matches-index__header"><div><span class="eyebrow">RECENT GAMES</span><h2>最近对局</h2></div><span>{{ filtered.length }} / {{ rows.length }}</span></header>
@@ -333,6 +383,21 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
             <MatchHistoryDetail v-if="selectedMatch" :key="selectedMatch.gameId" :match="selectedMatch" @close="detailOpen = false" @exported="message.success(`已保存：${$event}`)" @export-error="message.error($event)" />
             <div v-else key="empty-detail" class="matches-detail-empty"><span class="eyebrow">MATCH DETAIL</span><h2>选择一场对局</h2><p>从左侧列表选择记录，查看装备、技能、符文、十人阵容和 BP。</p></div>
           </Transition>
+          <!--
+            历史页那一套完整详情（观战面板 + 每波团 + 事件流）也挂在右栏下面：
+            同一份组件、同一份数据，两处看的东西必须一致（`MatchDeepDetail` 的注释里
+            写了为什么只维护一份）。`:key` 带上局号，换一局就整块重置选中态与游标。
+          -->
+          <MatchDeepDetail
+            v-if="selectedMatch"
+            class="matches-deep"
+            :key="`deep-${selectedMatch.gameId}`"
+            :game-id="selectedMatch.gameId"
+            :target-puuid="targetPuuidOf(selectedMatch)"
+            :self-puuid="selfPuuid"
+            :encounter-counts="encounterCounts"
+            :champion-name-of="championNameOf"
+          />
         </section>
       </section>
       <footer class="matches-pagination"><span>第 {{ page + 1 }} 页 · {{ rows.length }} 场</span><div><NButton size="small" secondary :disabled="page === 0" @click="goPage(page - 1)">上一页</NButton><NButton size="small" secondary :disabled="!hasNextPage" @click="goPage(page + 1)">下一页</NButton></div></footer>
@@ -361,7 +426,10 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
 .matches-workspace { display: grid; grid-template-columns: minmax(184px, .16fr) minmax(0, 1fr); gap: 8px; min-width: 0; align-items: stretch; }.matches-index, .matches-detail-panel { min-width: 0; border: 1px solid var(--line); background: var(--surface); }.matches-index { display: flex; flex-direction: column; overflow: hidden; }.matches-index__header { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; padding: 11px 12px 9px; border-bottom: 1px solid var(--line); }.matches-index__header h2 { margin: 3px 0 0; font-size: 14px; }.matches-index__header > span { color: var(--text-secondary); font-size: 8px; font-variant-numeric: tabular-nums; }.matches-index__list { display: grid; align-content: start; flex: 1; gap: 4px; padding: 5px; overflow: auto; }
 .history-index-row { display: grid; gap: 7px; width: 100%; padding: 9px 10px 8px; border: 1px solid var(--line); border-left: 3px solid var(--line-strong); color: var(--text-primary); background: var(--surface-raised); cursor: pointer; text-align: left; transition: border-color 150ms ease, background 150ms ease, transform 150ms ease; }.history-index-row:hover { border-color: var(--accent); transform: translateX(2px); }.history-index-row.active { border-color: var(--accent); border-left-color: var(--accent); background: color-mix(in srgb, var(--accent-soft) 55%, var(--surface-raised)); }.history-index-row--win { border-left-color: var(--green); }.history-index-row--loss { border-left-color: var(--red); }.history-index-row--unfinished { border-left-color: var(--amber); }.history-index-row__top, .history-index-row__foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }.history-index-row__top span, .history-index-row__foot span { color: var(--text-muted); font-size: 9px; }.history-index-row__top strong { color: var(--green); font-size: 10px; }.history-index-row--loss .history-index-row__top strong { color: var(--red); }.history-index-row--unfinished .history-index-row__top strong { color: var(--amber); }.history-index-row__main { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto 14px; align-items: center; gap: 8px; min-width: 0; }.history-index-row__main > span { min-width: 0; }.history-index-row__main b, .history-index-row__main small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.history-index-row__main b { font-size: 11px; }.history-index-row__main small { margin-top: 3px; color: var(--text-secondary); font-size: 9px; }.history-index-row__main em { color: var(--text-primary); font-size: 10px; font-style: normal; font-variant-numeric: tabular-nums; white-space: nowrap; }.history-index-row__main svg { color: var(--text-muted); }.history-index-row__foot { padding-top: 6px; border-top: 1px solid var(--line); }.history-index-row__mvp { display: inline-flex; align-items: center; gap: 3px; color: var(--accent) !important; font-weight: 800; }.history-index-row__mvp svg { color: currentColor; }.history-index-row__mvp[data-mvp="SVP"] { color: var(--blue) !important; }
 .history-index-row__main :deep(.asset-icon__fallback) { font-size: 0; }
-.matches-detail-panel { min-height: 590px; overflow: hidden; }.matches-detail-empty { display: grid; place-items: center; align-content: center; min-height: 590px; padding: 30px; color: var(--text-secondary); text-align: center; }.matches-detail-empty h2 { margin: 10px 0 0; color: var(--text-primary); font-size: 17px; }.matches-detail-empty p { max-width: 290px; margin: 7px auto 0; font-size: 10px; line-height: 1.5; }.history-detail-enter-active, .history-detail-leave-active { transition: opacity 180ms ease, transform 220ms cubic-bezier(.23, 1, .32, 1); }.history-detail-enter-from { opacity: 0; transform: translateX(24px); }.history-detail-leave-to { opacity: 0; transform: translateX(-12px); }
+.matches-detail-panel { min-height: 590px; overflow: hidden; }
+/* 深详情跟在右侧详情卡下面：自己带内边距和一道分隔线，免得直接贴在面板边框上；
+   展开区（`.match-row__detail`）里的那一份则由卡片自己给内边距，不需要这个类。 */
+.matches-deep { padding: 12px; border-top: 1px solid var(--line); background: var(--surface); }.matches-detail-empty { display: grid; place-items: center; align-content: center; min-height: 590px; padding: 30px; color: var(--text-secondary); text-align: center; }.matches-detail-empty h2 { margin: 10px 0 0; color: var(--text-primary); font-size: 17px; }.matches-detail-empty p { max-width: 290px; margin: 7px auto 0; font-size: 10px; line-height: 1.5; }.history-detail-enter-active, .history-detail-leave-active { transition: opacity 180ms ease, transform 220ms cubic-bezier(.23, 1, .32, 1); }.history-detail-enter-from { opacity: 0; transform: translateX(24px); }.history-detail-leave-to { opacity: 0; transform: translateX(-12px); }
 .matches-pagination { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; padding: 10px 14px; border: 1px solid var(--line); color: var(--text-secondary); background: var(--surface); font-size: 10px; }.matches-pagination > div { display: flex; gap: 6px; }
 @media (max-width: 980px) { .matches-workspace { grid-template-columns: minmax(205px, .3fr) minmax(0, 1fr); }.matches-filter-row { grid-template-columns: auto minmax(150px, 1fr) 108px 132px auto; }.matches-index__list { max-height: none; } }
 @media (max-width: 760px) { .matches-query-form { grid-template-columns: 1fr; }.matches-query-submit { justify-self: start; }.matches-account-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }.matches-account-strip__who { grid-column: 1 / -1; }.matches-filter-row { grid-template-columns: 1fr 1fr; }.matches-filter-title { grid-column: 1 / -1; }.matches-filter-count { justify-self: start; }.matches-workspace { grid-template-columns: 1fr; }.matches-detail-panel { min-height: 0; }.matches-detail-empty { min-height: 240px; }.matches-index__list { max-height: 420px; }.matches-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }.matches-summary__result { grid-column: 1 / -1; } }
