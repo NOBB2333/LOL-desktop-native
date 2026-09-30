@@ -12,6 +12,7 @@
 import { isNative } from "./native";
 import {
   createFixtureChampionAbilities,
+  createFixtureChampionAbilityValues,
   createFixtureGameRecording,
   createFixtureJunglePath,
   createFixtureLobby,
@@ -40,6 +41,7 @@ import type {
   AppBootstrap,
   AppConfig,
   ChampionAbilities,
+  ChampionAbilityValues,
   ChampionOverview,
   ClaimItem,
   ClaimOutcome,
@@ -361,6 +363,10 @@ export const browserBackend = {
   /** 技能详情：真机一次只拉一个英雄，预览里照做（不去拉远程图，走静态兜底）。 */
   championAbilities(championId: number): ChampionAbilities {
     return createFixtureChampionAbilities(championId);
+  },
+  /** 逐级数值：真机走公网，预览里直接给一份「能连上」的表。 */
+  championAbilityValues(championId: number, alias: string): ChampionAbilityValues {
+    return createFixtureChampionAbilityValues(alias || createFixtureChampionAbilities(championId).alias);
   },
   playerStats(puuids: string[]): PlayerStatSummary[] {
     return createFixturePlayerStats(puuids);

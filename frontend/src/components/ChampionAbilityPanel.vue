@@ -3,6 +3,7 @@ import { computed, ref, watch } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 import { backend } from "../services/backend";
 import type { ChampionAbility } from "../types/domain";
+import { remainingPlaceholders, renderAbilityText, flattenAbilityValues, formatLevelValues } from "../utils/abilityText";
 import LcuAssetImage from "./LcuAssetImage.vue";
 
 /**
@@ -19,10 +20,24 @@ import LcuAssetImage from "./LcuAssetImage.vue";
  * 来自**本机 LCU** 的 `/lol-game-data/assets/v1/champions/{id}.json`，所以技能名和描述
  * 是**你客户端当前语言**的（国服就是中文），不需要我们维护翻译表。
  *
- * ⚠️ **这里没有每级伤害数字**，而且这是有意的：LCU 那份里真实系数（AD/AP 加成）
- * 全是 0，只有 CommunityDragon 的公式数据里才有。所以面板只展示**冷却 / 耗蓝 / 射程**
- * 这些 LCU 确实给了的数，以及 `dynamicDescription` 里带 `@TotalDamage@` 占位符的模板。
- * 宁可少给，也不能自己算一个数出来——那会让人以为是官方数据。
+ * 但是那份描述**不是纯文本**——它带一整套标记：
+ *
+ * ```
+ * 获得<speed>@MinimumMoveSpeed@移动速度</speed>，并在@RollDuration@秒里…
+ * ```
+ *
+ * 所以不能直接插值（会把 `<speed>` 印出来），也不能直接 `v-html`（第三方字符串当 HTML）。
+ * 统一走 `utils/abilityText.ts` 的白名单渲染：认识的标签变样式，其余当文本转义。
+ *
+ * ⚠️ **`@RollDuration@` 这类占位符的数值来自 CommunityDragon**，不在 LCU 那份里
+ * （LCU 的真实系数全是 0）。`values` 里给到的就替换成真实数字，给不到的原样保留并标出来——
+ * 宁可让人看到「这里有个官方变量」，也不能自己算一个数出来冒充实测值。
+ *
+ * # 数值那一层是**可选增强**
+ *
+ * 逐级数值要过公网（CommunityDragon），断网 / 被代理挡了就整体拿不到。那种情况下
+ * **只有变量保留原文**，技能名、描述、冷却、耗蓝、射程全部照常显示——所以这里
+ * 不用 `isError` 去盖掉主面板，只在文案下面提一句。
  */
 const props = defineProps<{ championId: number; championName: string }>();
 
@@ -33,6 +48,19 @@ const abilities = useQuery({
   // 技能资料只随补丁变，不必频繁回源。
   staleTime: 30 * 60_000,
   // **不重试**：失败基本就是「客户端没开」，重试只会让错误提示晚几秒才出现。
+  retry: false,
+});
+
+/**
+ * 逐级数值。必须等 `abilities` 先回来——CommunityDragon 的目录用**英文别名**
+ * （`Rammus`），光有数字 id 拼不出路径。
+ */
+const values = useQuery({
+  queryKey: computed(() => ["champion-ability-values", props.championId]),
+  queryFn: () => backend.championAbilityValues(props.championId, abilities.data.value?.alias ?? ""),
+  enabled: computed(() => props.championId > 0 && !!abilities.data.value?.alias),
+  // 随补丁变，同样是长缓存。
+  staleTime: 30 * 60_000,
   retry: false,
 });
 
@@ -87,8 +115,57 @@ const rangeText = computed(() => {
   return values.every((value) => value === first) ? formatNumber(first) : levelsOf(values);
 });
 
-/** 描述里的 `@TotalDamage@` 这类占位符是**官方模板的原文**。 */
-const hasPlaceholders = computed(() => /@[A-Za-z0-9_]+@/.test(selected.value?.dynamicDescription ?? ""));
+/**
+ * 当前槽位能用的取值表。
+ *
+ * 槽位键：被动在 CommunityDragon 那边是 `p`，主动是 `q`/`w`/`e`/`r`——和 LCU 的
+ * `spellKey` 同一套，所以直接用 `tab` 配。
+ *
+ * 带系数的那种（`+1.0 法强`）**不拼进同一格**：系数是另一个变量，拼一起会让人
+ * 以为「40/80/120 +1.0 法强」是一个整体。加成单独在下面列一行。
+ */
+const slotValues = computed(() => {
+  const slot = tab.value;
+  const sets = values.data.value?.spells ?? [];
+  const match = sets.find((item) => item.slot.toLowerCase() === slot);
+  return match?.values ?? {};
+});
+
+const valuesFor = (): Record<string, string> => flattenAbilityValues(slotValues.value);
+
+/** 带系数的取值项——单独列出来给读者看「另外还加多少」。 */
+const scaledEntries = computed(() =>
+  Object.entries(slotValues.value)
+    .filter(([, entry]) => entry.ratio !== undefined && entry.ratio !== 0)
+    .map(([name, entry]) => ({
+      name,
+      text: `${formatLevelValues(entry.values)}${entry.ratioStat ? ` + ${entry.ratio} ${entry.ratioStat}` : ""}`,
+      stat: entry.ratioStat ?? "",
+    }))
+    .filter((entry) => entry.text.length > 0),
+);
+
+/** 逐级数值整体拿不到（断网 / 被代理挡）时提一句——不是错误，只是这一层没有。 */
+const valuesUnavailable = computed(() => props.championId > 0 && !!abilities.data.value && values.isError.value);
+
+/** 被动描述也可能带标签与占位符，同样走白名单渲染。 */
+const passiveHtml = computed(() => renderAbilityText(abilities.data.value?.passive?.description ?? "", { values: valuesFor() }));
+
+/** 简版描述（一句话概括）——也可能带 `@…@`，一起渲染。 */
+const shortHtml = computed(() => renderAbilityText(selected.value?.description ?? "", { values: valuesFor() }));
+
+/** 完整描述，带官方占位符的那段。这是主文案。 */
+const dynamicHtml = computed(() => renderAbilityText(selected.value?.dynamicDescription ?? "", { values: valuesFor() }));
+
+/** 还剩哪些占位符没取到值——决定要不要显示那句说明。 */
+const leftover = computed(() =>
+  remainingPlaceholders(selected.value?.dynamicDescription ?? "", valuesFor()),
+);
+
+/** `@SpellModifierDescriptionAppend@` 不是数值，是客户端拼装备/符文加成的**位置**。 */
+const leftoverIsOnlyAppend = computed(
+  () => leftover.value.length > 0 && leftover.value.every((name) => name.includes("SpellModifierDescriptionAppend")),
+);
 </script>
 
 <template>
@@ -123,7 +200,7 @@ const hasPlaceholders = computed(() => /@[A-Za-z0-9_]+@/.test(selected.value?.dy
           <LcuAssetImage :path="passive.iconPath" :alt="passive.name" size="lg"><b>P</b></LcuAssetImage>
           <div><strong>{{ passive.name }}</strong><small>被动</small></div>
         </header>
-        <p class="abilities__text" v-html="passive.description" />
+        <p v-if="passiveHtml" class="abilities__text" v-html="passiveHtml" />
       </article>
 
       <article v-else-if="selected" class="abilities__body">
@@ -136,13 +213,29 @@ const hasPlaceholders = computed(() => /@[A-Za-z0-9_]+@/.test(selected.value?.dy
           <div><dt>耗蓝</dt><dd>{{ levelsOf(selected.cost) }}</dd></div>
           <div><dt>射程</dt><dd>{{ rangeText }}</dd></div>
         </dl>
-        <!-- 三段文案全列出来：`description` 是简版，`dynamicDescription` 带官方占位符。
-             只给一段会让「有占位符」看起来像我们没渲染好。 -->
-        <p v-if="selected.description" class="abilities__text">{{ selected.description }}</p>
-        <p v-if="selected.dynamicDescription" class="abilities__text abilities__text--muted">{{ selected.dynamicDescription }}</p>
-        <p v-if="hasPlaceholders" class="abilities__note">
-          上面 <code>@…@</code> 是**官方文案里的占位符**（如 `@TotalDamage@` 指这一项的伤害值）。
-          真实数值要按英雄等级/装备才算得出来，LCU 本地资料里没有这份系数，所以这里原样展示，不替它填数字。
+        <!-- 两段文案：`description` 是一句话概括，`dynamicDescription` 是带官方变量的完整版。
+             都走白名单渲染（标签变样式、变量标出来），不做纯文本插值。 -->
+        <p v-if="shortHtml" class="abilities__text abilities__text--short" v-html="shortHtml" />
+        <p v-if="dynamicHtml" class="abilities__text" v-html="dynamicHtml" />
+        <!-- 带加成系数的项单独列：拼进正文格子会让人把「基础值」和「系数」读成一个数。 -->
+        <dl v-if="scaledEntries.length" class="abilities__scaling">
+          <div v-for="entry in scaledEntries" :key="entry.name">
+            <dt>{{ entry.name }}</dt>
+            <dd>{{ entry.text }}</dd>
+          </div>
+        </dl>
+        <p v-if="leftover.length" class="abilities__note">
+          <template v-if="leftoverIsOnlyAppend">
+            末尾没有显示内容的那一处，是客户端用来<strong>拼接装备与符文加成</strong>的位置；你没带这些加成时它本来就是空的，不是漏了。
+          </template>
+          <template v-else>
+            上面标出的 <span class="abilities__note-mark">@…@</span> 是官方文案里的<strong>变量</strong>，取值要按英雄等级与
+            实时属性（移速 / 护甲 / 魔抗等）才算得出来。这类数值本地资料里没有现成的，所以原样保留，不替它填数字。
+          </template>
+        </p>
+        <p v-if="valuesUnavailable" class="abilities__note abilities__note--muted">
+          本次<strong>没能取到逐级数值</strong>（那一步要联网），所以上面带 <span class="abilities__note-mark">@…@</span> 的地方保留了原文。
+          技能名、描述、冷却、耗蓝、射程都不受影响。
         </p>
       </article>
       <p v-else class="abilities__state">这个英雄没有可展示的技能条目。</p>
@@ -170,7 +263,36 @@ const hasPlaceholders = computed(() => /@[A-Za-z0-9_]+@/.test(selected.value?.dy
 .abilities__stats dt { color: var(--text-muted); font-size: 9px; }
 .abilities__stats dd { margin: 3px 0 0; color: var(--text-primary); font-size: 11px; font-variant-numeric: tabular-nums; }
 .abilities__text { margin: 0; color: var(--text-secondary); font-size: 11px; line-height: 1.7; }
-.abilities__text--muted { color: var(--text-muted); }
+.abilities__text--short { color: var(--text-muted); }
 .abilities__note { margin: 0; padding: 7px 9px; border-left: 2px solid var(--amber); color: var(--text-secondary); background: var(--surface-raised); font-size: 10px; line-height: 1.6; }
+.abilities__note--muted { border-left-color: var(--line); color: var(--text-muted); }
 .abilities__note code { color: var(--amber); font-size: 10px; }
+.abilities__note-mark { color: var(--amber); font-family: var(--font-mono, monospace); font-size: 10px; }
+/* 带加成系数的项：和正文分开，避免把「基础值」与「系数」读成一个数。 */
+.abilities__scaling { display: grid; gap: 4px; margin: 0; padding: 7px 9px; border: 1px solid var(--line); background: var(--surface-raised); }
+.abilities__scaling div { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.abilities__scaling dt { color: var(--text-muted); font-size: 9px; }
+.abilities__scaling dd { margin: 0; color: var(--text-secondary); font-size: 10px; font-variant-numeric: tabular-nums; }
+
+/* 官方文案里的样式标签（<speed> <magicDamage> …）映射到这里。
+   配色跟游戏内保持一致：魔法伤害紫、物理伤害橙、真伤白、治疗绿、护盾灰蓝。 */
+.abilities__text :deep(.ab-magic) { color: var(--purple, #a08bd8); }
+.abilities__text :deep(.ab-physical) { color: var(--amber, #d8903c); }
+.abilities__text :deep(.ab-true) { color: var(--text-primary); font-weight: 500; }
+.abilities__text :deep(.ab-healing) { color: var(--green, #5fae6a); }
+.abilities__text :deep(.ab-shield) { color: var(--text-secondary); }
+.abilities__text :deep(.ab-speed) { color: var(--text-secondary); }
+.abilities__text :deep(.ab-status) { color: var(--amber, #d8903c); }
+.abilities__text :deep(.ab-attention) { color: var(--text-primary); font-weight: 500; }
+.abilities__text :deep(.ab-scale) { color: var(--text-secondary); }
+.abilities__text :deep(.ab-recast) { color: var(--accent); font-weight: 500; }
+.abilities__text :deep(.ab-spell) { color: var(--accent); }
+.abilities__text :deep(.ab-strong) { color: var(--text-primary); font-weight: 500; }
+.abilities__text :deep(.ab-italic) { font-style: italic; }
+.abilities__text :deep(.ab-flavor) { color: var(--text-muted); font-style: italic; }
+.abilities__text :deep(.ab-block) { display: block; }
+/* 取到值的变量 */
+.abilities__text :deep(.ab-value) { color: var(--text-primary); font-weight: 500; font-variant-numeric: tabular-nums; }
+/* 没取到值的变量：标出来，别让人以为是渲染坏了 */
+.abilities__text :deep(.ab-placeholder) { color: var(--amber); font-family: var(--font-mono, monospace); font-size: 10px; }
 </style>

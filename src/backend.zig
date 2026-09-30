@@ -1,7 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const native_sdk = @import("native_sdk");
-const lcu = @import("lcu");
+// `pub` 是给 `backend/` 下的子模块用的：它们不能直接 `@import("../lcu.zig")`
+// （会撞上「同一文件属于两个 module」），只能从这里的再导出拿 `Client`。
+pub const lcu = @import("lcu");
 const storage = @import("storage");
 const build_options = @import("build_options");
 const automation_service = @import("backend/automation.zig");
@@ -23,6 +25,7 @@ const player_stats = @import("backend/player_stats.zig");
 const launcher_ipc = @import("backend/launcher_ipc.zig");
 const assets_ipc = @import("backend/assets_ipc.zig");
 const champion_abilities = @import("backend/champion_abilities.zig");
+const champion_ability_values = @import("backend/champion_ability_values.zig");
 const claim_ipc = @import("backend/claim_ipc.zig");
 const gameflow_ipc = @import("backend/gameflow_ipc.zig");
 const game_recording = @import("backend/game_recording.zig");
@@ -36,6 +39,8 @@ test {
     // 技能详情模块的 pub fn 只被下面那张 handler 表引用，而 Zig 是**惰性分析**：
     // 不显式拉一次，模块里的用例可能连语义检查都不做（测试全绿但 exe 编译挂）。
     std.testing.refAllDecls(champion_abilities);
+    // 同理：CommunityDragon 取值模块也只被 handler 表引用。
+    std.testing.refAllDecls(champion_ability_values);
 }
 
 test "慢查询期间状态可读取且切换模式后旧结果被拒绝" {
@@ -286,6 +291,9 @@ pub const command_table = [_]CommandSpec{
     .{ .name = "lol.get_champions", .lane = .query },
     // 单英雄技能详情：一个英雄一条 LCU 请求（~30-70KB 原始 JSON），所以按需拉、不塞进列表。
     .{ .name = "lol.get_champion_abilities", .lane = .query },
+    // 技能文案里 `@变量@` 的逐级真实数值：只有 CommunityDragon 有（LCU 那份系数全是 0），
+    // 所以走公网。上层按需拉、落盘缓存，见 backend/champion_ability_values.zig。
+    .{ .name = "lol.get_champion_ability_values", .lane = .query },
     .{ .name = "lol.get_asset", .lane = .query },
     .{ .name = "lol.get_encounters", .lane = .query },
     // 每人两次 LCU 往返，走 query 通道按需触发；上限见 backend/player_stats.zig。
@@ -699,6 +707,7 @@ pub const Runtime = struct {
             .{ .name = "lol.search_summoner", .context = self, .invoke_fn = searchSummoner },
             .{ .name = "lol.get_champions", .context = self, .invoke_fn = assets_ipc.getChampions },
             .{ .name = "lol.get_champion_abilities", .context = self, .invoke_fn = champion_abilities.getChampionAbilities },
+            .{ .name = "lol.get_champion_ability_values", .context = self, .invoke_fn = champion_ability_values.getChampionAbilityValues },
             .{ .name = "lol.get_asset", .context = self, .invoke_fn = assets_ipc.getAsset },
             .{ .name = "lol.get_encounters", .context = self, .invoke_fn = getEncounters },
             .{ .name = "lol.get_player_stats", .context = self, .invoke_fn = player_stats.getPlayerStats },
@@ -1016,7 +1025,7 @@ pub fn runtimeConnectionIsSsh(self: *const Runtime) bool {
     return std.ascii.eqlIgnoreCase(jsonField(connection, "kind"), "ssh");
 }
 
-fn runtimeRequestTimeoutMs(self: *const Runtime) u32 {
+pub fn runtimeRequestTimeoutMs(self: *const Runtime) u32 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const config = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.config[0..self.config_len], .{}) catch

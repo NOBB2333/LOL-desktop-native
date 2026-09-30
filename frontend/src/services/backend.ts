@@ -12,6 +12,7 @@ import type {
   AppConfig,
   AssetPayload,
   ChampionAbilities,
+  ChampionAbilityValues,
   ChampionOverview,
   ClaimOutcome,
   ClaimSnapshot,
@@ -245,6 +246,22 @@ export const backend = {
     if (!Number.isFinite(championId) || championId <= 0) throw new Error("无效的英雄 id");
     if (usesFixtureData()) return browserBackend.championAbilities(championId);
     return command<ChampionAbilities>("get_champion_abilities", { championId });
+  },
+  /**
+   * 技能文案里 `@变量@` 的逐级真实数值。
+   *
+   * **必须传 `alias`**：CommunityDragon 的目录用英文别名（`Rammus`），
+   * 光有数字 id 拼不出那个路径。别名从 `championAbilities()` 的返回值里拿。
+   *
+   * 这一步走公网（LCU 那份里系数全是 0），所以**可能整体失败**——断网、代理挡了
+   * 都算。调用方要把它当**可选增强**：失败就退回「占位符原样保留」，不要因此
+   * 把整个技能面板判成错误。缺的变量是正常现象，见 `ChampionAbilityValues` 的注释。
+   */
+  async championAbilityValues(championId: number, alias: string): Promise<ChampionAbilityValues> {
+    const target = alias?.trim() ?? "";
+    if (!Number.isFinite(championId) || championId <= 0 || !target) throw new Error("无效的英雄标识");
+    if (usesFixtureData()) return browserBackend.championAbilityValues(championId, target);
+    return command<ChampionAbilityValues>("get_champion_ability_values", { championId, alias: target });
   },
   /**
    * 按 LCU 资源路径取图标。

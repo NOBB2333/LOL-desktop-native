@@ -3,6 +3,7 @@ import type {
   AppConfig,
   BanSummary,
   ChampionAbilities,
+  ChampionAbilityValues,
   ChampionOverview,
   ClaimSnapshot,
   ClientInstallations,
@@ -516,6 +517,17 @@ export function createFixtureChampionAbilities(championId: number): ChampionAbil
   const row = champions.find(([id]) => id === championId) ?? champions[0];
   const [id, name, alias] = row;
   const slotNames: Record<string, string> = { q: "一技能", w: "二技能", e: "三技能", r: "终极技" };
+  /**
+   * 描述必须**照真机的形状**写：带官方标记（`<speed>` / `<magicDamage>` …）和
+   * `@Name@` 变量。写成纯文本的话，预览就测不出渲染层到底有没有正确处理——
+   * 而这一层正是最容易出错的地方（2026-09-30 就是标签被原样印出来了）。
+   */
+  const descriptions: Record<string, string> = {
+    q: "获得<speed>@MinimumMoveSpeed@移动速度</speed>，并在@RollDuration@秒里持续加速至<speed>@MaximumMoveSpeed@移动速度</speed>。碰撞后造成<magicDamage>@PowerBallDamage@魔法伤害</magicDamage>与<status>击退</status>。<br><br><recast>再次施放</recast>：提前结束这个技能。@SpellModifierDescriptionAppend@",
+    w: "进入持续@BuffDuration@秒的防御姿态，获得<scaleArmor>@BonusArmorTooltip@护甲</scaleArmor>和<scaleMR>@BonusMRTooltip@魔法抗性</scaleMR>。",
+    e: "<status>嘲讽</status>一个敌方英雄，强制目标攻击自己@Duration@秒。",
+    r: "造成<magicDamage>@InitialDamage@魔法伤害</magicDamage>和持续@SlowDuration@秒的@SlowPercent@%<status>减速</status>。",
+  };
   return {
     championId: id,
     alias,
@@ -523,7 +535,7 @@ export function createFixtureChampionAbilities(championId: number): ChampionAbil
     title: name,
     passive: {
       name: "被动技能",
-      description: `${name} 的被动效果（fixture 文案）`,
+      description: `${name} 的被动效果：普攻附带<b>额外伤害</b>（fixture 文案）。`,
       iconPath: `/lol-game-data/assets/ASSETS/Characters/${alias}/HUD/Icons2D/${alias}_Passive.png`,
       videoPath: `champion-abilities/${id}/ability_${id}_P1.webm`,
       videoImagePath: `champion-abilities/${id}/ability_${id}_P1.jpg`,
@@ -532,7 +544,7 @@ export function createFixtureChampionAbilities(championId: number): ChampionAbil
       slot,
       name: slotNames[slot],
       description: `${name} 的${slotNames[slot]}（fixture 文案）`,
-      dynamicDescription: `造成 <magicDamage>@TotalDamage@ 魔法伤害</magicDamage>`,
+      dynamicDescription: descriptions[slot],
       // 真机的长度是 5 或 6（技能最多点 5 级，有的技能多一格）。这里用 5。
       cooldown: Array.from({ length: 5 }, () => 6 + index * 2),
       cost: Array.from({ length: 5 }, () => 40 + index * 10),
@@ -541,6 +553,52 @@ export function createFixtureChampionAbilities(championId: number): ChampionAbil
       videoPath: `champion-abilities/${id}/ability_${id}_${slot.toUpperCase()}1.webm`,
       videoImagePath: `champion-abilities/${id}/ability_${id}_${slot.toUpperCase()}1.jpg`,
     })),
+  };
+}
+
+/**
+ * fixture 的技能变量取值：**必须和上面的描述对得上**。
+ *
+ * 覆盖三种情形，缺一就测不出渲染层的行为：
+ *  - 能取到值的（`@PowerBallDamage@` → 逐级数组 + AP 系数）；
+ *  - **取不到**值的（`@MinimumMoveSpeed@` 随英雄等级插值、`@BonusArmorTooltip@` 要实时护甲）
+ *    ——这两类故意不进表，用来验证「填不上时保留原文并说明原因」；
+ *  - 没有数值的纯位置标记（`@SpellModifierDescriptionAppend@`）。
+ *
+ * ⚠️ 真实取值来自 CommunityDragon，而**预览是离线**的：真机上这一步会走公网，
+ * 连不上时整条命令报错、前端退回「全部占位符原样保留」。fixture 给的是
+ * 「公网能连上」的分支，别把这里当成「这一项一定拿得到」。
+ */
+export function createFixtureChampionAbilityValues(alias: string): ChampionAbilityValues {
+  return {
+    alias,
+    spells: [
+      { slot: "p", values: { PBonusDamage: { values: [10, 20, 30, 40, 50] } } },
+      {
+        slot: "q",
+        values: {
+          PowerBallDamage: { values: [40, 80, 120, 160, 200, 240, 280], ratio: 1, ratioStat: "AP" },
+          RollDuration: { values: [6, 6, 6, 6, 6, 6, 6] },
+          SlowPercent: { values: [30, 40, 50, 60, 70, 80, 90] },
+        },
+      },
+      {
+        slot: "w",
+        values: {
+          BuffDuration: { values: [6, 6, 6, 6, 6] },
+          // 加成抗性随装备/符文变，真实数据里**就是没有**基础值——这里也不给。
+        },
+      },
+      { slot: "e", values: { Duration: { values: [1.25, 1.5, 1.75, 2, 2.25] } } },
+      {
+        slot: "r",
+        values: {
+          InitialDamage: { values: [100, 175, 250], ratio: 0.6, ratioStat: "AP" },
+          SlowDuration: { values: [3, 3, 3] },
+          SlowPercent: { values: [40, 50, 60] },
+        },
+      },
+    ],
   };
 }
 

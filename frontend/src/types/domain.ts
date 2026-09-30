@@ -643,6 +643,44 @@ export interface ChampionAbilities {
   spells: ChampionAbility[];
 }
 
+/**
+ * 技能文案里 `@变量@` 的**逐级真实数值**（一项）。
+ *
+ * `values` 是各级取值：技能等级 1..5（部分技能 6 级）。空数组表示 CDragon 那边
+ * 这一项没有逐级数组（例如纯系数），**不要**当成 0 显示。
+ */
+export interface ChampionAbilityValueEntry {
+  /** 逐级数值。 */
+  values: number[];
+  /** 若这一项带加成系数（`+1.0 法强`）。 */
+  ratio?: number;
+  /** 系数乘的属性：`AP` / `AD` / `Armor` / `MR` / `Health`。 */
+  ratioStat?: string;
+}
+
+/** 一个槽位的取值表：变量名 → 数值。名字和 LCU 文案里的 `@名字@` 严格一致。 */
+export interface ChampionAbilityValueSet {
+  /** `p`（被动）/ `q` / `w` / `e` / `r`。 */
+  slot: string;
+  values: Record<string, ChampionAbilityValueEntry>;
+}
+
+/**
+ * 单个英雄所有技能的变量取值。
+ *
+ * 来源是 CommunityDragon 的角色文件（公网），**不是** LCU——LCU 那份里
+ * `coefficients` 全是 0、`effectAmounts` 是占位。`mSpellCalculations` 的键名恰好
+ * 和 LCU 文案里的 `@名字@` 同一套，所以不需要映射表。
+ *
+ * 填不满是正常的：随**英雄等级**插值的（`@MinimumMoveSpeed@`）、依赖实时属性的
+ * （护甲/魔抗）、以及 `@SpellModifierDescriptionAppend@`（它不是数值，是客户端
+ * 拼接装备加成的位置）这三类**故意不出现**，前端保留原文并说明原因。
+ */
+export interface ChampionAbilityValues {
+  alias: string;
+  spells: ChampionAbilityValueSet[];
+}
+
 
 export interface EncounterRecord {
   gameId: number;

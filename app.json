@@ -152,6 +152,13 @@
         ]
       },
       {
+        "name": "lol.get_champion_ability_values",
+        "origins": [
+          "zero://app",
+          "http://127.0.0.1:49173"
+        ]
+      },
+      {
         "name": "lol.get_asset",
         "origins": [
           "zero://app",

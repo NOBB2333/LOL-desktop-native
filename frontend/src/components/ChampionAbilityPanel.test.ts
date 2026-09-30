@@ -1,7 +1,7 @@
 import { QueryClient, VueQueryPlugin } from "@tanstack/vue-query";
 import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it } from "vitest";
-import type { ChampionAbilities } from "../types/domain";
+import type { ChampionAbilities, ChampionAbilityValues } from "../types/domain";
 import ChampionAbilityPanel from "./ChampionAbilityPanel.vue";
 
 /**
@@ -15,8 +15,9 @@ import ChampionAbilityPanel from "./ChampionAbilityPanel.vue";
  *    0.5 这种小数不能被取整成 0（亚索 E）。
  */
 
-const { abilitiesState } = vi.hoisted(() => ({
+const { abilitiesState, valuesState } = vi.hoisted(() => ({
   abilitiesState: { data: null as ChampionAbilities | null, error: null as Error | null, calls: 0 },
+  valuesState: { data: null as ChampionAbilityValues | null, error: null as Error | null, calls: 0, lastAlias: "" },
 }));
 
 vi.mock("../services/backend", () => ({
@@ -26,6 +27,12 @@ vi.mock("../services/backend", () => ({
       abilitiesState.calls += 1;
       if (abilitiesState.error) throw abilitiesState.error;
       return abilitiesState.data as never;
+    },
+    championAbilityValues: async (_championId: number, alias: string) => {
+      valuesState.calls += 1;
+      valuesState.lastAlias = alias;
+      if (valuesState.error) throw valuesState.error;
+      return valuesState.data as never;
     },
   },
 }));
@@ -81,6 +88,10 @@ beforeEach(() => {
   abilitiesState.data = null;
   abilitiesState.error = null;
   abilitiesState.calls = 0;
+  valuesState.data = null;
+  valuesState.error = null;
+  valuesState.calls = 0;
+  valuesState.lastAlias = "";
 });
 
 describe("技能面板：数据形状与口径", () => {
@@ -155,14 +166,60 @@ describe("技能面板：数据形状与口径", () => {
     wrapper.unmount();
   });
 
-  it("带 @占位符@ 的官方模板照原样展示，并说明为什么没有数字", async () => {
+  it("官方标记被消费掉：标签变样式、没取到值的变量标出来并说明为什么没数字", async () => {
     abilitiesState.data = abilitiesFixture();
     const wrapper = mountPanel();
     await flushPromises();
-    expect(wrapper.get(".abilities__text--muted").text()).toContain("@TotalDamage@");
+    // 标签不能原样印出来（这是用户 2026-09-30 报的那个渲染问题）。
+    const body = wrapper.get(".abilities__body");
+    expect(body.text()).not.toContain("<magicDamage>");
+    expect(body.html()).toContain('class="ab-magic"');
+    // 没取到值的占位符要标出来，不能悄悄消失。
+    expect(body.html()).toContain("ab-placeholder");
+    expect(body.text()).toContain("@TotalDamage@");
     // 口径说明必须在：不说清，用户会以为是我们没渲染出来。
-    expect(wrapper.get(".abilities__note").text()).toContain("占位符");
+    expect(wrapper.get(".abilities__note").text()).toContain("变量");
     expect(wrapper.get(".abilities__note").text()).toContain("不替它填数字");
+    wrapper.unmount();
+  });
+
+  it("拉莫斯 Q 的真机原文：正文完整可读，没有一个裸标签", async () => {
+    // 用户 2026-09-30 贴的就是这段，原样搬进来当回归。
+    const rammusQ =
+      "拉莫斯蜷缩为球状，获得<speed>@MinimumMoveSpeed@移动速度</speed>，并在@RollDuration@秒里持续加速至" +
+      "<speed>@MaximumMoveSpeed@移动速度</speed>。拉莫斯会在与一名敌人碰撞后停下，对附近的敌人们造成" +
+      "<magicDamage>@PowerBallDamage@魔法伤害</magicDamage>、<status>击退</status>、和持续@SlowDuration@秒的" +
+      "@SlowPercent@%<status>减速</status>。<br><br><recast>再次施放</recast>：拉莫斯提前结束这个技能。" +
+      "@SpellModifierDescriptionAppend@";
+    const data = abilitiesFixture();
+    data.spells[0] = { ...data.spells[0], name: "动力冲刺", dynamicDescription: rammusQ };
+    abilitiesState.data = data;
+    const wrapper = mountPanel();
+    await flushPromises();
+
+    const html = wrapper.get(".abilities__body").html();
+    for (const tag of ["speed", "magicDamage", "status", "recast"]) {
+      expect(html).not.toContain(`<${tag}>`);
+    }
+    const text = wrapper.get(".abilities__body").text();
+    expect(text).toContain("拉莫斯蜷缩为球状");
+    expect(text).toContain("再次施放");
+    expect(text).toContain("击退");
+    // 换行真的渲染了，而不是挤成一行
+    expect(html).toContain("<br");
+    wrapper.unmount();
+  });
+
+  it("只有 @SpellModifierDescriptionAppend@ 时，说明文案不说成「缺数值」", async () => {
+    // 这是客户端拼装备/符文加成的位置，本来就应该空——说成「算不出来」会误导。
+    const data = abilitiesFixture();
+    data.spells[0] = { ...data.spells[0], dynamicDescription: "造成伤害。@SpellModifierDescriptionAppend@" };
+    abilitiesState.data = data;
+    const wrapper = mountPanel();
+    await flushPromises();
+    const note = wrapper.get(".abilities__note").text();
+    expect(note).toContain("装备与符文");
+    expect(note).not.toContain("实时属性");
     wrapper.unmount();
   });
 
@@ -202,6 +259,117 @@ describe("技能面板：数据形状与口径", () => {
     await wrapper.setProps({ championName: "换个显示名" });
     await flushPromises();
     expect(abilitiesState.calls).toBe(1);
+    wrapper.unmount();
+  });
+});
+
+/**
+ * 逐级数值那一层。
+ *
+ * 数据来自 CommunityDragon（**公网**），LCU 那份里系数全是 0。所以它天然是
+ * 「可选增强」：拿得到就替换占位符，拿不到就保留原文——绝不能因此把整块面板判成失败。
+ */
+describe("技能面板：逐级数值（CommunityDragon）", () => {
+  /** 拉莫斯 Q 的取值表：三个能取到、一个取不到（随英雄等级插值）。 */
+  function rammusValues(): ChampionAbilityValues {
+    return {
+      alias: "Rammus",
+      spells: [
+        {
+          slot: "q",
+          values: {
+            PowerBallDamage: { values: [40, 80, 120, 160, 200, 240, 280], ratio: 1, ratioStat: "AP" },
+            RollDuration: { values: [6, 6, 6, 6, 6, 6, 6] },
+            SlowDuration: { values: [1.5, 1.5, 1.5, 1.5, 1.5] },
+            SlowPercent: { values: [30, 40, 50, 60, 70, 80, 90] },
+          },
+        },
+      ],
+    };
+  }
+
+  const rammusQ =
+    "拉莫斯蜷缩为球状，获得<speed>@MinimumMoveSpeed@移动速度</speed>，并在@RollDuration@秒里持续加速至" +
+    "<speed>@MaximumMoveSpeed@移动速度</speed>。拉莫斯会在与一名敌人碰撞后停下，对附近的敌人们造成" +
+    "<magicDamage>@PowerBallDamage@魔法伤害</magicDamage>、和持续@SlowDuration@秒的@SlowPercent@%" +
+    "<status>减速</status>。<br><br><recast>再次施放</recast>：拉莫斯提前结束这个技能。" +
+    "@SpellModifierDescriptionAppend@";
+
+  function mountRammus() {
+    const data = abilitiesFixture({ championId: 33, alias: "Rammus", name: "披甲龙龟" });
+    data.spells[0] = { ...data.spells[0], name: "动力冲刺", dynamicDescription: rammusQ };
+    abilitiesState.data = data;
+    return mountPanel(33);
+  }
+
+  it("取到值的变量换成真实数字，取不到的原样保留", async () => {
+    valuesState.data = rammusValues();
+    const wrapper = mountRammus();
+    await flushPromises();
+    await flushPromises();
+
+    const body = wrapper.get(".abilities__body");
+    const text = body.text();
+    // 逐级数组按 " / " 拼出来，且第 6/7 格也在（技能能点 5 级但数组给到 7 格是官方的）。
+    expect(body.html()).toContain("ab-value");
+    expect(text).toContain("40 / 80 / 120 / 160 / 200 / 240 / 280");
+    expect(text).toContain("30 / 40 / 50 / 60 / 70 / 80 / 90");
+    // 取到的整块替换 → 正文里不该再有这几个占位符。
+    expect(text).not.toContain("@PowerBallDamage@");
+    expect(text).not.toContain("@SlowPercent@");
+    // 随**英雄等级**插值的那个取不到 → 必须原样留着，不许编。
+    expect(text).toContain("@MinimumMoveSpeed@");
+    expect(body.html()).toContain("ab-placeholder");
+    wrapper.unmount();
+  });
+
+  it("拿不到数值（断网）时退回原文，且不把主面板判成失败", async () => {
+    valuesState.error = new Error("AbilityValuesUnavailable");
+    const wrapper = mountRammus();
+    await flushPromises();
+    await flushPromises();
+
+    // 主面板照常：标签、正文、冷却都在。
+    expect(wrapper.find(".abilities__state--warn").exists()).toBe(false);
+    expect(wrapper.findAll(".abilities__tabs button").length).toBeGreaterThan(0);
+    const body = wrapper.get(".abilities__body");
+    expect(body.text()).toContain("拉莫斯蜷缩为球状");
+    expect(body.text()).toContain("@PowerBallDamage@");
+    // 但要明说「这次没取到数值」——否则看起来像我们没渲染。
+    expect(wrapper.get(".abilities__note--muted").text()).toContain("没能取到逐级数值");
+    wrapper.unmount();
+  });
+
+  it("拉数值时把 alias 传下去（CommunityDragon 的目录用英文别名）", async () => {
+    valuesState.data = rammusValues();
+    const wrapper = mountRammus();
+    await flushPromises();
+    await flushPromises();
+    expect(valuesState.calls).toBe(1);
+    expect(valuesState.lastAlias).toBe("Rammus");
+    wrapper.unmount();
+  });
+
+  it("技能资料没回来之前不去拉数值（那时还不知道 alias）", async () => {
+    valuesState.data = rammusValues();
+    abilitiesState.error = new Error("LcuNotRunning");
+    const wrapper = mountPanel(33);
+    await flushPromises();
+    await flushPromises();
+    expect(valuesState.calls).toBe(0);
+    wrapper.unmount();
+  });
+
+  it("带加成系数的项单独列一行，不拼进正文数字里", async () => {
+    valuesState.data = rammusValues();
+    const wrapper = mountRammus();
+    await flushPromises();
+    await flushPromises();
+    const scaling = wrapper.get(".abilities__scaling");
+    expect(scaling.text()).toContain("PowerBallDamage");
+    expect(scaling.text()).toContain("+ 1 AP");
+    // 正文里的那一格只放基础值，不带 "+ 1 AP"，否则会被读成一个数。
+    expect(wrapper.get(".abilities__text").text()).not.toContain("+ 1 AP");
     wrapper.unmount();
   });
 });
