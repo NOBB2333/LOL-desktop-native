@@ -1,7 +1,7 @@
 {
   "name": "lol-desktop-native",
   "private": true,
-  "version": "2.6.0",
+  "version": "3.0.0",
   "type": "module",
   "engines": {
     "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
