@@ -182,6 +182,17 @@ const Entry = struct {
     ratio: ?f64 = null,
     /// 系数乘的是哪个属性（`AP` / `AD` / 护甲…）。取不到就 null。
     ratio_stat: ?[]const u8 = null,
+    /// 这一项是**分数**（0.5 要显示成 `50%`）。
+    ///
+    /// 判据两条，任一成立即可：CDragon 自己标了 `mDisplayAsPercent`（`MinimumMoveSpeed`
+    /// 就是），或者全部取值都落在 `[0, 1]` 区间（`AOEModifier` = 0.5、`ArmorShredPercent` = 0.1）。
+    ///
+    /// ⚠️ 之所以不能只看 `mDisplayAsPercent`：实测它只在**少数**计算项上出现
+    /// （拉莫斯 1 个、龙王 2 个），而 `AOEModifier` / `SlowAmount` / `CloneDamageMod`
+    /// 这些纯 DataValue 一个都没标——但它们全都是分数，用 0.5 显示会让人读成「0.5 点伤害」。
+    /// 反过来 `TooltipTakedownCooldownMultiplier` = 90 这种「已经是百分数」的**不算**分数
+    /// （不在 [0,1] 内），照常显示 90。
+    is_percent: bool = false,
 };
 
 /// 从一个技能对象里收集 `名字 → 逐级数值`。
@@ -227,14 +238,25 @@ fn collectSpell(allocator: std.mem.Allocator, root: std.json.ObjectMap, spell_pa
                     .array => |a| a,
                     else => continue,
                 };
+                // 计算项自己标的「这是百分比」优先。
+                const declared_percent = switch (calc.object.get("mDisplayAsPercent") orelse .null) {
+                    .bool => |b| b,
+                    else => false,
+                };
                 if (resolveFormula(parts, data_values)) |entry| {
-                    out.append(allocator, .{ .name = name, .values = entry.values, .ratio = entry.ratio, .ratio_stat = entry.ratio_stat }) catch continue;
+                    out.append(allocator, .{
+                        .name = name,
+                        .values = entry.values,
+                        .ratio = entry.ratio,
+                        .ratio_stat = entry.ratio_stat,
+                        .is_percent = declared_percent or looksLikeFraction(entry.values),
+                    }) catch continue;
                 }
             }
         }
     }
 
-    // ② 名字直接就是 DataValues 的（`RollDuration` / `SlowPercent` / `SlowDuration`…）。
+    // ② 名字直接就是 DataValues 的（`RollDuration` / `SlowPercent` / `AOEModifier`…）。
     //    只在还没被 ① 覆盖时补。
     var dv_it = data_values.iterator();
     while (dv_it.next()) |pair| {
@@ -246,7 +268,11 @@ fn collectSpell(allocator: std.mem.Allocator, root: std.json.ObjectMap, spell_pa
             }
         }
         if (already) continue;
-        out.append(allocator, .{ .name = pair.key_ptr.*, .values = pair.value_ptr.* }) catch continue;
+        out.append(allocator, .{
+            .name = pair.key_ptr.*,
+            .values = pair.value_ptr.*,
+            .is_percent = looksLikeFraction(pair.value_ptr.*),
+        }) catch continue;
     }
 
     // 顺序稳定（HashMap 迭代顺序不定，输出必须可复现，否则缓存与测试都会抖）。
@@ -297,13 +323,39 @@ fn resolveFormula(parts: std.json.Array, data_values: std.StringHashMap([]const 
     return null;
 }
 
+/// 全部取值都落在 `[0, 1]` 且**至少有一个非 0** 时，认定它是分数（要按百分比显示）。
+///
+/// 为什么要求「非 0」：`CloneDamageMod` 那种真的从 0 开始的要做限制，而全 0 的
+/// 占位数组（CDragon 里不少）本来就是没用的，标成百分比也毫无意义。
+/// 为什么要求「全部」：`SlowAmount` = 0.2…0.8 全是分数；而
+/// `TooltipTakedownCooldownMultiplier` = 90 不是——只要有一个越界就整体否定，
+/// 宁可少标，也不要把一个「90」印成「9000%」。
+fn looksLikeFraction(values: []const f64) bool {
+    if (values.len == 0) return false;
+    var has_nonzero = false;
+    for (values) |value| {
+        if (!(value >= 0 and value <= 1)) return false;
+        if (value != 0) has_nonzero = true;
+    }
+    return has_nonzero;
+}
+
 /// `APRatio` → `AP`，`DamageArmorRatio` → `Armor`。认不出来就返回 null（显示成「系数」）。
+///
+/// ⚠️ 顺序要紧：`AD` 必须排在 `Armor` 前面——`AD` 是两字母前缀，而 `DamageArmorRatio`
+/// 里也有 `A`+`D` 但不相邻，实际不会撞；真正会撞的是 `AttackDamage`（含 `AD` 吗？不含，
+/// 是 `A…t…t…a…c…k…D…`）。所以这里用前缀判 `AD` 是安全的。
 fn statNameFrom(data_value_name: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, data_value_name, "AP")) return "AP";
     if (std.mem.startsWith(u8, data_value_name, "AD")) return "AD";
-    if (std.mem.indexOf(u8, data_value_name, "Armor") != null) return "Armor";
-    if (std.mem.indexOf(u8, data_value_name, "MR") != null) return "MR";
+    if (std.mem.indexOf(u8, data_value_name, "MaxHealth") != null) return "MaxHealth";
     if (std.mem.indexOf(u8, data_value_name, "Health") != null) return "Health";
+    if (std.mem.indexOf(u8, data_value_name, "MagicResist") != null) return "MR";
+    if (std.mem.indexOf(u8, data_value_name, "Armor") != null) return "Armor";
+    if (std.mem.indexOf(u8, data_value_name, "AttackSpeed") != null) return "AttackSpeed";
+    if (std.mem.indexOf(u8, data_value_name, "MoveSpeed") != null) return "MoveSpeed";
+    if (std.mem.indexOf(u8, data_value_name, "Crit") != null) return "Crit";
+    if (std.mem.indexOf(u8, data_value_name, "Mana") != null) return "Mana";
     return null;
 }
 
@@ -351,6 +403,8 @@ fn writeEntries(writer: *Writer, entries: []const Entry) !void {
                 try writer.writeJsonString(stat);
             }
         }
+        // 只在为真时才写，让输出短一点（绝大多数项都不是分数）。
+        if (entry.is_percent) try writer.writeAll(",\"percent\":true");
         try writer.writeAll("}");
     }
     try writer.writeAll("}");
@@ -449,6 +503,70 @@ test "大小写不固定的键也能找到（CDragon 实测两种都有）" {
     var output: [2048]u8 = undefined;
     const json = try writeValues("Ahri", body, &output);
     try std.testing.expect(std.mem.indexOf(u8, json, "[10,20,30]") != null);
+}
+
+test "落在 [0,1] 的取值标成百分比（@Name*100@ 那批变量）" {
+    // 取值全照 2026-09-30 实测：拉莫斯 R 的 `SlowAmount` = 0.2…0.8，
+    // 客户端文案里写作 `@SlowAmount*100@%`。
+    const body =
+        \\{"Characters/Rammus/CharacterRecords/Root":{"spells":["Characters/Rammus/Spells/Tremors2Ability/Tremors2"]},
+        \\ "Characters/Rammus/Spells/Tremors2Ability/Tremors2":{"mSpell":{"DataValues":[
+        \\   {"name":"SlowAmount","values":[0.2,0.3,0.4,0.5,0.6,0.7,0.8]},
+        \\   {"name":"TooltipTakedownCooldownMultiplier","values":[90,90,90,90,90,90,90]},
+        \\   {"name":"KnockbackDistance","values":[125,125,125,125,125,125,125]},
+        \\   {"name":"AllZeroPlaceholder","values":[0,0,0,0,0,0,0]}
+        \\ ]}}}
+    ;
+    var output: [4096]u8 = undefined;
+    const json = try writeValues("Rammus", body, &output);
+
+    // 0.2…0.8 → 分数，前端会渲染成 20%…80%
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"SlowAmount\":{\"values\":[0.2000,0.3000,0.4000,0.5000,0.6000,0.7000,0.8000],\"percent\":true}") != null);
+    // 90 不是分数——标了就会显示成 9000%
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"TooltipTakedownCooldownMultiplier\":{\"values\":[90,90,90,90,90,90,90]}") != null);
+    // 125 同理
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"KnockbackDistance\":{\"values\":[125,125,125,125,125,125,125]}") != null);
+    // 全 0 的占位数组不标（标了也没意义）
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"AllZeroPlaceholder\":{\"values\":[0,0,0,0,0,0,0]}") != null);
+}
+
+test "计算项自己声明的 mDisplayAsPercent 也算数" {
+    // 声明了 percent、但取值落在 [0,1] 之外时，靠区间判不出来，只能靠这个字段。
+    const body =
+        \\{"Characters/X/CharacterRecords/Root":{"spells":["Characters/X/Spells/Q"]},
+        \\ "Characters/X/Spells/Q":{"mSpell":{
+        \\   "DataValues":[{"name":"Base","values":[5,10,15]}],
+        \\   "mSpellCalculations":{"DeclaredPercent":{
+        \\     "mFormulaParts":[{"__type":"NamedDataValueCalculationPart","mDataValue":"Base"}],
+        \\     "mDisplayAsPercent":true
+        \\   }}
+        \\ }}}
+    ;
+    var output: [2048]u8 = undefined;
+    const json = try writeValues("X", body, &output);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"DeclaredPercent\":{\"values\":[5,10,15],\"percent\":true}") != null);
+}
+
+test "系数乘的是什么属性：法强要能认出来" {
+    // 龙王整套技能都是法强加成（`APPerSecond` / `BurstAPRatio` / `APRatio`）——
+    // 这直接回答「它是什么加成」那个问题。
+    const body =
+        \\{"Characters/AurelionSol/CharacterRecords/Root":{"spells":["Characters/AurelionSol/Spells/AurelionSolQAbility/AurelionSolQ"]},
+        \\ "Characters/AurelionSol/Spells/AurelionSolQAbility/AurelionSolQ":{"mSpell":{
+        \\   "DataValues":[
+        \\     {"name":"RankDamagePerSecond","values":[30,45,60,75,90]},
+        \\     {"name":"APPerSecond","values":[0.6,0.6,0.6,0.6,0.6]}
+        \\   ],
+        \\   "mSpellCalculations":{"DamagePerSecond":{"mFormulaParts":[
+        \\     {"__type":"NamedDataValueCalculationPart","mDataValue":"RankDamagePerSecond"},
+        \\     {"__type":"StatByNamedDataValueCalculationPart","mDataValue":"APPerSecond"}
+        \\   ]}}
+        \\ }}}
+    ;
+    var output: [4096]u8 = undefined;
+    const json = try writeValues("AurelionSol", body, &output);
+    // 关键：`ratioStat` 必须是 `AP`，前端才能写出「+0.6 法强」而不是「+0.6 加成」。
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"DamagePerSecond\":{\"values\":[30,45,60,75,90],\"ratio\":0.6000,\"ratioStat\":\"AP\"}") != null);
 }
 
 test "只有插值公式的技能返回空列表，而不是编一个数" {

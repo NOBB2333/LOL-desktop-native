@@ -580,6 +580,9 @@ export function createFixtureChampionAbilityValues(alias: string): ChampionAbili
           PowerBallDamage: { values: [40, 80, 120, 160, 200, 240, 280], ratio: 1, ratioStat: "AP" },
           RollDuration: { values: [6, 6, 6, 6, 6, 6, 6] },
           SlowPercent: { values: [30, 40, 50, 60, 70, 80, 90] },
+          // 客户端文案写 `@AOEModifier*100@%`：原始值 0.5，`percent` 为真。
+          // 预览里能同时验到「*100 表达式」与「百分号只出现一次」。
+          AOEModifier: { values: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], percent: true },
         },
       },
       {
@@ -595,7 +598,8 @@ export function createFixtureChampionAbilityValues(alias: string): ChampionAbili
         values: {
           InitialDamage: { values: [100, 175, 250], ratio: 0.6, ratioStat: "AP" },
           SlowDuration: { values: [3, 3, 3] },
-          SlowPercent: { values: [40, 50, 60] },
+          // `@SlowAmount*100@%`——同样是分数口径。
+          SlowPercent: { values: [0.4, 0.5, 0.6], percent: true },
         },
       },
     ],

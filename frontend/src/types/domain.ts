@@ -654,8 +654,16 @@ export interface ChampionAbilityValueEntry {
   values: number[];
   /** 若这一项带加成系数（`+1.0 法强`）。 */
   ratio?: number;
-  /** 系数乘的属性：`AP` / `AD` / `Armor` / `MR` / `Health`。 */
+  /** 系数乘的属性：`AP` / `AD` / `Armor` / `MR` / `MaxHealth` / `Health` / `AttackSpeed` / `MoveSpeed` / `Crit` / `Mana`。 */
   ratioStat?: string;
+  /**
+   * 这一项是**分数**（0.5 表示 50%）。
+   *
+   * 来源：CDragon 的计算项 `mDisplayAsPercent`，或取值全部落在 `[0, 1]` 区间。
+   * 客户端文案里写作 `@SlowAmount*100@%` 的就是这一批——渲染时要 **×100 加百分号**，
+   * 直接印 `0.5` 会被读成「0.5 点减速」。
+   */
+  percent?: boolean;
 }
 
 /** 一个槽位的取值表：变量名 → 数值。名字和 LCU 文案里的 `@名字@` 严格一致。 */

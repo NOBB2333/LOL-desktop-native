@@ -360,16 +360,147 @@ describe("技能面板：逐级数值（CommunityDragon）", () => {
     wrapper.unmount();
   });
 
-  it("带加成系数的项单独列一行，不拼进正文数字里", async () => {
+  it("带加成系数的项单独列一行，并写明乘的是哪个属性", async () => {
     valuesState.data = rammusValues();
     const wrapper = mountRammus();
     await flushPromises();
     await flushPromises();
     const scaling = wrapper.get(".abilities__scaling");
     expect(scaling.text()).toContain("PowerBallDamage");
-    expect(scaling.text()).toContain("+ 1 AP");
-    // 正文里的那一格只放基础值，不带 "+ 1 AP"，否则会被读成一个数。
-    expect(wrapper.get(".abilities__text").text()).not.toContain("+ 1 AP");
+    // 关键：不是干巴巴的「AP」，而是「法术强度」——用户问的就是「它是什么加成」。
+    expect(scaling.text()).toContain("+ 1 法术强度");
+    // 正文里的那一格只放基础值，不带系数，否则会被读成一个数。
+    expect(wrapper.get(".abilities__text").text()).not.toContain("+ 1 ");
+    wrapper.unmount();
+  });
+});
+
+/**
+ * 用户 2026-09-30 报的原文（铸星龙王 Q），逐条钉死。
+ *
+ * 他贴的就是这一段，里面有三种以前会「漏出原文」的写法：
+ * - `<font color='#3458eb'>2 / 2 / … 星尘</font>`（标签被转义成字面量）
+ * - `@AOEModifier*100@`（正则不认 `*`，整个漏出）
+ * - `@SpellModifierDescriptionAppend@`（客户端拼接位，本来就该空）
+ */
+describe("技能面板：龙王 Q 的原文（用户报的那段）", () => {
+  /** 龙王 Q 原文，照用户贴的一字不改。 */
+  const ASOL_Q =
+    "奥瑞利安·索尔喷吐星焰，至多持续@MaxChannelDuration@秒，每秒对首个命中的敌人造成" +
+    "<magicDamage>@DamagePerSecond@魔法伤害</magicDamage>并对附近的敌人们造成@AOEModifier*100@%此伤害。" +
+    "<br><br>对相同敌人每进行一整秒的吐息，就会造成一次爆发性的" +
+    "<magicDamage>@BurstDamage@魔法伤害</magicDamage>外加" +
+    "<magicDamage>@BurstBonusTrueDamageToChamps@最大生命值的魔法伤害</magicDamage>，并且如果这个敌人是英雄，" +
+    "还会吸收<font color='#3458eb'>2 / 2 / 2 / 2 / 2 / 2 / 2星尘</font>。@SpellModifierDescriptionAppend@";
+
+  function mountAsol() {
+    const data = abilitiesFixture({ championId: 136, alias: "AurelionSol", name: "铸星龙王" });
+    data.spells[0] = { ...data.spells[0], name: "星河冲荡", dynamicDescription: ASOL_Q };
+    abilitiesState.data = data;
+    valuesState.data = {
+      alias: "AurelionSol",
+      spells: [
+        {
+          slot: "q",
+          values: {
+            MaxChannelDuration: { values: [3.25, 3.25, 3.25, 3.25, 3.25, 9999, 9999] },
+            DamagePerSecond: { values: [30, 45, 60, 75, 90], ratio: 0.6, ratioStat: "AP" },
+            // 客户端文案写 `@AOEModifier*100@%`，原始值就是 0.5。
+            AOEModifier: { values: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], percent: true },
+            BurstDamage: { values: [50, 60, 70, 80, 90], ratio: 0.35, ratioStat: "AP" },
+          },
+        },
+      ],
+    } as ChampionAbilityValues;
+    return mountPanel(136);
+  }
+
+  it("`@AOEModifier*100@` 算成 50%，不再把变量名和 `*100` 露在界面上", async () => {
+    const wrapper = mountAsol();
+    await flushPromises();
+    await flushPromises();
+    const texts = wrapper.findAll(".abilities__text");
+    const text = texts[texts.length - 1].text();
+    expect(text).not.toContain("AOEModifier");
+    expect(text).not.toContain("*100");
+    // 客户端原文是 `@AOEModifier*100@%此伤害`——`%` 由文案自己带，
+    // 所以这里必须是 `50%` 而**不是** `50%%`（2026-09-30 实测踩到过双百分号）。
+    expect(text).toContain("50%此伤害");
+    expect(text).not.toContain("%%");
+    wrapper.unmount();
+  });
+
+  it("`<font color>` 的星尘按色渲染，不再是可见的标签文本", async () => {
+    const wrapper = mountAsol();
+    await flushPromises();
+    await flushPromises();
+    const html = wrapper.get(".abilities__body").html();
+    expect(html).not.toContain("&lt;font");
+    expect(html).not.toContain("<font");
+    expect(html).toContain('style="color:#3458eb"');
+    expect(wrapper.get(".abilities__body").text()).toContain("星尘");
+    wrapper.unmount();
+  });
+
+  it("「+0.6 法术强度」写在面板上——这就是「它是什么加成」的答案", async () => {
+    const wrapper = mountAsol();
+    await flushPromises();
+    await flushPromises();
+    const scaling = wrapper.get(".abilities__scaling").text();
+    expect(scaling).toContain("DamagePerSecond");
+    expect(scaling).toContain("+ 0.6 法术强度");
+    // 爆发那一段也是法强加成（客户端文案没写，我们补上）。
+    expect(scaling).toContain("BurstDamage");
+    expect(scaling).toContain("+ 0.35 法术强度");
+    wrapper.unmount();
+  });
+
+  it("变量速查表把每个 `@…@` 的取值都列出来（含百分比口径）", async () => {
+    const wrapper = mountAsol();
+    await flushPromises();
+    await flushPromises();
+    const values = wrapper.get(".abilities__values").text();
+    expect(values).toContain("MaxChannelDuration");
+    expect(values).toContain("3.25 / 3.25 / 3.25 / 3.25 / 3.25 / 9999 / 9999");
+    // 分数按百分数显示，不能是 0.5。
+    expect(values).toContain("AOEModifier");
+    expect(values).toContain("50%");
+    expect(values).not.toContain("0.5");
+    wrapper.unmount();
+  });
+
+  it("仍然取不到的变量会明说原因，不会假装全都填上了", async () => {
+    const wrapper = mountAsol();
+    await flushPromises();
+    await flushPromises();
+    const note = wrapper.get(".abilities__note").text();
+    // `BurstBonusTrueDamageToChamps` 依赖星尘层数，本地算不出来 → 保留原文并说明。
+    expect(note).toContain("按英雄等级与");
+    // 而已经填上的那几个（含表达式形式）不能被报成缺失。
+    expect(note).not.toContain("AOEModifier");
+    wrapper.unmount();
+  });
+
+  it("只有 `@SpellModifierDescriptionAppend@` 剩下时，解释成「拼接加成的位置」", async () => {
+    // 把龙王 Q 里那个依赖星尘层的变量也填上，就只剩拼接位了。
+    const data = abilitiesFixture({ championId: 136, alias: "AurelionSol", name: "铸星龙王" });
+    data.spells[0] = {
+      ...data.spells[0],
+      name: "星河冲荡",
+      dynamicDescription: "造成@AOEModifier*100@%此伤害。@SpellModifierDescriptionAppend@",
+    };
+    abilitiesState.data = data;
+    valuesState.data = {
+      alias: "AurelionSol",
+      spells: [{ slot: "q", values: { AOEModifier: { values: [0.5], percent: true } } }],
+    } as ChampionAbilityValues;
+    const wrapper = mountPanel(136);
+    await flushPromises();
+    await flushPromises();
+    const note = wrapper.get(".abilities__note").text();
+    expect(note).toContain("拼接装备与符文加成");
+    // 不能退化成那句「取不到值」的泛泛说明。
+    expect(note).not.toContain("按英雄等级与");
     wrapper.unmount();
   });
 });

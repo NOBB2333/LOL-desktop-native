@@ -3,7 +3,14 @@ import { computed, ref, watch } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 import { backend } from "../services/backend";
 import type { ChampionAbility } from "../types/domain";
-import { remainingPlaceholders, renderAbilityText, flattenAbilityValues, formatLevelValues } from "../utils/abilityText";
+import {
+  remainingPlaceholders,
+  renderAbilityText,
+  flattenAbilityValues,
+  formatLevelValues,
+  formatPercentValues,
+  statLabel,
+} from "../utils/abilityText";
 import LcuAssetImage from "./LcuAssetImage.vue";
 
 /**
@@ -133,16 +140,37 @@ const slotValues = computed(() => {
 
 const valuesFor = (): Record<string, string> => flattenAbilityValues(slotValues.value);
 
-/** 带系数的取值项——单独列出来给读者看「另外还加多少」。 */
-const scaledEntries = computed(() =>
-  Object.entries(slotValues.value)
-    .filter(([, entry]) => entry.ratio !== undefined && entry.ratio !== 0)
-    .map(([name, entry]) => ({
+/**
+ * 取值速查表：把这一格的每个变量都摊开给读者看。
+ *
+ * 这是为了回答「**它是什么加成**」——正文里 `@BurstBonusTrueDamageToChamps@`
+ * 只有一个变量名，读者没法知道它是法强、攻击力还是最大生命值。所以这里逐项列出来：
+ * 变量名 + 逐级值 + （有系数时）系数乘的是哪个属性。
+ *
+ * - 分数（`percent`）按百分数显示：`0.5` → `50%`，而不是让人读成「0.5 点」。
+ *   这里**要**带百分号（和正文替换相反——正文那个 `%` 由客户端文案自己带）。
+ * - 带系数的单独标出「+0.6 法术强度」——**这一句就是用户要的答案**。
+ */
+const valueRows = computed(() =>
+  Object.entries(slotValues.value).map(([name, entry]) => {
+    const levels = entry.percent
+      ? formatPercentValues(entry.values, { withSign: true })
+      : formatLevelValues(entry.values);
+    return {
       name,
-      text: `${formatLevelValues(entry.values)}${entry.ratioStat ? ` + ${entry.ratio} ${entry.ratioStat}` : ""}`,
-      stat: entry.ratioStat ?? "",
-    }))
-    .filter((entry) => entry.text.length > 0),
+      levels,
+      /** 有系数才有值：`法术强度` / `攻击力` / `最大生命值`… */
+      stat: entry.ratio !== undefined && entry.ratio !== 0 ? statLabel(entry.ratioStat) : "",
+      ratio: entry.ratio !== undefined && entry.ratio !== 0 ? entry.ratio : null,
+    };
+  }).filter((row) => row.levels.length > 0),
+);
+
+/** 带系数的项——单独列在最上面，因为这是「什么加成」的正面回答。 */
+const scaledEntries = computed(() =>
+  valueRows.value
+    .filter((row) => row.ratio !== null)
+    .map((row) => ({ name: row.name, text: `${row.levels} + ${row.ratio} ${row.stat}` })),
 );
 
 /** 逐级数值整体拿不到（断网 / 被代理挡）时提一句——不是错误，只是这一层没有。 */
@@ -217,13 +245,27 @@ const leftoverIsOnlyAppend = computed(
              都走白名单渲染（标签变样式、变量标出来），不做纯文本插值。 -->
         <p v-if="shortHtml" class="abilities__text abilities__text--short" v-html="shortHtml" />
         <p v-if="dynamicHtml" class="abilities__text" v-html="dynamicHtml" />
-        <!-- 带加成系数的项单独列：拼进正文格子会让人把「基础值」和「系数」读成一个数。 -->
+        <!-- 「它是什么加成」的正面回答：带系数的项先列，写明乘的是哪个属性。 -->
         <dl v-if="scaledEntries.length" class="abilities__scaling">
           <div v-for="entry in scaledEntries" :key="entry.name">
             <dt>{{ entry.name }}</dt>
             <dd>{{ entry.text }}</dd>
           </div>
         </dl>
+        <!-- 取值速查：正文里每个 `@变量@` 分别是什么数。
+             分数按百分数显示（50% 而不是 0.5），避免读成「0.5 点伤害」。 -->
+        <details v-if="valueRows.length" class="abilities__values">
+          <summary>这一格的变量取值（{{ valueRows.length }} 项）</summary>
+          <dl>
+            <div v-for="row in valueRows" :key="row.name">
+              <dt>{{ row.name }}</dt>
+              <dd>
+                {{ row.levels }}
+                <small v-if="row.ratio !== null">+ {{ row.ratio }} {{ row.stat }}</small>
+              </dd>
+            </div>
+          </dl>
+        </details>
         <p v-if="leftover.length" class="abilities__note">
           <template v-if="leftoverIsOnlyAppend">
             末尾没有显示内容的那一处，是客户端用来<strong>拼接装备与符文加成</strong>的位置；你没带这些加成时它本来就是空的，不是漏了。
@@ -231,6 +273,7 @@ const leftoverIsOnlyAppend = computed(
           <template v-else>
             上面标出的 <span class="abilities__note-mark">@…@</span> 是官方文案里的<strong>变量</strong>，取值要按英雄等级与
             实时属性（移速 / 护甲 / 魔抗等）才算得出来。这类数值本地资料里没有现成的，所以原样保留，不替它填数字。
+            它的具体含义在下面的「变量取值」里能查到。
           </template>
         </p>
         <p v-if="valuesUnavailable" class="abilities__note abilities__note--muted">
@@ -273,6 +316,15 @@ const leftoverIsOnlyAppend = computed(
 .abilities__scaling div { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .abilities__scaling dt { color: var(--text-muted); font-size: 9px; }
 .abilities__scaling dd { margin: 0; color: var(--text-secondary); font-size: 10px; font-variant-numeric: tabular-nums; }
+/* 变量取值速查：默认收起，需要时才展开（正文已经用不上的信息不必占地方）。 */
+.abilities__values { border: 1px solid var(--line); background: var(--surface-raised); }
+.abilities__values > summary { padding: 6px 9px; color: var(--text-muted); font-size: 9px; cursor: pointer; }
+.abilities__values > summary:hover { color: var(--accent); }
+.abilities__values > dl { display: grid; gap: 3px; margin: 0; padding: 0 9px 8px; }
+.abilities__values > dl > div { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.abilities__values dt { color: var(--text-muted); font-family: var(--font-mono, monospace); font-size: 9px; }
+.abilities__values dd { margin: 0; color: var(--text-secondary); font-size: 10px; font-variant-numeric: tabular-nums; }
+.abilities__values dd small { margin-left: 4px; color: var(--accent); font-size: 9px; }
 
 /* 官方文案里的样式标签（<speed> <magicDamage> …）映射到这里。
    配色跟游戏内保持一致：魔法伤害紫、物理伤害橙、真伤白、治疗绿、护盾灰蓝。 */
@@ -295,4 +347,8 @@ const leftoverIsOnlyAppend = computed(
 .abilities__text :deep(.ab-value) { color: var(--text-primary); font-weight: 500; font-variant-numeric: tabular-nums; }
 /* 没取到值的变量：标出来，别让人以为是渲染坏了 */
 .abilities__text :deep(.ab-placeholder) { color: var(--amber); font-family: var(--font-mono, monospace); font-size: 10px; }
+/* 客户端 `<font color='#3458eb'>星尘</font>` 这类关键词着色。
+   内联 style 里的颜色由 `safeColor` 限定成十六进制（见 abilityText.ts），
+   没有 color 属性时退回这里的中性强调色。 */
+.abilities__text :deep(.ab-fontcolor) { color: var(--green, #5fae6a); font-weight: 500; }
 </style>
