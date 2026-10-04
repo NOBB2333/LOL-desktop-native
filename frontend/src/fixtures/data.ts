@@ -785,7 +785,7 @@ export const fixtureBootstrap: AppBootstrap = {
   configPath: "~/.lol_desktop/config.jsonc",
   databasePath: "~/.lol_desktop/lol-desktop.sqlite3",
   appDataPath: "~/.lol_desktop",
-  appVersion: "3.0.0",
+  appVersion: "3.1.0",
 };
 
 /**
