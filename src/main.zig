@@ -5,8 +5,17 @@ const native_sdk = @import("native_sdk");
 const lcu = @import("lcu");
 const backend = @import("backend");
 const bridge_policy = @import("bridge");
-// 每个 bridge lane 一个 worker 线程；事件轮询与连接刷新已从 roster lane 拆出。
+// 每条 bridge lane 起 `lane_worker_count[lane]` 个 worker 线程；事件轮询与连接刷新
+// 已从 roster lane 拆出。`query` 与 `asset` 是 4，其余是 1（见 `lcu.lane_worker_count`
+// 里为什么这么分）。
 const lane_count = lcu.lane_count;
+/// 单条 lane 最多几个 worker——用来给线程数组定长（编译期常量）。
+const max_workers_per_lane = blk: {
+    var max: usize = 1;
+    for (lcu.lane_worker_count) |count| max = @max(max, count);
+    break :blk max;
+};
+const worker_slot_count = lane_count * max_workers_per_lane;
 const build_options = @import("build_options");
 const embedded_assets = @import("embedded_assets");
 const app_manifest = @import("app_manifest_zon");
@@ -105,7 +114,13 @@ const App = struct {
     pending_tails: [lane_count]?*AsyncBridgeJob = .{null} ** lane_count,
     pending_counts: [lane_count]usize = .{0} ** lane_count,
     worker_signals: [lane_count]std.Io.Semaphore = .{std.Io.Semaphore{}} ** lane_count,
-    worker_threads: [lane_count]?std.Thread = .{null} ** lane_count,
+    /// 每条 lane 的 worker 线程。同一条 lane 可能有多个（`lane_worker_count`），
+    /// 它们共享 `pending_heads/tails/counts` 与 `worker_signals`——队列本身
+    /// 已经在 `pending_mutex` 下是线程安全的，多消费者只是一个一个地取走队首。
+    ///
+    /// 存成扁平数组（`lane * max_workers_per_lane + 槽位`），空槽保持 `null`；
+    /// 这样所有 lane 共用一个定长数组，不必为「哪个 lane 有几个」再引一层嵌套。
+    worker_threads: [worker_slot_count]?std.Thread = .{null} ** worker_slot_count,
     automation_stop: std.atomic.Value(bool) = .init(false),
     automation_thread: ?std.Thread = null,
     completion_mutex: std.atomic.Mutex = .unlocked,
@@ -237,6 +252,11 @@ const App = struct {
                 processAsyncBridgeJob(job);
                 continue;
             }
+            // 多个 worker 共享一个信号量：一次 `post` 只唤醒一个等待者，被唤醒的
+            // worker 却可能发现队列已被兄弟线程抢空。此时**立刻回头再等**即可——
+            // 退出必须靠 `accepting_async_jobs`，不能因为"这次没抢到活"就退出，
+            // 否则几个空转的 worker 会先于真正的活消失，信号量上残留的 post 再也没有
+            // 消费者，队列里的任务就永远卡在那儿。
             if (!self.accepting_async_jobs.load(.acquire)) return;
         }
     }
@@ -341,9 +361,12 @@ const App = struct {
         lockAtomic(&self.pending_mutex);
         self.accepting_async_jobs.store(false, .release);
         self.pending_mutex.unlock();
-        for (self.worker_threads, 0..) |thread, lane| if (thread != null) {
-            if (self.runtime.io) |io| self.worker_signals[lane].post(io);
-        };
+        // 每个 lane 上的**每个** worker 都要唤醒一次（槽位数 = worker 数），
+        // 否则还堵在 `waitUncancelable` 上的那些会一直等到 join 超时。
+        for (0..lane_count) |lane| {
+            const count = lcu.lane_worker_count[lane];
+            for (0..count) |_| if (self.runtime.io) |io| self.worker_signals[lane].post(io);
+        }
         for (&self.worker_threads) |*thread| if (thread.*) |value| {
             value.join();
             thread.* = null;
@@ -374,7 +397,15 @@ const App = struct {
         if (self.runtime.io == null) return error.BridgeWorkerIoUnavailable;
         self.accepting_async_jobs.store(true, .release);
         errdefer self.stopAsyncBridge();
-        for (&self.worker_threads, 0..) |*thread, lane| thread.* = try std.Thread.spawn(.{}, asyncBridgeWorker, .{ self, lane });
+        // 每条 lane 按 `lane_worker_count` 起若干个 worker（`query` / `asset` 各 4 个，
+        // 其余 1 个）。槽位 = `lane * max_workers_per_lane + 序号`，空槽留 `null`。
+        for (0..lane_count) |lane| {
+            const count = lcu.lane_worker_count[lane];
+            for (0..count) |slot| {
+                const index = lane * max_workers_per_lane + slot;
+                self.worker_threads[index] = try std.Thread.spawn(.{}, asyncBridgeWorker, .{ self, lane });
+            }
+        }
     }
 
     fn source(context: *anyopaque) anyerror!native_sdk.WebViewSource {

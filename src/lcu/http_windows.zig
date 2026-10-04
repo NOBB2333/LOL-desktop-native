@@ -2,12 +2,40 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Control = @import("request_control.zig").Control;
 
-pub const Budget = enum { lcu, remote, roster, action, events };
+pub const Budget = enum { lcu, remote, roster, action, events, profiles, asset };
 // 事件轮询一次要发 6~9 个请求，给它独立配额，避免挤掉阵容请求或资料富化。
-const budget_limits = [_]usize{ 6, 2, 1, 1, 2 };
+//
+// `profiles` 是「十人资料富化批次」的专属配额。那个批次同时跑 5 名玩家，每人有
+// 3 个互不依赖的请求（身份 / 段位 / 战绩），峰值 15 个并发——原先它们全挤在
+// `.lcu` 的 6 个名额上，而 `.lcu` 还要和英雄图标、英雄目录、技能数值这些交互
+// 请求共享。
+//
+// 真正致命的是 `request()` 的 deadline 在**取名额之前**就定下了（见下面的
+// `request`），所以排队等待的时间直接从请求自己的 `timeout_ms` 里扣。选人阶段
+// 队列一深，排在后面的请求还没发出去就先判 `RequestTimedOut`，玩家被记成失败，
+// 整批于是推迟 `live_failure_retry_ms`（10 秒）再重跑一次——用户看到的
+// 「查完要等十秒」就是这条链路，不是数据源慢。
+//
+// 16 ≥ 峰值 15，批内请求基本不排队；批次只发本地 GET，给到 16 对客户端无压力。
+//
+// `asset` 是图标/头像取字节的专属配额。给它单独一条是本次性能修复的另一半：
+// 英雄页首屏会一次性打 200+ 个 `lol.get_asset`，如果它们和交互式查询共用 `.lcu`
+// 的 6 个名额，用户点开英雄看技能就只能在这堆取图后面排队。分到独立配额后，
+// 谁也不会挤谁。数值 8 与它的 lane worker 数（见 `lcu.lane_worker_count` 的 4）
+// 匹配：4 个 worker 在飞，每个请求的连接建立/读取各占一个名额，8 足够不排队。
+const budget_limits = [_]usize{ 6, 2, 1, 1, 2, 16, 8 };
 const budget_count = budget_limits.len;
 var active_requests: [budget_count]std.atomic.Value(usize) = .{std.atomic.Value(usize).init(0)} ** budget_count;
 var retry_after_ms: [budget_count]std.atomic.Value(i64) = .{std.atomic.Value(i64).init(0)} ** budget_count;
+
+/// 某个配额通道的并发上限。
+///
+/// 暴露出来是为了让「批次峰值并发」和「配额」这两个必须互相匹配的数字能被
+/// 一条断言绑在一起（见 `backend.zig` 的配额用例）——两者各自硬编码在不同文件里，
+/// 光靠注释提醒迟早会漂移。
+pub fn budgetLimit(budget: Budget) usize {
+    return budget_limits[@intFromEnum(budget)];
+}
 
 pub const Options = struct {
     io: std.Io,

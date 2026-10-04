@@ -195,11 +195,37 @@ pub fn getAsset(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
 /// 取 `(kind, id)` 的图标 DTO：LCU 本地字节优先，拿不到退回 CommunityDragon。
 fn fetchAssetDto(self: *backend.Runtime, kind: AssetKind, id: i64, output: []u8) ![]const u8 {
     const io = self.io orelse return communityDragonAsset(kind, id, output);
-    var client = backend.discoverClient(self, io) catch return communityDragonAsset(kind, id, output);
+    var client = assetClient(self, io) catch return communityDragonAsset(kind, id, output);
     defer client.deinit();
     const bytes = fetchLcuAsset(client, kind, id) catch return communityDragonAsset(kind, id, output);
     defer std.heap.page_allocator.free(bytes);
     return assetDataDto(kind, id, bytes, output);
+}
+
+/// 图标取字节专用的客户端配置：挂到 `.asset` 配额通道。
+///
+/// `discoverClient` 建出来的客户端默认是 `.query` lane，`localBudget()` 于是回落到
+/// `.lcu`（6 个名额）——而 `.lcu` 还要给英雄目录、技能数值这些交互请求用。图标是
+/// 一屏几百个的纯装饰请求，和交互请求抢同一条配额会两头都慢，所以这里显式覆盖成
+/// `.asset`（独立 8 个名额）。命令的**派发** lane 由 `backend.zig` 的命令表决定
+/// （见那里的 `lol.get_asset`），和这里的**配额**通道是两件事，必须各自设对。
+fn assetClient(self: *backend.Runtime, io: std.Io) !lcu.Client {
+    var client = try backend.discoverClient(self, io);
+    client.budget = .asset;
+    return client;
+}
+
+/// 按 LCU 资源路径取图标。取不到就回退 CommunityDragon 的同名 URL。
+fn assetByPath(self: *backend.Runtime, path: []const u8, output: []u8) ![]const u8 {
+    if (!isLcuAssetPath(path)) return error.InvalidAsset;
+    if (self.io) |io| {
+        var client = assetClient(self, io) catch return communityDragonAssetByPath(path, output);
+        defer client.deinit();
+        const bytes = client.get(path) catch return communityDragonAssetByPath(path, output);
+        defer std.heap.page_allocator.free(bytes);
+        return assetByPathDto(path, bytes, output);
+    }
+    return communityDragonAssetByPath(path, output);
 }
 
 /// 图标 DTO 的进程内缓存。
@@ -295,19 +321,7 @@ fn assetCacheResetForTest() void {
     asset_cache_bytes = 0;
 }
 
-/// 按 LCU 资源路径取图标。取不到就回退 CommunityDragon 的同名 URL。
-fn assetByPath(self: *backend.Runtime, path: []const u8, output: []u8) ![]const u8 {
-    if (!isLcuAssetPath(path)) return error.InvalidAsset;
-    if (self.io) |io| {
-        var client = backend.discoverClient(self, io) catch return communityDragonAssetByPath(path, output);
-        defer client.deinit();
-        const bytes = client.get(path) catch return communityDragonAssetByPath(path, output);
-        defer std.heap.page_allocator.free(bytes);
-        return assetByPathDto(path, bytes, output);
-    }
-    return communityDragonAssetByPath(path, output);
-}
-
+/// 把按路径取到的字节包成 DTO。`assetByPath` 已经做过路径白名单校验。
 fn assetByPathDto(path: []const u8, bytes: []const u8, output: []u8) ![]const u8 {
     var prefix_buffer: [768]u8 = undefined;
     var prefix_writer = std.Io.Writer.fixed(&prefix_buffer);

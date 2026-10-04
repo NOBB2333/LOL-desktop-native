@@ -28,6 +28,30 @@ const broken = ref<string[]>([]);
 const initials = computed(() => props.name.trim().slice(0, 1) || "?");
 
 /**
+ * ⚠️ **不要再在这里加「没滚到眼前就不取图」的 `IntersectionObserver` 门控**（2026-10-03 试过，已回退）。
+ *
+ * 当时的推理是：英雄页默认渲染 **245 行**，每行一个图标就是 245 次桥调用、
+ * 每次都要 `discoverClient` + 新开一条 WinHTTP 连接打 LCU（实测 **39.7ms/张**），
+ * 所以只给「接近视口」的那十几行取图。推理没错，但**实测把英雄头像整个卡死了**：
+ * `IntersectionObserver` 在这套 WebView 里没有按预期回调，`visible` 一直是 `false`，
+ * 于是**没有任何一个图标再去取图**——用户看到的就是「这些英雄头像加载不出来了」。
+ *
+ * （它另外还埋着一个更隐蔽的坑：`watchEffect` 会在 setup 期间**同步跑第一次**，
+ * 被它读到的 `visible` 必须声明在它前面，否则就是暂时性死区
+ * `ReferenceError: Cannot access 'visible' before initialization`，而且**只在真有原生宿主时**才炸。
+ * 两个问题叠在一起，排查时极容易跑到缓存 / mock 的方向去。）
+ *
+ * 真正的修法分两处，都**不依赖任何可见性回调**：
+ *   1. 后端：`lol.get_asset` 拆出独立的 `asset` lane（多 worker 并行消费）与独立配额，
+ *      不再和交互式查询串在一条队列里抢名额（见 `src/lcu.zig` 的 `lane_worker_count`）。
+ *   2. 前端：`../assets/assetCache.ts` 限制同时在飞的取图请求数——行为上是
+ *      「一定会加载，只是分批」，符合直觉。
+ *
+ * 另外 `../services/backend.ts` 的 `asset()` 也修了一处**会永久焊死空白**的缓存 bug：
+ * 它曾把空载荷的 promise 一直留在 map 里，导致某次取图失败后同一个图标再也不重试。
+ */
+
+/**
  * 候选顺序：原生取到的字节（LCU 本地、版本最准）在前，调用方给的远程地址兜底。
  *
  * 这里刻意做成「取第一个还没挂的」而不是「取第一个」：远程地址是先到的那一个

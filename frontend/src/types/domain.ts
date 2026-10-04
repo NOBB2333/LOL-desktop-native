@@ -160,6 +160,17 @@ export interface BanSummary {
 export interface MatchParticipant {
   puuid: string;
   gameName: string;
+  /**
+   * Riot ID 里 `#` 后面那段编号（`名字#编号`）。
+   *
+   * **十人阵容必须把它显示出来**：同一局里两个人都叫「萌太TnT」时，只有编号能区分
+   * （用户报：「所有召唤师原本的 ID 后边没有带上对应的编号」）。
+   *
+   * 数据源两套字段名不同：SGP 在 `participant.riotIdTagline`，LCU 只在
+   * `participantIdentities[].player.tagLine`。后端已经归一化到这里；
+   * 老缓存 / 人机局可能没有，所以是可选的 `null`。
+   */
+  tagLine?: string | null;
   isBot: boolean;
   championId: number;
   championName: string;
@@ -654,8 +665,35 @@ export interface ChampionAbilityValueEntry {
   values: number[];
   /** 若这一项带加成系数（`+1.0 法强`）。 */
   ratio?: number;
-  /** 系数乘的属性：`AP` / `AD` / `Armor` / `MR` / `MaxHealth` / `Health` / `AttackSpeed` / `MoveSpeed` / `Crit` / `Mana`。 */
+  /**
+   * 系数的**逐级值**。只有确实逐级不同时才带（金克丝 W = 1.4/1.5/…/1.8）。
+   *
+   * 有它时显示要按级展开，否则「升到 5 级」的加成会显示成 1 级的。
+   * 全等时后端不写这个字段，用 `ratio` 一个数就够。
+   */
+  ratios?: number[];
+  /**
+   * 系数乘的属性：`AP` / `AD` / `Armor` / `MR` / `MaxHealth` / `Health` / `AttackSpeed` / `MoveSpeed` / `Crit` / `Mana` / `MaxMana`。
+   *
+   * ⚠️ 可以**只有它、没有 `ratio`**：龙王 Q 的 `BurstBonusTrueDamageToChamps`
+   * 是「按最大生命值算」但没有显式系数（公式里只有消耗层数的那一段）。
+   * 这种项就是要回答「它是什么加成」的。
+   */
   ratioStat?: string;
+  /**
+   * **第二段及以后的**加成。
+   *
+   * 一个计算项可以有不止一段加成，客户端文案也确实是几段并写的：
+   *
+   * ```text
+   * 艾瑞莉娅 W  MinDamageCalc = 基础值 + 40% 攻击力 + 50% 法术强度
+   * 瑞兹     Q  QDamageCalc   = 基础值 + 55% 法术强度 + 2% 最大法力值
+   * ```
+   *
+   * 第一段仍然写在 `ratio` / `ratios` / `ratioStat` 里（向后兼容），这个字段
+   * **只在真有第二段时才出现**。读取方要先看它、没有才回退到单值字段。
+   */
+  ratioItems?: ChampionAbilityRatioItem[];
   /**
    * 这一项是**分数**（0.5 表示 50%）。
    *
@@ -664,6 +702,19 @@ export interface ChampionAbilityValueEntry {
    * 直接印 `0.5` 会被读成「0.5 点减速」。
    */
   percent?: boolean;
+}
+
+/**
+ * 一段「系数 × 属性」。
+ *
+ * `ratio` 与 `ratios` 至少有一个：`ratios` 只在系数逐级不同时出现。
+ * `stat` 可以缺——含义是「有系数，但认不出乘的是什么属性」，此时按「加成」显示，
+ * **不要**自己补一个属性名。
+ */
+export interface ChampionAbilityRatioItem {
+  ratio?: number;
+  ratios?: number[];
+  stat?: string;
 }
 
 /** 一个槽位的取值表：变量名 → 数值。名字和 LCU 文案里的 `@名字@` 严格一致。 */
@@ -778,21 +829,31 @@ export interface DashboardSnapshot {
 /**
  * 查询串 → 候选「名字#TAG」。
  *
- * 本地 API 只有精确匹配（LCU 的 `lol-summoner/v1/summoners?name=` 覆盖当前大区，
- * Riot Client 的 `player-account/aliases/v1/lookup` 覆盖跨区但要 gameName + tagLine
- * 两个字段），没有任何 name→tags 的反向索引，所以「只给名字列出所有 TAG」做不到。
- * `requiresTag` 就是用来把这个限制讲清楚的：只给了名字又没查到任何候选时为 `true`。
+ * 三条路对应三种输入（移植自 LeagueAkari 的 `useSummonerSearch`）：
+ * - 只给名字 → 模糊查询：Riot Client 的 `player-account/aliases/v1/lookup` **只传
+ *   `gameName`** 就能回一批同名玩家，所以「输一个名字列出同名」是**可以做到**的；
+ * - `名字#TAG` → 精确查询：同上接口带 `tagLine` 全局解析，跨区也能认出来；
+ * - puuid → 直接查。
+ *
+ * 同区候选的等级/段位由本地 LCU 补；跨区候选走它自己大区的 SGP，那里**只有等级**
+ * （段位接口不能跨区，见 AK `leagues-ledge` 的注释），所以跨区候选的 `soloRank` /
+ * `flexRank` 会是 null —— 界面要显示「—」，不要退化成「无段位」，那是两件事。
  */
 export interface SummonerSearchCandidate {
   gameName: string;
   tagLine: string;
   puuid: string;
   /**
-   * 等级与段位由本地 LCU 补（同大区才有）。
+   * 候选所在 SGP 子区（`TJ101` / `NJ100` …）。
    *
-   * 跨区候选是通过 Riot Client 解析出来的，本机没有那个大区的段位数据，所以这三项
-   * 会是 null —— 界面要显示「—」，不要退化成「无段位」，那是两件不同的事。
+   * ⚠️ 跨区搜索时这是**唯一能区分两个同名玩家**的字段：名字和 tag 都可能撞，
+   * 子区不会。有它才能把「华东的张三」和「华北的张三」分开显示。
+   *
+   * 精确 / puuid 查询里，候选会被逐个拿去 `summoner-ledge` 定位，所以**本区玩家也会带上**
+   * （显示成「联盟五区」）—— 那不是多余信息，它同时证明了「本区确实搜过了」。
+   * 只有模糊查询（几十个同名，不逐区探）与定位失败时才是 null。
    */
+  sgpServerId?: string | null;
   summonerLevel?: number | null;
   soloRank?: RankQueueSummary | null;
   flexRank?: RankQueueSummary | null;
@@ -801,8 +862,27 @@ export interface SummonerSearchCandidate {
 export interface SummonerSearchResult {
   query: string;
   hasTag: boolean;
+  /** 只给了名字、模糊枚举也确实一个都没回来时才为 true（现在很少见）。 */
   requiresTag: boolean;
+  /** 后端判定的查询类型，用于界面提示当前走的是哪条路。 */
+  searchType?: "fuzzy" | "exact" | "puuid";
+  /**
+   * 「全大区搜索」的痕迹：`summoner-ledge` 逐个子区问过谁、最后定位到哪个。
+   *
+   * 为什么要带出来：跨区玩家在本区是**搜得到人、查不到战绩**的，用户会以为功能坏了。
+   * 把「搜了哪几个大区、命中哪个」如实列出来，才知道当前大区和这个人无关，
+   * 而不是「搜不到」。只有精确 / puuid 查询才会产生这段（模糊查询不逐区探）。
+   */
+  regions?: SummonerRegionProbe;
   candidates: SummonerSearchCandidate[];
+}
+
+/** 一次「全大区定位」的过程与结论。 */
+export interface SummonerRegionProbe {
+  /** 命中的子区 id（`CQ100`）；一个都没命中时为 null。 */
+  located: string | null;
+  /** 按真实顺序问过的子区（命中即停，所以最后一项就是命中的那个）。 */
+  probed: { serverId: string; found: boolean }[];
 }
 
 export interface AppBootstrap {

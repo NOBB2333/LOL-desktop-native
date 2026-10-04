@@ -2,13 +2,16 @@
 import { computed, ref, watch } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 import { backend } from "../services/backend";
-import type { ChampionAbility } from "../types/domain";
+import type { ChampionAbility, ChampionAbilityValueEntry } from "../types/domain";
 import {
+  abilityRatioItems,
+  formatRatioText,
+  isCrossSkillKey,
+  referencedValueKeys,
   remainingPlaceholders,
   renderAbilityText,
   flattenAbilityValues,
-  formatLevelValues,
-  formatPercentValues,
+  formatEntryValues,
   statLabel,
 } from "../utils/abilityText";
 import LcuAssetImage from "./LcuAssetImage.vue";
@@ -123,55 +126,173 @@ const rangeText = computed(() => {
 });
 
 /**
- * 当前槽位能用的取值表。
+ * 逐级数组最多显示到第几级。
+ *
+ * 两份数据源都**没有**「这个技能能点几级」这个字段：CommunityDragon 的
+ * `DataValues` 一律给 7 格，LCU 的 `cooldown` / `cost` 一律给 6 格
+ * （拉莫斯 R 只有 3 级，LCU 也照样给 6 格）——所以只能取一个上限。
+ * 这里取 **5**，和下面「冷却 / 耗蓝 / 射程」三行同一个口径
+ * （用户 2026-10-03 明确说想要「5 个层级、5 个技能点」）。
+ *
+ * 代价：大招收尾会多显示两格重复值（R 实际 3 级）。要真正修得先拿到等级数。
+ */
+const MAX_RANKS = 5;
+
+/**
+ * 把一条取值裁到 `MAX_RANKS` 级（值和逐级系数一起裁，否则会错位）。
+ *
+ * ⚠️ 这一步必须**同时**作用于正文替换与速查表。只裁速查表的话，正文里
+ * `@ReturnDamageCalc@` 还是会印出 7 格 `15 / 15 / … / 15`——那正是用户
+ * 2026-10-03 贴出来的原文形状，也是他说的「应该是 5 个层级」。
+ * 两处口径一旦不同，「面板上的数和正文里的数对不上」比多显示两格更难解释。
+ */
+function trimRanks(entry: ChampionAbilityValueEntry): ChampionAbilityValueEntry {
+  const trim = (values: number[] | undefined) => values?.slice(0, MAX_RANKS);
+  return {
+    ...entry,
+    values: entry.values.slice(0, MAX_RANKS),
+    ratios: trim(entry.ratios),
+    ratioItems: entry.ratioItems?.map((item) => ({ ...item, ratios: trim(item.ratios) })),
+  };
+}
+
+/**
+ * 当前槽位能用的取值表（**已裁到 `MAX_RANKS` 级**）。
  *
  * 槽位键：被动在 CommunityDragon 那边是 `p`，主动是 `q`/`w`/`e`/`r`——和 LCU 的
  * `spellKey` 同一套，所以直接用 `tab` 配。
  *
- * 带系数的那种（`+1.0 法强`）**不拼进同一格**：系数是另一个变量，拼一起会让人
- * 以为「40/80/120 +1.0 法强」是一个整体。加成单独在下面列一行。
+ * 带系数的那种（`+100% 法强`）**不拼进同一格**：系数是另一个变量，拼一起会让人
+ * 以为「40/80/120 +100% 法强」是一个整体。加成单独在下面列一行。
+ *
+ * 裁级放在这一层（而不是各个消费点各裁一次）：正文替换、速查表、引用过滤
+ * 全都读这一份，口径自然一致。
  */
-const slotValues = computed(() => {
+const slotValues = computed<Record<string, ChampionAbilityValueEntry>>(() => {
   const slot = tab.value;
   const sets = values.data.value?.spells ?? [];
   const match = sets.find((item) => item.slot.toLowerCase() === slot);
-  return match?.values ?? {};
+  const raw = match?.values ?? {};
+  const out: Record<string, ChampionAbilityValueEntry> = {};
+  for (const [name, entry] of Object.entries(raw)) out[name] = trimRanks(entry);
+  return out;
 });
 
-const valuesFor = (): Record<string, string> => flattenAbilityValues(slotValues.value);
+/**
+ * 当前技能的**原文**（描述 + 动态描述拼起来）。
+ *
+ * 它的唯一用途是当「单位」的权威依据：客户端在占位符后面紧贴着的
+ * `秒` / `%` 说明了变量到底是秒还是百分数。没有它就只能靠数值范围猜，
+ * 而 `0.5 秒` 和 `50%` 数值上完全一样——猜错就是「击飞 50 秒」
+ * （见 `utils/abilityText.ts` 的 `detectUnitFromText`）。
+ */
+const slotText = computed(() => {
+  const spell = selected.value;
+  // 被动结构不一样（`ChampionPassive` 只有 `description`，没有 `dynamicDescription`）。
+  const passiveText = passive.value?.description ?? "";
+  return `${spell?.description ?? ""} ${spell?.dynamicDescription ?? ""} ${passiveText}`.trim();
+});
 
 /**
- * 取值速查表：把这一格的每个变量都摊开给读者看。
+ * 正文替换用的取值表。
+ *
+ * ⚠️ 这里**必须**带 `withRatio`（2026-10-03 用户要求）：正文里
+ * `@WDamageCalc@` 要渲染成 `30 / 60 / 90 / 120 / 150 + 60% 法术强度 + 3% 最大法力值`，
+ * 也就是**把加成直接接在基础值后面**，和客户端自己的写法一致
+ * （客户端面板就是「基础伤害（+加成）」一行连着写）。
+ * 以前正文只给基础值、加成单独列在下面一个框里，用户看到的是一句话被拆成两处，
+ * 而且那个框和「这个技能用到的数值」框内容重复。
+ */
+const valuesFor = (): Record<string, string> =>
+  flattenAbilityValues(slotValues.value, { text: slotText.value, withRatio: true });
+
+/**
+ * 这段文案**真正引用到**的键。
+ *
+ * 后端为了支持 `@spell.X:Y@` 会把其他每个技能整体收一遍塞进当前槽位，
+ * 于是每个槽位都拿到全英雄的变量（实测拉莫斯 5 个槽位各 46 项、集合逐字相同）。
+ * 那一层拿不到文案（CDragon 角色文件里 `@` 出现 0 次），所以过滤必须在这里做。
+ */
+const referencedKeys = computed(() => referencedValueKeys(slotText.value, slotValues.value));
+
+/**
+ * 这一格该展示哪些变量。
+ *
+ * - 文案里有引用 → **只留被引用的**。这正是「像客户端面板那样，只列这个技能
+ *   自己的数字」：拉莫斯 W 从此只剩 `BuffDuration` / `ReturnDamageCalc` /
+ *   `BonusArmorTooltip` / `BonusMRTooltip`；Q/E/R 的系数、以及文案根本没提的
+ *   `RecastDamageTooltip` 都不再出现。
+ * - 文案里**一个占位符都没有**（被动常见，比如拉莫斯被动就一句纯文字）→
+ *   退化成「本技能自己的变量」，把 `spell.X:` 那批排除掉。宁可少列，
+ *   也不要把别的技能的东西摊出来。
+ */
+const visibleValueNames = computed(() => {
+  const all = Object.keys(slotValues.value);
+  if (referencedKeys.value.size > 0) return all.filter((name) => referencedKeys.value.has(name));
+  return all.filter((name) => !isCrossSkillKey(name));
+});
+
+/**
+ * 取值速查表：这一格**用到的**每个变量逐项列出来。
  *
  * 这是为了回答「**它是什么加成**」——正文里 `@BurstBonusTrueDamageToChamps@`
  * 只有一个变量名，读者没法知道它是法强、攻击力还是最大生命值。所以这里逐项列出来：
  * 变量名 + 逐级值 + （有系数时）系数乘的是哪个属性。
  *
- * - 分数（`percent`）按百分数显示：`0.5` → `50%`，而不是让人读成「0.5 点」。
+ * - 百分数按百分数显示：`0.5` → `50%`，而不是让人读成「0.5 点」。
  *   这里**要**带百分号（和正文替换相反——正文那个 `%` 由客户端文案自己带）。
- * - 带系数的单独标出「+0.6 法术强度」——**这一句就是用户要的答案**。
+ *   ⚠️ 但**先看原文声明的单位**：`@SlowDuration@秒` 是 0.5 **秒**，
+ *   按百分数显示就会变成「50 秒」——这正是那个 bug。`withSign = true` 只在
+ *   确认是百分数时才补 `%`。
+ * - 带系数的单独标出「+60% 法术强度」——**这一句就是用户要的答案**。
+ *   系数一律按百分数写（`+10% 护甲` 而不是 `+0.1 护甲`），和客户端文案一致
+ *   （用户 2026-10-03 看到 `0.1 护甲` 时以为识别错了）。
+ * - 系数逐级不同的（`ratios`）按级展开，否则 5 级的加成会显示成 1 级的；
+ *   拉莫斯 W 的 `BonusArmorTooltip` 正是如此（22.5% → 67.5%）。
+ * - **一个变量可以有好几段加成**（艾瑞莉娅 W = 攻击力 + 法强、瑞兹 Q = 法强 +
+ *   最大法力值），全部列出、用 ` + ` 连起来；只留第一段就是用户报的「加成没了」。
  */
 const valueRows = computed(() =>
-  Object.entries(slotValues.value).map(([name, entry]) => {
-    const levels = entry.percent
-      ? formatPercentValues(entry.values, { withSign: true })
-      : formatLevelValues(entry.values);
+  visibleValueNames.value.map((name) => {
+    // `slotValues` 已经在源头裁过级（见 `trimRanks`），这里直接用。
+    const entry = slotValues.value[name];
+    const levels = formatEntryValues(name, entry, slotText.value, true);
+    const items = abilityRatioItems(entry);
+    /**
+     * 带系数的段：`100% 法术强度`、`40% 攻击力 + 50% 法术强度`。
+     *
+     * 系数逐级不同就展开（否则 5 级会被显示成 1 级）。
+     */
+    const ratioParts = items
+      .filter((item) => item.ratios !== null || item.ratio !== null)
+      .map((item) => `${formatRatioText(item)} ${statLabel(item.stat ?? undefined)}`);
+    /**
+     * 只有属性、没有系数的段（龙王 Q 的星尘项）——
+     * 单独一句话回答「它是什么加成」，不硬套系数。
+     */
+    const statLabels = items
+      .filter((item) => item.ratios === null && item.ratio === null && item.stat !== null)
+      .map((item) => statLabel(item.stat ?? undefined));
     return {
       name,
       levels,
-      /** 有系数才有值：`法术强度` / `攻击力` / `最大生命值`… */
-      stat: entry.ratio !== undefined && entry.ratio !== 0 ? statLabel(entry.ratioStat) : "",
-      ratio: entry.ratio !== undefined && entry.ratio !== 0 ? entry.ratio : null,
+      /** 展示用后缀：`+ 100% 法术强度`；没有系数就留空。 */
+      ratios: ratioParts.join(" + "),
+      statOnly: ratioParts.length === 0 && statLabels.length > 0,
+      statOnlyText: `按${statLabels.join(" / ")}算`,
     };
   }).filter((row) => row.levels.length > 0),
 );
 
-/** 带系数的项——单独列在最上面，因为这是「什么加成」的正面回答。 */
-const scaledEntries = computed(() =>
-  valueRows.value
-    .filter((row) => row.ratio !== null)
-    .map((row) => ({ name: row.name, text: `${row.levels} + ${row.ratio} ${row.stat}` })),
-);
+/**
+ * ⚠️ 这里原来还有一个 `scaledEntries`（把「带系数的项」单独列成**另一个框**）。
+ * **2026-10-03 删除**：加成已经由 `valuesFor()` 直接写进正文的伤害后面
+ * （`30 / 60 / 90 / 120 / 150 + 60% 法术强度 + 3% 最大法力值`），
+ * 再单开一个框会和下面「这个技能用到的数值」框**逐行重复**——
+ * 用户原话：「我不知道为什么有两个框，两个框写的一样的东西」。
+ * 现在只保留下面那个可折叠的速查表（它是**唯一**列出变量名的地方，
+ * 正文里只有数字、没有变量名）。
+ */
 
 /** 逐级数值整体拿不到（断网 / 被代理挡）时提一句——不是错误，只是这一层没有。 */
 const valuesUnavailable = computed(() => props.championId > 0 && !!abilities.data.value && values.isError.value);
@@ -245,23 +366,22 @@ const leftoverIsOnlyAppend = computed(
              都走白名单渲染（标签变样式、变量标出来），不做纯文本插值。 -->
         <p v-if="shortHtml" class="abilities__text abilities__text--short" v-html="shortHtml" />
         <p v-if="dynamicHtml" class="abilities__text" v-html="dynamicHtml" />
-        <!-- 「它是什么加成」的正面回答：带系数的项先列，写明乘的是哪个属性。 -->
-        <dl v-if="scaledEntries.length" class="abilities__scaling">
-          <div v-for="entry in scaledEntries" :key="entry.name">
-            <dt>{{ entry.name }}</dt>
-            <dd>{{ entry.text }}</dd>
-          </div>
-        </dl>
-        <!-- 取值速查：正文里每个 `@变量@` 分别是什么数。
-             分数按百分数显示（50% 而不是 0.5），避免读成「0.5 点伤害」。 -->
+        <!-- 取值速查：**这段文案真正用到**的每个 `@变量@` 分别是什么数
+             （后端会把其他技能的变量也一并塞进来，这里按引用过滤掉了）。
+             分数按百分数显示（50% 而不是 0.5），避免读成「0.5 点伤害」。
+             ⚠️ 这是**唯一**列出变量名的框：正文里已经带着加成（`基础值 + 60% 法强`），
+             但只有数字没有变量名，所以这一栏不能省（2026-10-03 删掉的是上面那个
+             内容重复的「带系数的项」框，见 `scaledEntries` 处的注释）。 -->
         <details v-if="valueRows.length" class="abilities__values">
-          <summary>这一格的变量取值（{{ valueRows.length }} 项）</summary>
+          <summary>这个技能用到的数值（{{ valueRows.length }} 项）</summary>
           <dl>
             <div v-for="row in valueRows" :key="row.name">
               <dt>{{ row.name }}</dt>
               <dd>
                 {{ row.levels }}
-                <small v-if="row.ratio !== null">+ {{ row.ratio }} {{ row.stat }}</small>
+                <small v-if="row.ratios !== ''">+ {{ row.ratios }}</small>
+                <!-- 只有属性没有系数的那种：直接写「按最大生命值算」。 -->
+                <small v-else-if="row.statOnly">{{ row.statOnlyText }}</small>
               </dd>
             </div>
           </dl>
@@ -311,11 +431,8 @@ const leftoverIsOnlyAppend = computed(
 .abilities__note--muted { border-left-color: var(--line); color: var(--text-muted); }
 .abilities__note code { color: var(--amber); font-size: 10px; }
 .abilities__note-mark { color: var(--amber); font-family: var(--font-mono, monospace); font-size: 10px; }
-/* 带加成系数的项：和正文分开，避免把「基础值」与「系数」读成一个数。 */
-.abilities__scaling { display: grid; gap: 4px; margin: 0; padding: 7px 9px; border: 1px solid var(--line); background: var(--surface-raised); }
-.abilities__scaling div { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
-.abilities__scaling dt { color: var(--text-muted); font-size: 9px; }
-.abilities__scaling dd { margin: 0; color: var(--text-secondary); font-size: 10px; font-variant-numeric: tabular-nums; }
+/* `.abilities__scaling`（「带系数的项」那个独立框）已随 2026-10-03 的去重一起删除：
+   加成现在直接跟在正文的基础值后面，再单开一栏就和下面的速查表逐行重复了。 */
 /* 变量取值速查：默认收起，需要时才展开（正文已经用不上的信息不必占地方）。 */
 .abilities__values { border: 1px solid var(--line); background: var(--surface-raised); }
 .abilities__values > summary { padding: 6px 9px; color: var(--text-muted); font-size: 9px; cursor: pointer; }
@@ -338,17 +455,38 @@ const leftoverIsOnlyAppend = computed(
 .abilities__text :deep(.ab-attention) { color: var(--text-primary); font-weight: 500; }
 .abilities__text :deep(.ab-scale) { color: var(--text-secondary); }
 .abilities__text :deep(.ab-recast) { color: var(--accent); font-weight: 500; }
+/* `<spellActive>主动：</spellActive>` / `<spellPassive>被动：</spellPassive>`——
+   国服文案里成对出现的导语（前者 212 处、后者 264 处）。它们和「再次施放：」
+   是同一个角色（一句动作的导语），所以样式一致。 */
+.abilities__text :deep(.ab-active) { color: var(--accent); font-weight: 500; }
+.abilities__text :deep(.ab-passive) { color: var(--accent); font-weight: 500; }
+/* `<hr>`：凯隐两种形态之间的分隔线。做成一条细分隔，别让它变成一行字面量。 */
+.abilities__text :deep(.ab-separator) { display: block; margin: 6px 0; border: 0; border-top: 1px solid var(--line); }
 .abilities__text :deep(.ab-spell) { color: var(--accent); }
 .abilities__text :deep(.ab-strong) { color: var(--text-primary); font-weight: 500; }
 .abilities__text :deep(.ab-italic) { font-style: italic; }
 .abilities__text :deep(.ab-flavor) { color: var(--text-muted); font-style: italic; }
 .abilities__text :deep(.ab-block) { display: block; }
+/* 客户端 `<li>` 是**列表项**（斯莫德 Q 的三档进化、薇恩 W 的三环…）。
+   文案里连着写一串 `<li>` 且常常不闭合，直接转义会挤成一句话、当 HTML 又会
+   在 `<p>` 里非法嵌套。所以做成块级 + 行首圆点，既不挤行也不破坏结构。 */
+.abilities__text :deep(.ab-listitem) { display: block; margin: 2px 0 2px 10px; }
+.abilities__text :deep(.ab-listitem)::before { content: "· "; color: var(--text-muted); }
+/* `<keywordMajor>` 是国服文案的重点标记（108 个英雄在用）。
+   不给它特别颜色——用客户端的十六进制 `<font color>` 时颜色由内联 style 决定，
+   这里只兜底「没有 color 时也要看得出是重点」。 */
+.abilities__text :deep(.ab-keyword) { color: var(--text-primary); font-weight: 500; }
 /* 取到值的变量 */
 .abilities__text :deep(.ab-value) { color: var(--text-primary); font-weight: 500; font-variant-numeric: tabular-nums; }
 /* 没取到值的变量：标出来，别让人以为是渲染坏了 */
 .abilities__text :deep(.ab-placeholder) { color: var(--amber); font-family: var(--font-mono, monospace); font-size: 10px; }
 /* 客户端 `<font color='#3458eb'>星尘</font>` 这类关键词着色。
    内联 style 里的颜色由 `safeColor` 限定成十六进制（见 abilityText.ts），
-   没有 color 属性时退回这里的中性强调色。 */
+   没有 color 属性时退回这里的中性强调色。
+
+   ⚠️ 只加 `font-weight: 500`，**不能**改 `font-size`：字号一变，行内这一段的
+   基线就会和周围的说明文字错开，看起来像「渲染坏了」（用户 2026-09-30 报的
+   「字体有些时候没渲染特别好」就是这个）。颜色一律走内联 style，
+   这里只兜底没写 color 的情况。 */
 .abilities__text :deep(.ab-fontcolor) { color: var(--green, #5fae6a); font-weight: 500; }
 </style>

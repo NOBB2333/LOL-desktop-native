@@ -68,6 +68,7 @@ import type {
   RestoreFriendResult,
   ShortcutValidation,
   SpectateResult,
+  SummonerSearchCandidate,
   SummonerSearchResult,
 } from "../types/domain";
 
@@ -263,6 +264,29 @@ function spectateFixture(puuid: string): SpectateResult {
 }
 
 /**
+ * 「全大区搜索」的 fixture 痕迹。
+ *
+ * 顺序刻意与后端 `tencent_sub_ids` 完全一致（命中即停）：
+ * `TJ101 / TJ100 / CQ100 / GZ100 / NJ100 / HN1 / HN10 / BGP2`。
+ * 预览里给这几种形状，是为了能同时验到三句文案
+ * —— 只造成功态的话，失败态那条分支在预览里永远看不见。
+ */
+const FIXTURE_REGION_PROBE_HIT = [
+  { serverId: "TJ101", found: false },
+  { serverId: "TJ100", found: false },
+  { serverId: "CQ100", found: true },
+];
+const FIXTURE_REGION_PROBE_MISS = ["TJ101", "TJ100", "CQ100", "GZ100", "NJ100", "HN1", "HN10", "BGP2"].map((serverId) => ({ serverId, found: false }));
+/**
+ * 「账号解析到了、但逐区定位不到大区」——第 3 种形状。
+ *
+ * 这一种是 2026-10-03 用户实报的那次：精确匹配命中 1 个账号，逐区却全灭，
+ * 旧文案于是自相矛盾地说「8 个大区都没这个人」。用 `一剑霜寒#TOP`（enemy[0]）
+ * 触发，保证这条文案在预览里可验。
+ */
+const FIXTURE_UNLOCATED_TRIGGER = { gameName: "一剑霜寒", tagLine: "TOP" };
+
+/**
  * 与原生实现同一套方法签名的模拟实现。
  *
  * 参数都是门面已经做过清洗/边界处理的值（如 `targets` 已去重、`boundedLimit` 已 clamp），
@@ -330,31 +354,68 @@ export const browserBackend = {
   /**
    * 预览模式下的玩家解析。
    *
-   * 真机上这步是「Riot Client 精确解析 → 本地 LCU 补等级与段位」。预览里没有客户端，
-   * 所以改成在 fixture 的十人名单里找同名的人：命中就带着等级、单双与灵活段位回来，
-   * 让战绩页顶部的账号信息条在预览里也能看到真实排版（否则那一块永远是「—」）。
+   * 真机上这步是「Riot Client 全局解析/模糊枚举 → 本地 LCU 补等级与段位 → 跨区走 SGP」。
+   * 预览里没有客户端，所以改成在 fixture 的十人名单里找：
+   * - 带 `#标签`（精确）→ 必须名字和标签都对上；
+   * - 只给名字（模糊）→ 把**所有**同名的都列出来，而且故意额外塞一个「外区同名」的
+   *   假候选，好让预览能看见大区标签和「同名多人」的排版（否则这两块样式的 bug
+   *   在预览里永远暴露不出来）。
    */
   searchSummoner(query: string): SummonerSearchResult {
     const trimmed = query.trim();
     const hasTag = trimmed.includes("#");
-    if (!trimmed) return { query: "", hasTag, requiresTag: false, candidates: [] };
+    if (!trimmed) return { query: "", hasTag, requiresTag: false, searchType: "fuzzy", candidates: [] };
     const [rawName, rawTag = ""] = trimmed.split("#");
     const gameName = rawName.trim();
     const tagLine = rawTag.trim();
-    const hit = [...fixtureLobby.ally, ...fixtureLobby.enemy].find((player) => player.gameName === gameName && (!tagLine || player.tagLine === tagLine));
-    if (!hit) return { query: trimmed, hasTag, requiresTag: !hasTag, candidates: [] };
+    const hits = [...fixtureLobby.ally, ...fixtureLobby.enemy].filter(
+      (player) => player.gameName === gameName && (!tagLine || player.tagLine === tagLine),
+    );
+    if (!hits.length) {
+      return {
+        query: trimmed,
+        hasTag,
+        requiresTag: !hasTag,
+        searchType: hasTag ? "exact" : "fuzzy",
+        // 精确查询没命中时，真机也会把「逐个问过哪些大区」带回来（都没中）。
+        // 形状必须一样，否则「全大区搜索」那块在预览里只有成功态、验不到失败态。
+        regions: hasTag ? { located: null, probed: FIXTURE_REGION_PROBE_MISS } : undefined,
+        candidates: [],
+      };
+    }
+    const candidates: SummonerSearchCandidate[] = hits.map((hit) => ({
+      gameName: hit.gameName,
+      tagLine: hit.tagLine,
+      puuid: hit.puuid,
+      sgpServerId: null,
+      summonerLevel: hit.summonerLevel ?? null,
+      soloRank: hit.soloRank ?? null,
+      flexRank: hit.flexRank ?? null,
+    }));
+    // 只给名字时，补一个「另一个大区的同名玩家」：这是跨区搜索最典型的场景，
+    // 也是「大区标签」唯一有用的时刻。段位刻意留 null（跨区拿不到）。
+    if (!hasTag && hits[0]) {
+      candidates.push({
+        gameName: hits[0].gameName,
+        tagLine: `${hits[0].tagLine}`,
+        puuid: `${hits[0].puuid}-elsewhere`,
+        sgpServerId: "TJ101",
+        summonerLevel: 87,
+        soloRank: null,
+        flexRank: null,
+      });
+    }
+    // 「账号解析到了、逐区定位不到」：候选照给，但逐区痕迹全是未命中。
+    // 真机上是 `summoner-ledge` 那一环出问题（2026-10-03 就是缺 Content-Type 收 415），
+    // 界面必须说的是「定位失败」而不是「没这个人」。
+    const unlocated = gameName === FIXTURE_UNLOCATED_TRIGGER.gameName && tagLine === FIXTURE_UNLOCATED_TRIGGER.tagLine;
     return {
       query: trimmed,
       hasTag,
       requiresTag: false,
-      candidates: [{
-        gameName: hit.gameName,
-        tagLine: hit.tagLine,
-        puuid: hit.puuid,
-        summonerLevel: hit.summonerLevel ?? null,
-        soloRank: hit.soloRank ?? null,
-        flexRank: hit.flexRank ?? null,
-      }],
+      searchType: hasTag ? "exact" : "fuzzy",
+      regions: hasTag ? (unlocated ? { located: null, probed: FIXTURE_REGION_PROBE_MISS } : { located: "CQ100", probed: FIXTURE_REGION_PROBE_HIT }) : undefined,
+      candidates,
     };
   },
   champions(): ChampionOverview[] {

@@ -57,6 +57,31 @@ export const platformRegionName = (value?: string | null) => {
   if (id && platformRegions[id]) return `${id} · ${platformRegions[id].name}`;
   return value?.trim() || "未连接大区";
 };
+/**
+ * 只要**大区名字**（`联盟五区`），不带 `TJ101 · ` 前缀。
+ *
+ * ⚠️ 这个函数存在的唯一理由：以前战绩页为了显示大区，**自己另抄了一张表**，
+ * 抄错了 —— `HN1` 写成「河南一区」、`TJ101` 写成「天津二区」（真名是艾欧尼亚 / 联盟五区）。
+ * 名字错不会报错，只会让用户看到「搜不到」时以为是搜索坏了（2026-10-03 用户实报）。
+ * 所以大区名字**只能有这一份来源**，任何页面都不许再抄。
+ *
+ * 认不出来时**原样返回 id**，不猜、不编。
+ */
+export const platformRegionLabel = (value?: string | null) => {
+  const id = platformRegionId(value);
+  if (!id) return "";
+  if (platformRegions[id]) return platformRegions[id].name;
+  return overseasRegionLabels[id] ?? value?.trim() ?? id;
+};
+/**
+ * 海外服的中文名。只做**显示**，不参与 `platformRegionOverview` 的大区速查
+ * （那份列表是国服专属的 8 个大区，见 `platformRegionOrder`）。
+ */
+const overseasRegionLabels: Record<string, string> = {
+  KR: "韩国", NA1: "北美", EUW: "西欧", EUW1: "西欧", EUN1: "东欧", JP: "日本", JP1: "日本",
+  SG2: "新加坡", TW2: "台湾", PH2: "菲律宾", VN2: "越南", TH2: "泰国", BR1: "巴西",
+  LA1: "拉丁美洲北部", LA2: "拉丁美洲南部", OC1: "大洋洲", TR1: "土耳其", RU: "俄罗斯", PBE: "PBE",
+};
 export const platformRegionOverview = (value?: string | null): PlatformRegionOverview => {
   const currentId = platformRegionId(value);
   const regions = platformRegionOrder.map((id) => ({ id, ...platformRegions[id] }));

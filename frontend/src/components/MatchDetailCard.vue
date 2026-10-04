@@ -256,7 +256,13 @@ function toggleFromRow(event: MouseEvent) {
                 <span class="participant-line__spells" aria-label="召唤师技能">
                   <AssetIcon v-for="spell in participantSpells(participant)" :key="`spell-${participant.puuid}-${spell.id}`" kind="spell" :id="spell.id" :name="spell.name" :fallback-url="spell.iconUrl" size="xs" />
                 </span>
-                <span class="participant-line__identity"><strong>{{ participant.gameName }}<em v-if="participant.isBot">人机</em></strong><small>{{ participant.championName }} · {{ roleName(participant.position) }}</small></span>
+                <!--
+                  十人阵容必须带 `#编号`：同一局里两个人都叫「萌太TnT」时，
+                  只有编号能把他们分开（用户报：「ID 后边没有带上对应的编号」）。
+                  编号可能是 null（老缓存 / 人机局），那就只显示名字，不补一个假的。
+                  下面的观战面板**故意**不带编号——那里是「谁在打什么」，不是身份识别。
+                -->
+                <span class="participant-line__identity"><strong>{{ participant.gameName }}<span v-if="participant.tagLine" class="participant-line__tag">#{{ participant.tagLine }}</span><em v-if="participant.isBot">人机</em></strong><small>{{ participant.championName }} · {{ roleName(participant.position) }}</small></span>
                 <b class="participant-line__kda">{{ participant.kills }}/{{ participant.deaths }}/{{ participant.assists }}</b>
                 <span class="participant-line__metric participant-line__damage"><strong>{{ number(participant.damageDealt) }}</strong><small>英雄伤害</small></span>
                 <span class="participant-line__metric participant-line__economy"><strong>{{ number(participant.goldEarned) }}</strong><small>{{ participant.cs }} 补刀</small></span>
@@ -727,6 +733,9 @@ function toggleFromRow(event: MouseEvent) {
 .participant-line > span:not(.participant-line__icons) { display: grid; gap: 2px; min-width: 0; }
 .participant-line small { color: var(--text-muted); font-size: 7px; }
 .participant-line__identity em { margin-left: 4px; color: var(--blue); font-size: 7px; font-style: normal; }
+/* 编号（`#16720`）跟在名字后面，用比名字弱、比副标题强的字重：
+   它是身份识别信息，不是装饰，所以不换行、也不省略。 */
+.participant-line__tag { margin-left: 1px; color: var(--text-muted); font-size: 8px; font-weight: 500; font-variant-numeric: tabular-nums; }
 .participant-line__icons { display: flex; align-items: center; gap: 2px; min-width: 0; overflow: hidden; }
 .participant-line__icons i { color: var(--text-muted); font-size: 7px; font-style: normal; }
 /* 装备整格按固定 7 个位置排队（20px × 7 + 间距 = 152px，与列宽一致）。

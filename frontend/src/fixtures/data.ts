@@ -369,6 +369,9 @@ function matchParticipants(index: number, win: boolean, selfTeam: number = TEAM_
       // 座位 0 正好是「我」（`allyNames[0]`），所以相遇档案（`ally.slice(1)`）天然不含自己。
       puuid: slot < 5 ? `fixture-ally-${slot}` : `fixture-enemy-${slot - 5}`,
       gameName: (slot < 5 ? allyNames : enemyNames)[slot % 5][0],
+      // `#编号` 也一起给：十人阵容要靠它把同名玩家分开，fixture 缺了这一段，
+      // 预览里就永远看不到那行小字（真机上 LCU/SGP 两侧的字段名还不一样，见类型注释）。
+      tagLine: (slot < 5 ? allyNames : enemyNames)[slot % 5][1],
       isBot: false,
       // 座位 0 = 我，英雄用这一局真实的那只（见上面的 `SELF_CHAMPION_BY_MATCH`）。
       championId: slot === 0 ? CHAMPION_IDS[selfChampionName] ?? championId : championId,
@@ -583,6 +586,11 @@ export function createFixtureChampionAbilityValues(alias: string): ChampionAbili
           // 客户端文案写 `@AOEModifier*100@%`：原始值 0.5，`percent` 为真。
           // 预览里能同时验到「*100 表达式」与「百分号只出现一次」。
           AOEModifier: { values: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], percent: true },
+          // 消耗层数的项（照龙王 Q 的真实形状抄）：正文 `@BurstBonusTrueDamageToChamps@`
+          // 印的是星尘数 2，回答「它按最大生命值算」靠 `ratioStat`——**注意没有 `ratio`**。
+          BurstBonusTrueDamageToChamps: { values: [2, 2, 2, 2, 2, 2, 2], ratioStat: "MaxHealth" },
+          // 系数逐级不同的那种（照金克丝 W 的形状抄）。
+          VariableRatioDamage: { values: [10, 45, 80, 115, 150], ratio: 1.4, ratios: [1.4, 1.5, 1.6, 1.7, 1.8], ratioStat: "AD" },
         },
       },
       {

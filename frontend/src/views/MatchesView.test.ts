@@ -12,7 +12,7 @@ import { fixtureConfig, fixtureMatches } from "../fixtures/data";
  */
 const { route, backendState } = vi.hoisted(() => ({
   route: { query: {} as Record<string, unknown> },
-  backendState: { matchRows: [] as unknown[] },
+  backendState: { matchRows: [] as unknown[], matchesError: "", regionProbe: null as unknown, searchCandidates: null as unknown },
 }));
 
 vi.mock("vue-router", () => ({
@@ -61,7 +61,10 @@ vi.mock("../stores/app", async () => {
 vi.mock("../services/backend", () => ({
   isTauri: () => false,
   backend: {
-    matches: async () => backendState.matchRows as never,
+    matches: async () => {
+      if (backendState.matchesError) throw new Error(backendState.matchesError);
+      return backendState.matchRows as never;
+    },
     encounters: async () => [],
     friends: async () => ({ groups: [], friends: [] }),
     matchDetail: async () => null,
@@ -74,7 +77,10 @@ vi.mock("../services/backend", () => ({
       query,
       hasTag: true,
       requiresTag: false,
-      candidates: [
+      regions: backendState.regionProbe ?? undefined,
+      // `searchCandidates` 置空数组可以造出「压根没解析到人」的形状：
+      // 那是「都没这个人」唯一有资格说出口的场合（见下面那两条用例）。
+      candidates: (backendState.searchCandidates ?? [
         {
           gameName: "对手",
           tagLine: "1234",
@@ -83,7 +89,7 @@ vi.mock("../services/backend", () => ({
           soloRank: { queueType: "RANKED_SOLO_5x5", tier: "DIAMOND", division: "IV", leaguePoints: 12, wins: 30, losses: 28 },
           flexRank: null,
         },
-      ],
+      ]) as never,
     }),
   },
 }));
@@ -134,6 +140,129 @@ describe("MatchesView 账号信息条", () => {
     expect(strip).toContain("—");
     expect(strip).not.toContain("未定级");
     expect(strip).not.toContain("Lv.318");
+  });
+});
+
+/**
+ * 「全大区搜索」必须看得见。
+ *
+ * 用户原话：「全大区搜索你最起码显示一下吧，说当前大区搜不到，然后在哪个正在搜哪个大区、
+ * 搜索结果什么的」。跨区玩家在本区是**搜得到人、查不到战绩**的，不把大区亮出来，
+ * 用户的结论就是「搜不到」。
+ */
+describe("MatchesView 的全大区搜索提示", () => {
+  const submitSearch = async (query: string) => {
+    route.query = { summoner: query };
+    const wrapper = mountView();
+    await flushPromises();
+    await wrapper.get(".matches-query-form").trigger("submit");
+    await flushPromises();
+    return wrapper;
+  };
+
+  it("定位到别的玩家在另一个大区时，列出搜过的大区与命中项", async () => {
+    backendState.regionProbe = {
+      located: "CQ100",
+      probed: [
+        { serverId: "TJ101", found: false },
+        { serverId: "TJ100", found: false },
+        { serverId: "CQ100", found: true },
+      ],
+    };
+    try {
+      const wrapper = await submitSearch("对手#1234");
+      const note = wrapper.get('[data-testid="matches-region-probe"]');
+
+      // 结论：搜了 3 个区、人在**联盟三区**（`CQ100`），并且说清楚**不是**本机所在的区。
+      //
+      // ⚠️ 这里的大区名只能是 `utils/format.ts` 那一份：`CQ100` 是「联盟三区」，
+      // `HN1` 是「艾欧尼亚」。以前战绩页自己抄过一张表，把它们写成「重庆一区」
+      // 和「河南一区」——名字错不会报错，只会让用户以为搜索坏了（用户实报）。
+      expect(note.text()).toContain("已搜索 3 个大区");
+      expect(note.text()).toContain("联盟三区");
+      // 本机大区取自 `connection.platformId`（这个用例里是 HN1 = 艾欧尼亚），
+      // 必须点明「命中的不是本机那个区」，否则用户还是不知道为什么要跨区取。
+      expect(note.text()).toContain("不是本机所在的艾欧尼亚");
+
+      // 逐区痕迹：3 个胶囊，只有命中那个标「命中」。
+      expect(note.findAll(".matches-region-probe__chip")).toHaveLength(3);
+      expect(note.findAll('.matches-region-probe__chip[data-found="true"]')).toHaveLength(1);
+      expect(note.get('.matches-region-probe__chip[data-found="true"]').text()).toContain("联盟三区");
+      // 错名字一个都不许再冒出来。
+      expect(note.text()).not.toContain("重庆一区");
+      expect(note.text()).not.toContain("河南一区");
+    } finally {
+      backendState.regionProbe = null;
+    }
+  });
+
+  /**
+   * **账号解析到了、逐区定位失败时，不许说「都没这个人」。**
+   *
+   * 这是 2026-10-03 用户实报形状的回归锁：精确匹配命中 1 个账号，下面紧接着
+   * 「8 个大区全问过一遍，都没这个人」—— 自相矛盾。人明明已经解析出来了，
+   * 真正的故障是**逐区定位**（`summoner-ledge`）没能问出他属于哪个大区，
+   * 而那句话把故障归因成了「这个人不存在」，方向完全错了。
+   */
+  it("账号已解析但逐区定位失败时，说的是定位失败而不是「没这个人」", async () => {
+    backendState.regionProbe = {
+      located: null,
+      probed: ["TJ101", "TJ100", "CQ100"].map((serverId) => ({ serverId, found: false })),
+    };
+    try {
+      const wrapper = await submitSearch("对手#1234");
+      const text = wrapper.get('[data-testid="matches-region-probe"]').text();
+
+      expect(text).toContain("都没能定位到这个账号");
+      expect(text).not.toContain("都没这个人");
+      expect(wrapper.findAll('.matches-region-probe__chip[data-found="true"]')).toHaveLength(0);
+    } finally {
+      backendState.regionProbe = null;
+    }
+  });
+
+  it("真的一个候选都没解析到时，才说各大区都没这个人", async () => {
+    backendState.regionProbe = {
+      located: null,
+      probed: ["TJ101", "TJ100", "CQ100"].map((serverId) => ({ serverId, found: false })),
+    };
+    backendState.searchCandidates = [];
+    try {
+      const wrapper = await submitSearch("查无此人#9999");
+      const text = wrapper.get('[data-testid="matches-region-probe"]').text();
+
+      expect(text).toContain("搜不到");
+      expect(text).toContain("都没这个人");
+      expect(text).not.toContain("定位");
+      expect(wrapper.findAll('.matches-region-probe__chip[data-found="true"]')).toHaveLength(0);
+    } finally {
+      backendState.regionProbe = null;
+      backendState.searchCandidates = null;
+    }
+  });
+
+  /**
+   * 取战绩失败必须说出来。
+   *
+   * 以前这里是**完全静默**的：`get_match_history` 抛错 → `rows` 是空数组 →
+   * 页面只剩一句「没有匹配的对局」。跨区玩家最容易撞上（解析成功、大区也定位到了，
+   * 死在取战绩那一步），用户看到的却是「搜不到人」。
+   */
+  it("取战绩失败时给出可操作的说明，而不是只留一个空列表", async () => {
+    backendState.matchesError = "LcuRequestFailed";
+    try {
+      route.query = {};
+      const wrapper = mountView();
+      await flushPromises();
+
+      const note = wrapper.get('[data-testid="matches-error"]');
+      expect(note.text()).toContain("取战绩失败");
+      expect(note.text()).toContain("跨区");
+      // 原始错误也要带上，方便反馈时定位。
+      expect(note.text()).toContain("LcuRequestFailed");
+    } finally {
+      backendState.matchesError = "";
+    }
   });
 });
 

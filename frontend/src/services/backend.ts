@@ -221,11 +221,27 @@ export const backend = {
     if (usesFixtureData()) return browserBackend.gameRecording(gameId);
     return command<GameRecording>("get_game_recording", { gameId });
   },
-  async asset(kind: "champion" | "item" | "spell" | "perk" | "profile", id: number): Promise<AssetPayload> {    if (usesFixtureData()) throw new Error("Fixture 使用静态资源");
+  /**
+   * 取图标 DTO。
+   *
+   * ⚠️ **空结果不留在 `assetRequests` 里**（2026-10-04 修）：这个 map 缓存的是
+   * promise，一旦某次取图返回空载荷（`dataUrl` 为空——例如那一瞬间 LCU 没连上、
+   * 或配额被打满导致请求失败），旧写法会把这个"空"的 promise 永久留在 map 里。
+   * 之后同一个 `kind:id` 再问，命中的还是那个空结果，图标就**再也不会加载**——
+   * 用户看到的正是「很多英雄头像现在完全加载不出来」（不是慢，是彻底没有）。
+   * 上层 `assets/assetCache.ts` 一向遵守"空结果不缓存"，这里当时漏了同一条规则；
+   * 对齐之后，下一次挂载/重试会真的重新发请求。
+   */
+  async asset(kind: "champion" | "item" | "spell" | "perk" | "profile", id: number): Promise<AssetPayload> {
+    if (usesFixtureData()) throw new Error("Fixture 使用静态资源");
     const key = `${kind}:${id}`;
     const cached = assetRequests.get(key);
     if (cached) return cached;
-    const request = command<AssetPayload>("get_asset", { kind, id }).catch((cause) => {
+    const request = command<AssetPayload>("get_asset", { kind, id }).then((payload) => {
+      // 空的 `dataUrl` 视为"这次没取到"，删掉缓存让下次能重试。
+      if (!payload?.dataUrl) assetRequests.delete(key);
+      return payload;
+    }).catch((cause) => {
       assetRequests.delete(key);
       throw cause;
     });
@@ -276,7 +292,11 @@ export const backend = {
     const key = `path:${target}`;
     const cached = assetRequests.get(key);
     if (cached) return cached;
-    const request = command<AssetPayload>("get_asset", { path: target }).catch((cause) => {
+    // 同 `asset`：空结果不留在缓存里，否则一次失败会把整个资源永久焊成空白。
+    const request = command<AssetPayload>("get_asset", { path: target }).then((payload) => {
+      if (!payload?.dataUrl) assetRequests.delete(key);
+      return payload;
+    }).catch((cause) => {
       assetRequests.delete(key);
       throw cause;
     });

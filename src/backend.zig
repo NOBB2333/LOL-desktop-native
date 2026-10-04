@@ -41,6 +41,11 @@ test {
     std.testing.refAllDecls(champion_abilities);
     // 同理：CommunityDragon 取值模块也只被 handler 表引用。
     std.testing.refAllDecls(champion_ability_values);
+    // 同一个坑的第三种形态：**本文件里**也有一个没人引用的 pub fn。
+    // `verifyLiveProfilePipeline` 只被 `src/verify_runtime.zig`（另一个模块）调用，
+    // 而本文件是测试构建的根模块——Zig 的惰性分析不会碰它，于是「测试全绿、exe 编不过」
+    // 完全可能发生在这一个函数里。取一次地址把它拉进分析范围。
+    _ = &verifyLiveProfilePipeline;
 }
 
 test "慢查询期间状态可读取且切换模式后旧结果被拒绝" {
@@ -227,6 +232,21 @@ const LivePersistSource = enum { lobby, champ_select };
 /// 在这段时间里不会被补上；现在只用它控制「多久检查一次」，是否真的重跑
 /// 由 `livePlayerProfileFresh` 按每位玩家的缓存 TTL 决定。
 const live_recheck_interval_ms: i64 = 5_000;
+/// 单名玩家在同一瞬间最多会挂几个**本地**（LCU）请求：段位 + 等级 + 战绩。
+///
+/// 身份补查排在它们之前、串行完成，所以不算进这个峰值（见 `writeLiveClientProfile`
+/// 里两个相邻的 `if` 块：先补身份，再并发拉段位 / 等级 / 战绩）。
+///
+/// 它和 `live_loading.Queue.max_concurrency` 一起决定批次的峰值并发，
+/// `profiles` 配额的取值就照这个乘积定（用例会替我们对齐，见文件末尾）。
+const live_profile_local_requests_per_player = 3;
+/// 整批有人失败时的重跑间隔。
+///
+/// 这个值本身就是观感的一部分：失败的那几位要等这么久才会再试一次，而界面上的
+/// 「加载中」只要还有人没凑齐就会一直转。所以要修的是**为什么会失败**
+/// （见 `runLiveLoadBatchInner` 里换 `profiles` 配额那段），而不是把这里改小——
+/// 改小只会把失败重试变成空转。
+const live_failure_retry_ms: i64 = 10_000;
 
 /// 快照落盘按时间节流。内存副本始终是最新的，SQLite 只用于冷启动恢复，
 /// 所以中间那些跳过的写入没有正确性代价；批次结束时由 `flushLiveLobbyPersist`
@@ -294,7 +314,9 @@ pub const command_table = [_]CommandSpec{
     // 技能文案里 `@变量@` 的逐级真实数值：只有 CommunityDragon 有（LCU 那份系数全是 0），
     // 所以走公网。上层按需拉、落盘缓存，见 backend/champion_ability_values.zig。
     .{ .name = "lol.get_champion_ability_values", .lane = .query },
-    .{ .name = "lol.get_asset", .lane = .query },
+    // 图标/头像取字节：一屏几百个、纯装饰、互相独立，单独一条 lane（多 worker）
+    // 免得挤掉交互式查询——用户点开英雄看技能时不该排在 200 个取图后面。
+    .{ .name = "lol.get_asset", .lane = .asset },
     .{ .name = "lol.get_encounters", .lane = .query },
     // 每人两次 LCU 往返，走 query 通道按需触发；上限见 backend/player_stats.zig。
     .{ .name = "lol.get_player_stats", .lane = .query },
@@ -1380,14 +1402,14 @@ const LiveLoadBatch = struct {
     /// 整批早退时的错误名（`@errorName`）。以前这种情况只会表现成
     /// 「0/10 人 · N 人待重试」，用户和我们都看不出到底哪一步挂了。
     error_name: []const u8 = "",
-    /// 十个人的**核心数据**是否已经发布（第一遍跑完）。
+    /// 十个人的**核心数据**是否已经发布（本地那遍跑完）。
     ///
     /// 与 `done` 分开：`done` 是「这批活全干完了」，还控制着下一次批次能不能
-    /// 启动，必须是第二遍也结束才算；而这个只用来**如实汇报进度**——第一遍
-    /// 发布之后界面就该显示「已加载 10/10」，不该把还在补标签的第二遍算进
+    /// 启动，必须连公网那遍也结束才算；而这个只用来**如实汇报进度**——本地那遍
+    /// 发布之后界面就该显示「已加载 10/10」，不该把还在补标签的公网那遍算进
     /// 「加载中」，否则用户看到的还是那个又涨到十几秒的计时器。
     cores_done: bool = false,
-    /// 第一遍发布完成的时刻，用来把界面上的「耗时」定格在核心数据就绪那一刻。
+    /// 本地那遍发布完成的时刻，用来把界面上的「耗时」定格在核心数据就绪那一刻。
     cores_ms: ?i64 = null,
     started_ms: i64,
     first_player_ms: ?i64 = null,
@@ -1484,7 +1506,7 @@ fn runLiveLoadBatch(batch: *LiveLoadBatch) void {
     if (batch.generation == batch.parent.live_generation and !batch.queue.cancelled.load(.acquire)) {
         // 失败仍需按 10s 重试；成功时不再整批封 60s，只留一个复查间隔，
         // 这样同局重连或新加入的玩家能被及时补上，是否真正重跑由每位玩家的缓存决定。
-        batch.parent.live_next_load_ms = batch.finished_ms.? + @as(i64, if (batch.failed > 0) 10_000 else live_recheck_interval_ms);
+        batch.parent.live_next_load_ms = batch.finished_ms.? + (if (batch.failed > 0) live_failure_retry_ms else live_recheck_interval_ms);
         batch.parent.live_lobby_enriched = batch.failed == 0;
     }
     flushLiveLobbyPersist(batch.parent);
@@ -1492,11 +1514,31 @@ fn runLiveLoadBatch(batch: *LiveLoadBatch) void {
     batch.done.store(true, .release);
 }
 
+/// 十人资料批次要用的客户端配置：换到 `profiles` 专属配额，并把单次请求超时
+/// 收到富化预算之内。
+///
+/// 为什么必须换配额：这个批次自己起线程跑（**不经过** bridge 的 lane worker），
+/// 所以它的请求默认落在 `.lcu` 的 6 个名额上——而 `.lcu` 同时被英雄图标、英雄
+/// 目录、技能数值这些交互请求占着。选人界面一打开就会发出上百个头像请求，
+/// 批次立刻被挤到队尾。更糟的是 `http_windows.request()` 的 deadline 在**取名额
+/// 之前**就定下了，排队时间直接从请求自己的 1800ms 里扣：排在队尾的请求还没发
+/// 出去就先判 `RequestTimedOut`，玩家记失败，整批于是推迟 `live_failure_retry_ms`
+/// （10 秒）重跑。选人阶段那个「查完要等十秒」就是这么来的。
+///
+/// `runLiveLoadBatchInner` 和 `verifyLiveProfilePipeline` 必须都走这个函数：
+/// 验证入口要是还挂在 `.lcu` 上，它量出来的就不是线上那条链路，
+/// 改造前后一样慢，量了也白量。
+fn configureLiveBatchClient(client: lcu.Client) lcu.Client {
+    var configured = client;
+    configured.budget = .profiles;
+    configured.timeout_ms = @min(client.timeout_ms, player_enrichment_timeout_ms);
+    return configured;
+}
+
 fn runLiveLoadBatchInner(batch: *LiveLoadBatch) !void {
     const self = batch.snapshot;
-    var client = try discoverClient(self, self.io.?);
+    var client = configureLiveBatchClient(try discoverClient(self, self.io.?));
     defer client.deinit();
-    client.timeout_ms = @min(client.timeout_ms, player_enrichment_timeout_ms);
     const current_json = try client.get("/lol-summoner/v1/current-summoner");
     defer std.heap.page_allocator.free(current_json);
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -1531,10 +1573,9 @@ fn runLiveLoadJobs(batch: *LiveLoadBatch, client: lcu.Client, current: std.json.
         if (shared_encounter) |*value| value.index.deinit();
     }
     var jobs: std.array_list.Managed(LiveProfileJob) = .init(allocator);
-    // **我方先发**：用户要的是先看见自己这 5 个人，所以把 5 个我方 job 排在最前面，
-    // 第一轮只让队列取到它们，跑完立刻发布。敌方第二轮补——但仍然是整队一次发布，
-    // 绝不逐人（逐人发布会让版本号一位玩家跳一次，界面就成「一个人一个人冒出来」）。
-    var ally_count: usize = 0;
+    // **我方先入队**：单人资料要花好几次串行往返，队列按下标递增取活，
+    // 所以把 5 个我方 job 排在最前面，四个 worker 一起手就先抓我方。
+    // 十人仍然在**同一次 `queue.run()`** 里跑完、只发布一次（见下面的说明）。
     for ([_][]const u8{ "ally", "enemy" }) |side| {
         const players = if (lobby == .object) lobby.object.get(side) else null;
         if (players == null or players.? != .array) continue;
@@ -1545,13 +1586,12 @@ fn runLiveLoadJobs(batch: *LiveLoadBatch, client: lcu.Client, current: std.json.
             if (!batch.force and livePlayerProfileFresh(self, player)) continue;
             var job = liveProfileJob(self, client, null, player, side, index, current, catalog, null);
             // 第一遍只走**本地**（LCU + 本地 2999）：SGP 战绩回落与「好抓 / 难抓」
-            // 的对局详情都是公网请求（全局并发只有 2），统一留到第三轮。
+            // 的对局详情都是公网请求（全局并发只有 2），统一留到最后一遍。
             job.remote = false;
             job.shared_sgp = &shared_sgp;
             job.shared_encounter = if (shared_encounter) |*value| value else null;
             job.output = try allocator.alloc(u8, live_profile_output_capacity);
             try jobs.append(job);
-            if (std.mem.eql(u8, side, "ally")) ally_count = jobs.items.len;
         }
     }
     batch.jobs = jobs.items;
@@ -1559,33 +1599,37 @@ fn runLiveLoadJobs(batch: *LiveLoadBatch, client: lcu.Client, current: std.json.
     lockBackendMutex(&batch.parent.command_mutex);
     batch.total = jobs.items.len;
     batch.parent.command_mutex.unlock();
-    // 第一轮：我方 5 人（纯本地数据），跑完立刻发布 —— 界面马上看到自己队伍。
-    if (ally_count > 0) {
-        batch.queue.count = ally_count;
+    // **一遍跑完十人（纯本地数据），跑完立刻整批发布。**
+    //
+    // 原先是「我方 5 人一轮 → 发布 → 敌方 5 人一轮 → 再发布」。两轮之间隔着一次
+    // `queue.run()` 的 join，那是一道硬栅栏：敌方第一个请求要等我方**最慢**的
+    // 那位落地才发得出去，十个人的耗时于是被串成 `max(我方) + max(敌方)`——
+    // 而这两段本来是可以重叠的。换成单轮后，谁先跑完就立刻接手下一个下标，
+    // 峰值并发（5 名玩家 × 每人 3 个请求）和两轮一样，墙钟时间却回落到
+    // 「两名玩家」的量级而不是「两段各自最慢」。
+    //
+    // 单轮还把发布从两次压成一次：每次发布都要在全局互斥量下把整份 244KB 快照
+    // 解析、逐人更新、再序列化，两次发布就是双倍的无谓开销，而且第二次发布
+    // 期间还会把 400ms 一次的进度轮询一起堵在锁上。
+    if (jobs.items.len > 0) {
+        batch.queue.count = jobs.items.len;
         batch.queue.next.store(0, .monotonic);
         batch.queue.run();
         publishLoadedProfiles(batch);
     }
-    // 第二轮：敌方补上，整个阵容再发布一次。
-    if (jobs.items.len > ally_count) {
-        batch.queue.count = jobs.items.len;
-        batch.queue.next.store(ally_count, .monotonic);
-        batch.queue.run();
-        publishLoadedProfiles(batch);
-    }
-    // 核心数据落地就算「加载完成」：第三轮补公网数据不再计入进度，界面上的
+    // 核心数据落地就算「加载完成」：最后一遍补公网数据不再计入进度，界面上的
     // 「加载中 10/10 人 · N 秒」到此定格，不会因为回落 / 标签还在拉就继续涨。
     lockBackendMutex(&batch.parent.command_mutex);
     batch.cores_done = true;
     batch.cores_ms = runtimeMonotonicMillis(batch.snapshot);
     batch.parent.command_mutex.unlock();
-    // 第三轮（公网遍）：SGP 战绩回落 +「好抓 / 难抓」的对局详情（每人最多 5 场）。
+    // 最后一遍（公网遍）：SGP 战绩回落 +「好抓 / 难抓」的对局详情（每人最多 5 场）。
     // 这是十人加载里唯一会把公网请求堆到几十个的地方，而公网并发全局只有 2——
     // 所以放到核心数据**发布之后**再跑，结果作为最后一次发布补上。用户明确说过
     // 这部分可以后到，不参与「瞬发」。这一遍全程命中刚写下的缓存
     // （段位 / 等级 / 战绩都还新鲜），只有真正需要公网的请求才是真的。
     if (jobs.items.len > 0) {
-        // 第一、二轮可能带 force（进入结算时强制刷新）。这一遍必须关掉它：
+        // 本地那几遍可能带 force（进入结算时强制刷新）。这一遍必须关掉它：
         // 刚写下的缓存正是要复用的，否则段位 / 战绩会被整份再拉一次。
         batch.snapshot.force_profile_refresh = false;
         for (jobs.items) |*job| {
@@ -1605,7 +1649,7 @@ fn loadLivePlayer(context: *anyopaque, index: usize) void {
     const batch: *LiveLoadBatch = @ptrCast(@alignCast(context));
     const job = &batch.jobs[index];
     runLiveProfileJob(job);
-    // 第二遍（补公网数据）只是附加内容：不参与进度统计，失败也不算失败。
+    // 最后一遍（补公网数据）只是附加内容：不参与进度统计，失败也不算失败。
     // 否则回落 / 标签拉不到会把十个人一起拖进 10 秒整批重试——那正是这次要修掉的现象。
     if (job.remote) return;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -1649,6 +1693,107 @@ fn publishLoadedProfiles(batch: *LiveLoadBatch) void {
     publishLiveProfiles(batch.parent, entries.items) catch {};
 }
 
+test "资料富化批次的配额要盖过它自己的峰值并发" {
+    // 批次峰值并发 = 5 名并发玩家 × 每人 3 个本地请求（段位 / 等级 / 战绩）。
+    //
+    // 为什么这条断言不是形式主义：`http_windows.request()` 的 deadline 是在
+    // **取名额之前**就定下的，排队等待的时间直接从请求自己的 `timeout_ms` 里扣。
+    // 配额一旦小于峰值，排在队尾的请求还没发出去就先判 `RequestTimedOut`，
+    // 玩家被记成失败、整批推迟 `live_failure_retry_ms`（10 秒）重跑——选人阶段
+    // 那个「查完要等十秒」的成因就在这里，而不是数据源慢。
+    const peak = live_loading.Queue.max_concurrency * live_profile_local_requests_per_player;
+    try std.testing.expect(lcu.transport.budgetLimit(.profiles) >= peak);
+    // 还必须比 `.lcu` 宽：`.lcu` 是交互请求（英雄图标 / 英雄目录 / 技能数值）走
+    // 的那条，批次单独开一条配额就是为了不和它们抢。
+    try std.testing.expect(lcu.transport.budgetLimit(.profiles) > lcu.transport.budgetLimit(.lcu));
+    // 反过来也要成立：批次不该从 `.lcu` 借名额，否则选人界面一开
+    // （上百个头像请求同时打进来）批次又会被挤回队尾。
+    try std.testing.expect(lcu.transport.budgetLimit(.lcu) < peak);
+    // 光有配额还不够，批次得真的**换过去**。这里断言的就是生产路径上的那个
+    // 配置函数：`lane` 仍是默认的 `.query`（推导出 `.lcu`），覆盖值必须赢——
+    // 它要是被忽略，前面几条配额断言全是空谈。
+    const discovered = lcu.Client{ .allocator = std.testing.allocator, .io = std.testing.io, .credentials = .{ .port = 0, .protocol = "http", .token = "" } };
+    try std.testing.expectEqual(lcu.transport.Budget.lcu, discovered.localBudget());
+    try std.testing.expectEqual(lcu.transport.Budget.profiles, configureLiveBatchClient(discovered).localBudget());
+}
+
+test "图标取字节独占一条 lane 与一条配额，不再挤交互式查询" {
+    // 这是 2026-10-04 那次性能修复的护栏。三件事必须同时成立，缺一条就等于没修：
+    //
+    // 1. `lol.get_asset` 的**派发** lane 是 `.asset`——否则一屏几百个取图又和
+    //    英雄目录 / 技能数值 / 阵容查询排在同一条 `query` 队列里。
+    // 2. `.asset` 的**配额**独立于 `.lcu`——否则 bridge 分开了、HTTP 层还是抢同一批名额。
+    // 3. `.asset` 这条 lane 的 worker 数 > 1——否则队列再分，消费端仍然是一个一个过，
+    //    前端再多并发也白搭（这正是这次要修的根因）。
+    try std.testing.expectEqual(lcu.RequestLane.asset, commandLane("lol.get_asset"));
+    try std.testing.expect(lcu.transport.budgetLimit(.asset) > 0);
+    // 配额必须和 `.lcu` 分开：相等或更小都说明还在同一条通道上抢名额。
+    try std.testing.expect(lcu.transport.budgetLimit(.asset) > lcu.transport.budgetLimit(.lcu));
+    // 图标客户端真的踩在 `.asset` 配额上（`discoverClient` 默认给的是 `.lcu`）。
+    try std.testing.expectEqual(lcu.transport.Budget.asset, blk: {
+        var client = lcu.Client{ .allocator = std.testing.allocator, .io = std.testing.io, .credentials = .{ .port = 0, .protocol = "http", .token = "" } };
+        client.budget = .asset;
+        break :blk client.localBudget();
+    });
+    // worker 数：图标与查询并行消费，其余 lane 保持单消费者（有顺序/状态语义）。
+    try std.testing.expect(lcu.lane_worker_count[@intFromEnum(lcu.RequestLane.asset)] > 1);
+    try std.testing.expect(lcu.lane_worker_count[@intFromEnum(lcu.RequestLane.query)] > 1);
+    try std.testing.expectEqual(@as(usize, 1), lcu.lane_worker_count[@intFromEnum(lcu.RequestLane.roster)]);
+    try std.testing.expectEqual(@as(usize, 1), lcu.lane_worker_count[@intFromEnum(lcu.RequestLane.action)]);
+}
+
+test "本地那遍十人只跑一轮：中途没有插入发布" {
+    var state = Runtime.init();
+    state.mode = .live;
+    // 5 名我方 + 5 名敌方，都不带 `dataComplete`，所以十个人全部会入队。
+    cacheLiveLobby(&state, "{\"id\":\"1\",\"phase\":\"ChampSelect\",\"ally\":[{\"puuid\":\"我方0\"},{\"puuid\":\"我方1\"},{\"puuid\":\"我方2\"},{\"puuid\":\"我方3\"},{\"puuid\":\"我方4\"}],\"enemy\":[{\"puuid\":\"敌方0\"},{\"puuid\":\"敌方1\"},{\"puuid\":\"敌方2\"},{\"puuid\":\"敌方3\"},{\"puuid\":\"敌方4\"}]}");
+    refreshLiveGeneration(&state);
+    const baseline = state.live_lobby_version;
+
+    // 探针顶替真正的资料抓取：它只关心「这个任务开始跑的时候快照版本是多少」。
+    //
+    // 版本在本地那遍中途变了 ⇒ 说明这遍被拆成了多轮、中间插了一次发布，
+    // 也就是「我方先冒出来、敌方再等一整轮」。那正是被测的行为，所以这里
+    // 不比对耗时、只钉住结构：一轮之内版本必须纹丝不动。
+    const Probe = struct {
+        batch: *LiveLoadBatch,
+        baseline: u64,
+        local_runs: std.atomic.Value(usize) = .init(0),
+        published_midway: std.atomic.Value(usize) = .init(0),
+        fn execute(pointer: *anyopaque, index: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(pointer));
+            const job = &self.batch.jobs[index];
+            // 公网那遍按 `loadLivePlayer` 的写法原地返回，不计入本地统计。
+            if (job.remote) return;
+            if (self.batch.parent.live_lobby_version != self.baseline) _ = self.published_midway.fetchAdd(1, .acq_rel);
+            _ = self.local_runs.fetchAdd(1, .acq_rel);
+            var buffer: [256]u8 = undefined;
+            // puuid 逐人不同，发布时才能按身份认人（全都写成同一个会被当成人没对上）。
+            const text = std.fmt.bufPrint(&buffer, "{{\"puuid\":\"{s}\",\"dataComplete\":true,\"dataStatus\":{{\"source\":\"lcu\"}}}}", .{jsonField(job.player, "puuid")}) catch return;
+            const output = job.output orelse return;
+            @memcpy(output[0..text.len], text);
+            job.output_len = text.len;
+        }
+    };
+    var batch = LiveLoadBatch{
+        .parent = &state,
+        .snapshot = &state,
+        .generation = state.live_generation,
+        .started_ms = 0,
+        .queue = .{ .count = 0, .context = undefined, .execute = Probe.execute },
+    };
+    var probe = Probe{ .batch = &batch, .baseline = baseline };
+    batch.queue.context = &probe;
+    const client = lcu.Client{ .allocator = std.testing.allocator, .io = std.testing.io, .credentials = .{ .port = 0, .protocol = "http", .token = "" } };
+    try runLiveLoadJobs(&batch, client, std.json.Value{ .null = {} }, std.json.Value{ .null = {} });
+
+    try std.testing.expectEqual(@as(usize, 10), probe.local_runs.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), probe.published_midway.load(.acquire));
+    try std.testing.expect(batch.cores_done);
+    // 本地那遍确实发布过一次（发布把版本号换成了新内容的哈希）。
+    try std.testing.expect(state.live_lobby_version != baseline);
+}
+
 pub fn verifyLiveProfilePipeline(io: std.Io, port: u16) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -1657,7 +1802,9 @@ pub fn verifyLiveProfilePipeline(io: std.Io, port: u16) !void {
     state.* = Runtime.init();
     state.mode = .live;
     state.io = io;
-    const client = lcu.Client{ .allocator = std.heap.page_allocator, .io = io, .credentials = .{ .port = port, .protocol = "http", .token = "验证凭据" } };
+    // 走和线上批次**同一份**客户端配置（配额 + 超时），否则这里量出来的耗时
+    // 反映的不是用户实际会遇到的那条链路。
+    const client = configureLiveBatchClient(lcu.Client{ .allocator = std.heap.page_allocator, .io = io, .credentials = .{ .port = port, .protocol = "http", .token = "验证凭据" } });
     var raw_players = std.json.Array.init(allocator);
     for (0..10) |index| {
         const json = try std.fmt.allocPrint(allocator, "{{\"puuid\":\"00000000-0000-0000-0000-000000000000\",\"riotIdGameName\":\"{s}{d}\",\"riotIdTagLine\":\"测试\",\"team\":\"{s}\",\"championId\":{d}}}", .{ if (index < 5) "我方" else "敌方", index % 5, if (index < 5) "ORDER" else "CHAOS", index + 1 });
@@ -1691,7 +1838,16 @@ pub fn verifyLiveProfilePipeline(io: std.Io, port: u16) !void {
             if (matches.len != 2 or jsonInt(matches[0], "gameId") != 1000 + number) return error.IncorrectPlayerHistory;
         }
     }
-    std.debug.print("原生十人资料验证：身份、英雄及战绩逐人对应，首名 {d} 毫秒，全部 {d} 毫秒\n", .{ batch.first_player_ms orelse 0, runtimeMonotonicMillis(state) - batch.started_ms });
+    // 把配额一起打出来：这组耗时的意义完全取决于批次有没有独占一条配额。
+    // 挂在 `.lcu`（6 名额）上时同一个批次能慢好几倍，只看毫秒数分不出这两种情况。
+    std.debug.print("原生十人资料验证：身份、英雄及战绩逐人对应，首名 {d} 毫秒，全部 {d} 毫秒（配额 {s}×{d}，{d} 人并发 × 每人 {d} 个请求）\n", .{
+        batch.first_player_ms orelse 0,
+        runtimeMonotonicMillis(state) - batch.started_ms,
+        @tagName(client.localBudget()),
+        lcu.transport.budgetLimit(client.localBudget()),
+        live_loading.Queue.max_concurrency,
+        live_profile_local_requests_per_player,
+    });
 }
 
 /// 一条待写入快照的玩家资料。
@@ -1828,8 +1984,8 @@ fn liveProgressResponse(self: *Runtime, output: []u8) ![]const u8 {
 fn writeLiveProgress(self: *Runtime, writer: *std.Io.Writer) !bool {
     const batch = self.live_load orelse return false;
     const current_batch = batch.generation == self.live_generation and !batch.queue.cancelled.load(.acquire);
-    // 「核心数据发完了」与「整批彻底结束」分开：第二遍只补「好抓/难抓」标签，
-    // 界面这时候应该已经是「已加载 10/10」，耗时也定格在第一遍结束的时刻。
+    // 「核心数据发完了」与「整批彻底结束」分开：公网那遍只补「好抓/难抓」标签，
+    // 界面这时候应该已经是「已加载 10/10」，耗时也定格在本地那遍结束的时刻。
     const cores_ready = batch.cores_done;
     const progress = .{
         .active = !(batch.done.load(.acquire) or cores_ready) or !current_batch,
@@ -2797,6 +2953,52 @@ fn getLiveRoster(context: *anyopaque, invocation: native_sdk.bridge.Invocation, 
     return result;
 }
 
+/// 用 Riot Client 的**全局**别名表把 `名字#TAG`（或只给名字）解析成 puuid。
+///
+/// 这是跨区查询的唯一入口：LCU 的 `?name=` 只覆盖当前登录大区，
+/// 别的区服的账号一律 404。实测同一台机器上 `一个人挺好的#67199`（TJ101）
+/// 在 LCU 两路都查不到，而 RC lookup 一次就命中。
+///
+/// 返回堆上分配的 puuid（调用方负责 free）；解析不到返回 null（不是错误）。
+fn resolvePuuidByRiotId(self: *Runtime, io: std.Io, query: []const u8) ?[]u8 {
+    _ = self;
+    const trimmed = std.mem.trim(u8, query, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const separator = std.mem.lastIndexOfScalar(u8, trimmed, '#');
+    const game_name = if (separator) |index| std.mem.trim(u8, trimmed[0..index], " \t\r\n") else trimmed;
+    const tag_line = if (separator) |index| std.mem.trim(u8, trimmed[index + 1 ..], " \t\r\n") else "";
+    if (game_name.len == 0) return null;
+
+    var riot_client = lcu.Client.discoverRiotClient(std.heap.page_allocator, io) catch return null;
+    defer riot_client.deinit();
+    var encoded_name: [1024]u8 = undefined;
+    var path_buffer: [2048]u8 = undefined;
+    const name_query = percentEncodeQuery(game_name, &encoded_name) catch return null;
+    const path = if (tag_line.len > 0) blk: {
+        var encoded_tag: [256]u8 = undefined;
+        const tag_query = percentEncodeQuery(tag_line, &encoded_tag) catch return null;
+        break :blk std.fmt.bufPrint(
+            &path_buffer,
+            "/player-account/aliases/v1/lookup?gameName={s}&tagLine={s}",
+            .{ name_query, tag_query },
+        ) catch return null;
+    } else std.fmt.bufPrint(
+        &path_buffer,
+        "/player-account/aliases/v1/lookup?gameName={s}",
+        .{name_query},
+    ) catch return null;
+    const body = riot_client.get(path) catch return null;
+    defer std.heap.page_allocator.free(body);
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, std.heap.page_allocator, body, .{}) catch return null;
+    if (parsed != .array) return null;
+    // 带 tag 时服务端只会回那一条；只给名字时可能回几十条同名，
+    // 取第一条（与前端「模糊查询列候选、用户再点」的交互一致）。
+    if (parsed.array.items.len == 0) return null;
+    const puuid = identityPuuid(parsed.array.items[0]);
+    if (puuid.len == 0) return null;
+    return std.heap.page_allocator.dupe(u8, puuid) catch null;
+}
+
 fn getMatches(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
     if (self.mode == .live) {
@@ -2835,20 +3037,74 @@ fn getMatches(context: *anyopaque, invocation: native_sdk.bridge.Invocation, out
             var target_owned: ?[]u8 = null;
             defer if (target_owned) |value| std.heap.page_allocator.free(value);
             var target = current;
+            // 权威 puuid：只要解析出来了就比「本机当前账号」更可信。
+            // 跨区账号**有** puuid（RC 全局认得），但本地 LCU 取不到它的召唤师对象（404）——
+            // 这时**必须**拿 puuid 直接去问战绩，不能退回按名字查（见下面那条 ⚠️）。
+            var subject_puuid: []const u8 = "";
+            // ⚠️ 这两块内存的 `defer` 必须挂在**这一层**，不能挂在下面那个
+            // `if (explicit_subject)` 块里：`resolved_puuid` 是指进它们的切片，
+            // 而 `subject_puuid`（= `resolved_puuid`）要到**块外面取战绩**时才用。
+            // 挂在块里 → 出块即释放 → 这里就是野指针（2026-10-03 复查发现）。
+            var mapped: ?[]u8 = null;
+            defer if (mapped) |value| std.heap.page_allocator.free(value);
+            var resolved_owned: ?[]u8 = null;
+            defer if (resolved_owned) |value| std.heap.page_allocator.free(value);
             if (explicit_subject) |subject| {
-                var encoded_buffer: [1536]u8 = undefined;
-                const encoded = percentEncodeQuery(subject, &encoded_buffer) catch return error.InvalidRiotId;
-                var target_path_buffer: [1792]u8 = undefined;
-                const target_path = std.fmt.bufPrint(&target_path_buffer, "/lol-summoner/v1/summoners?name={s}", .{encoded}) catch return error.InvalidRiotId;
-                target_owned = client.get(target_path) catch {
-                    if (cachedMatchesPageForSubject(self, explicit_subject, offset, page_size, output)) |cached| return cached;
-                    return error.SummonerLookupFailed;
-                };
-                const parsed_target = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), target_owned.?, .{}) catch return error.LcuInvalidResponse;
-                target = firstJsonValue(parsed_target);
+                // 解析查询串 → puuid。三级降级，**顺序不能换**：
+                //
+                // ① `search_summoner` 刚刚解析过的结果：它把 `historySubject` 映射写进了库。
+                //    用户在页面上点候选走进来时这条必然命中，而且它已经证明了「RC 全局限定过
+                //    这个 query」，比在这里重复解析更可靠。
+                // ② Riot Client 全局 lookup：跨区账号**只有它认得**。LCU 的 `?name=` 对
+                //    别的区服（如 TJ101）一律 404 —— 这一条就是「在别的软件能搜到、我这里搜不到」
+                //    的真因，光靠 ③ 永远补不上。
+                // ③ LCU `?name=`：同区账号兜底，也是 RC 没起来时唯一的退路。
+                mapped = if (self.storage) |*store| (store.get("historySubject", subject) catch null) else null;
+                var resolved_puuid: []const u8 = "";
+                if (mapped) |puuid| {
+                    if (puuid.len > 0) resolved_puuid = puuid;
+                }
+                if (resolved_puuid.len == 0) {
+                    resolved_owned = resolvePuuidByRiotId(self, io, subject);
+                    if (resolved_owned) |puuid| resolved_puuid = puuid;
+                }
+                if (resolved_puuid.len > 0) {
+                    // 补召唤师对象（只为拿等级/段位/名字）。**404 是预期内的**——
+                    // 本地 LCU 只服务本区，跨区账号必然取不到，那也不影响按 puuid 取战绩。
+                    var subject_path_buffer: [768]u8 = undefined;
+                    if (std.fmt.bufPrint(&subject_path_buffer, "/lol-summoner/v2/summoners/puuid/{s}", .{resolved_puuid})) |subject_path| {
+                        if (client.get(subject_path)) |body| {
+                            target_owned = body;
+                            const parsed_target = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{}) catch return error.LcuInvalidResponse;
+                            target = firstJsonValue(parsed_target);
+                        } else |_| {}
+                    } else |_| {}
+                }
+                // ⚠️ 只有**压根没解析出 puuid** 才退回按名字查。
+                //
+                // 2026-10-03 实测踩过：这里原来写成「`target` 还是本机账号就查名字」，
+                // 而跨区账号**恰好**满足这个条件（召唤师对象 404 → `target` 保持 `current`），
+                // 于是又去问 `?name=一个人挺好的#67199` → 同样 404 → `SummonerLookupFailed`，
+                // **已经拿到的 puuid 被白白丢掉、战绩一次都没发过**（界面表现：搜得到人、0 条战绩）。
+                if (resolved_puuid.len == 0) {
+                    var encoded_buffer: [1536]u8 = undefined;
+                    const encoded = percentEncodeQuery(subject, &encoded_buffer) catch return error.InvalidRiotId;
+                    var target_path_buffer: [1792]u8 = undefined;
+                    const target_path = std.fmt.bufPrint(&target_path_buffer, "/lol-summoner/v1/summoners?name={s}", .{encoded}) catch return error.InvalidRiotId;
+                    const lcu_body = client.get(target_path) catch {
+                        if (cachedMatchesPageForSubject(self, explicit_subject, offset, page_size, output)) |cached| return cached;
+                        return error.SummonerLookupFailed;
+                    };
+                    if (target_owned) |previous| std.heap.page_allocator.free(previous);
+                    target_owned = lcu_body;
+                    const parsed_target = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), lcu_body, .{}) catch return error.LcuInvalidResponse;
+                    target = firstJsonValue(parsed_target);
+                }
+                subject_puuid = resolved_puuid;
             }
 
-            const puuid = identityPuuid(target);
+            // 优先用解析出来的 puuid；没有才用召唤师对象上的（查自己 / 本区老路径）。
+            const puuid = if (subject_puuid.len > 0) subject_puuid else identityPuuid(target);
             if (puuid.len > 0) {
                 var path_buf: [512]u8 = undefined;
                 // LCU caches the first window requested for a PUUID. Always
@@ -2856,14 +3112,25 @@ fn getMatches(context: *anyopaque, invocation: native_sdk.bridge.Invocation, out
                 // result locally; otherwise an early dashboard request can
                 // pin every later page to one or three games.
                 const path = std.fmt.bufPrint(&path_buf, "/lol-match-history/v1/products/lol/{s}/matches?begIndex=0&endIndex=49", .{puuid}) catch return error.LcuInvalidResponse;
-                const lcu_history = client.get(path) catch {
+                // ⚠️ 这里**不能**在 LCU 失败时直接 `return`（2026-10-03 实测踩过）。
+                //
+                // 跨区账号的本地战绩接口回的是 **HTTP 400**
+                // （`match history plugin: could not find summoner info`），
+                // 原来 `client.get(path) catch return error.LcuRequestFailed` 直接把
+                // SGP 兜底（下一行）跳过了 —— 于是跨区玩家**永远**是 0 条战绩，
+                // 界面上连报错都看不到（错误被这一行吃掉了）。
+                //
+                // 所以：LCU 拿不到**不算失败**，交给 SGP（同区/跨区两条路）去兜；
+                // 只有两条都拿不到、缓存里也没有，才真的失败。
+                const lcu_history: ?[]u8 = client.get(path) catch null;
+                defer if (lcu_history) |history| std.heap.page_allocator.free(history);
+                // 本子区查不到时，才去**目标所在子区**再问一次（跨区玩家）。
+                const sgp_history: ?[]u8 = if (lcu_history != null and historyHasGames(lcu_history.?)) null else (fetchSgpHistory(client, current, lcu_history orelse "[]", puuid, 0, 50) catch null) orelse (fetchSgpHistoryCrossRegion(client, current, if (self.storage) |*slot| slot else null, puuid, 0, 50) catch null);
+                defer if (sgp_history) |history| std.heap.page_allocator.free(history);
+                const history = sgp_history orelse lcu_history orelse {
                     if (cachedMatchesPageForSubject(self, explicit_subject, offset, page_size, output)) |cached| return cached;
                     return error.LcuRequestFailed;
                 };
-                defer std.heap.page_allocator.free(lcu_history);
-                const sgp_history: ?[]u8 = if (historyHasGames(lcu_history)) null else fetchSgpHistory(client, current, lcu_history, puuid, 0, 50) catch null;
-                defer if (sgp_history) |history| std.heap.page_allocator.free(history);
-                const history = sgp_history orelse lcu_history;
                 var cached_catalog: ?[]u8 = null;
                 const champion_catalog = client.get("/lol-game-data/assets/v1/champion-summary.json") catch blk: {
                     if (self.storage) |*store| cached_catalog = store.get("cache", "champions") catch null;
@@ -2889,17 +3156,20 @@ fn getMatches(context: *anyopaque, invocation: native_sdk.bridge.Invocation, out
                     // A gateway response can be valid JSON but still use a
                     // shape the local DTO parser does not understand. Keep
                     // the LCU payload as a deterministic fallback.
-                    if (sgp_history != null) return matchHistoryDtoPageWithFilters(lcu_history, catalog_json, puuid, offset, page_size, runtimeHideUnfinishedMatches(self), runtimeRankedOnly(self), output) catch return err;
+                    // （LCU 那份可能压根没有——跨区账号就是这种情况，此时没有兜底可退。）
+                    if (sgp_history != null) if (lcu_history) |fallback| {
+                        return matchHistoryDtoPageWithFilters(fallback, catalog_json, puuid, offset, page_size, runtimeHideUnfinishedMatches(self), runtimeRankedOnly(self), output) catch return err;
+                    };
                     return err;
                 };
-                if (dto.len > 2 or sgp_history == null or !historyHasGames(lcu_history)) {
+                if (dto.len > 2 or sgp_history == null or lcu_history == null or !historyHasGames(lcu_history.?)) {
                     if (dto.len <= 2) if (cachedMatchesPageForSubject(self, explicit_subject, offset, page_size, output)) |cached| return cached;
                     return dto;
                 }
                 // Treat an empty SGP page as unavailable. This is common
                 // during an entitlement refresh and must not hide the LCU
                 // history that is already available locally.
-                return matchHistoryDtoPageWithFilters(lcu_history, catalog_json, puuid, offset, page_size, runtimeHideUnfinishedMatches(self), runtimeRankedOnly(self), output);
+                return matchHistoryDtoPageWithFilters(lcu_history.?, catalog_json, puuid, offset, page_size, runtimeHideUnfinishedMatches(self), runtimeRankedOnly(self), output);
             }
         }
         if (cachedMatchesPageForSubject(self, explicit_subject, offset, page_size, output)) |cached| return cached;
@@ -2912,15 +3182,31 @@ fn cachedMatchesPage(self: *Runtime, offset: usize, limit: usize, output: []u8) 
     return cachedMatchesPageForSubject(self, null, offset, limit, output);
 }
 
-/// 一次查询最多回这么多「名字#TAG」候选；本地 API 本身就是精确匹配，去重后远小于该值。
-const summoner_candidate_limit = 8;
+/// 一次查询最多回这么多「名字#TAG」候选。
+///
+/// 精确查询（`名字#标签`）去重后远小于该值；但**模糊查询**（只给名字）在大区多、
+/// 同名多的情况下会一下子回来一批，所以这个上限要留够，否则用户看不到想找的那个人。
+const summoner_candidate_limit = 40;
 
 const SummonerCandidate = struct {
     game_name: []const u8,
     tag_line: []const u8,
     puuid: []const u8,
-    /// 等级与段位都只从本地 LCU 取，因此**跨区候选拿不到**（见
-    /// `enrichSummonerCandidates`）。拿不到就是 null，不要退化成「无段位」。
+    /// 候选所在的 SGP 子区（`TJ101` / `NJ100` …）。同区候选为 null。
+    ///
+    /// 跨区搜索时这个字段是**唯一能区分两个同名玩家**的依据，必须带出去给前端。
+    sgp_server_id: ?[]const u8 = null,
+    /// `summoner-ledge` 实测定位到的子区，**本区也会填**。
+    ///
+    /// 与 `sgp_server_id` 的分工必须分清，否则会把本区玩家误当成跨区：
+    /// - `probed_region` 只用于**显示**（「这个人在联盟三区」）与**落库预热**；
+    /// - `sgp_server_id` 只用来决定**补全走哪条路**（LCU = 有段位 / SGP = 只有等级），
+    ///   所以**仅当定位结果不是本机子区时才设**。
+    ///
+    /// 之前没有这个区分：`sgp_server_id` 永远是 null（5 个调用点全传 null），于是
+    /// 跨区等级补不回来、候选没有大区标签、`playerSubjectRegion` 也从不落库。
+    probed_region: ?[]const u8 = null,
+    /// 等级从 LCU 或 SGP 取；两条路都拿不到就是 null。
     summoner_level: ?i64 = null,
     ranked: std.json.Value = .null,
 };
@@ -2936,10 +3222,68 @@ fn candidateNameMatches(returned: []const u8, expected: []const u8) bool {
     return std.ascii.eqlIgnoreCase(actual, std.mem.trim(u8, expected, " \t\r\n"));
 }
 
-/// 从 LCU `lol-summoner/v1/summoners?name=` 的响应里抽一个候选。
+/// 名字是否**包含**查询串（忽略大小写）——模糊查询用。
 ///
-/// 命中时是一个召唤师对象（`puuid`/`gameName`/`tagLine`），查不到时 LCU 直接 404；
-/// 两种失败都只是「没有候选」，由调用方决定怎么提示。
+/// ⚠️ 不能拿它当「精确命中」的判据：客户端返回的名字有时是空串（腾讯区服把昵称放在
+/// `displayName`，或者干脆不回），空串按包含处理会让任何查询都「命中」。
+/// 所以空串一律视为**不匹配**，让调用方决定要不要保留这个候选。
+fn candidateNameContains(returned: []const u8, expected: []const u8) bool {
+    const actual = std.mem.trim(u8, returned, " \t\r\n");
+    const needle = std.mem.trim(u8, expected, " \t\r\n");
+    if (actual.len == 0 or needle.len == 0) return false;
+    // 大小写无关的包含判断：ASCII 昵称占绝大多数，逐个字符比。
+    if (actual.len < needle.len) return false;
+    var start: usize = 0;
+    while (start + needle.len <= actual.len) : (start += 1) {
+        if (std.ascii.eqlIgnoreCase(actual[start .. start + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// 候选是否已存在（按 puuid 去重：LCU / RC / SGP 三条路都可能命中同一个人）。
+fn candidateDuplicated(candidates: []const SummonerCandidate, puuid: []const u8) bool {
+    for (candidates) |existing| {
+        if (std.mem.eql(u8, existing.puuid, puuid)) return true;
+    }
+    return false;
+}
+
+/// 把一条召唤师对象塞进候选表（puuid 去重）。
+///
+/// `expected_name` 非空时做**精确**名字校验（用于 LCU 那条会「忽略无效 name 直接回默认账号」
+/// 的危险路径）；为空则不做名字校验（用于 SGP/RC 这些已经按 puuid 定位过的来源）。
+fn pushSummonerCandidate(
+    allocator: std.mem.Allocator,
+    candidates: *[summoner_candidate_limit]SummonerCandidate,
+    count: *usize,
+    item: std.json.Value,
+    expected_name: []const u8,
+    sgp_server_id: ?[]const u8,
+) void {
+    if (count.* == summoner_candidate_limit) return;
+    if (item != .object) return;
+    const puuid = identityPuuid(item);
+    if (puuid.len == 0) return;
+    if (candidateDuplicated(candidates[0..count.*], puuid)) return;
+    // 腾讯区服的 `gameName` 经常是空的，昵称落在 `displayName`。
+    var game_name = jsonField(item, "gameName");
+    if (game_name.len == 0) game_name = jsonField(item, "displayName");
+    const tag_line = jsonField(item, "tagLine");
+    if (expected_name.len > 0 and !candidateNameMatches(game_name, expected_name)) return;
+    candidates[count.*] = .{
+        .game_name = allocator.dupe(u8, game_name) catch return,
+        .tag_line = allocator.dupe(u8, tag_line) catch return,
+        .puuid = allocator.dupe(u8, puuid) catch return,
+        .sgp_server_id = if (sgp_server_id) |id| (allocator.dupe(u8, id) catch null) else null,
+        .summoner_level = summonerLevelFromJson(item),
+    };
+    count.* += 1;
+}
+
+/// 从 LCU `lol-summoner/v1/summoners?name=` 的响应里抽一个候选（单对象）。
+///
+/// 只在**保留的兜底路径**上用；主力已经换成标量的 `POST /lol-summoner/v1/summoners/aliases`
+/// 与 RC 全局 lookup。查不到时 LCU 直接 404，两种失败都只是「没有候选」。
 fn appendSummonerCandidate(
     allocator: std.mem.Allocator,
     candidates: *[summoner_candidate_limit]SummonerCandidate,
@@ -2947,23 +3291,18 @@ fn appendSummonerCandidate(
     body: []const u8,
     expected_name: []const u8,
 ) void {
-    if (count.* == summoner_candidate_limit) return;
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, body, .{}) catch return;
-    const item = firstJsonValue(parsed);
-    if (item != .object) return;
-    const puuid = identityPuuid(item);
-    if (puuid.len == 0) return;
-    const game_name = if (jsonField(item, "gameName").len > 0) jsonField(item, "gameName") else jsonField(item, "displayName");
-    if (!candidateNameMatches(game_name, expected_name)) return;
-    candidates[count.*] = .{ .game_name = game_name, .tag_line = jsonField(item, "tagLine"), .puuid = puuid };
-    count.* += 1;
+    pushSummonerCandidate(allocator, candidates, count, firstJsonValue(parsed), expected_name, null);
 }
 
 /// 从 Riot Client `player-account/aliases/v1/lookup` 的响应里抽候选。
 ///
 /// 响应形如 `[{ "puuid": "...", "alias": { "game_name": ..., "tag_line": ... } }]`，
-/// 少数版本直接返回单个对象。名称一律取调用方传入的查询值：`alias` 内层字段命名
-/// 在不同版本间不稳定，而 RC 本身只做精确匹配，回填查询值不会失真。
+/// 少数版本直接返回单个对象。
+///
+/// ⚠️ `alias` 内层字段名在不同客户端版本间不稳定（`game_name` 对 `gameName`），
+/// 所以**内层取不到就回退到调用方传入的查询值**——查询值本来就是用户输入的
+/// 那个名字，回填不会失真；反而是硬读某个字段名会在换版本后整条路径哑掉。
 fn appendAliasCandidates(
     allocator: std.mem.Allocator,
     candidates: *[summoner_candidate_limit]SummonerCandidate,
@@ -2985,31 +3324,156 @@ fn appendAliasCandidates(
         if (count.* == summoner_candidate_limit) return;
         const puuid = identityPuuid(item);
         if (puuid.len == 0) continue;
-        // 同一个 puuid 只收一次：LCU 与 RC 两条路径都可能命中。
-        var duplicate = false;
-        for (candidates[0..count.*]) |existing| {
-            if (std.mem.eql(u8, existing.puuid, puuid)) duplicate = true;
+        if (candidateDuplicated(candidates[0..count.*], puuid)) continue;
+        // 先试内层 `alias`（两种命名都试），取不到就用调用方给的查询值。
+        const alias = jsonField(item, "alias");
+        // ⚠️ 必须显式写成 `[]const u8`：`var name = ""` 会把类型推成 `[0:0]u8`，
+        // 之后赋值 `[]const u8` 直接编译不过（`expected type '*const [0:0]u8'`）。
+        var name: []const u8 = "";
+        var tag: []const u8 = "";
+        if (alias.len > 0) {
+            const alias_parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, alias, .{}) catch null;
+            if (alias_parsed) |inner| {
+                name = jsonField(inner, "game_name");
+                if (name.len == 0) name = jsonField(inner, "gameName");
+                tag = jsonField(inner, "tag_line");
+                if (tag.len == 0) tag = jsonField(inner, "tagLine");
+            }
         }
-        if (duplicate) continue;
-        candidates[count.*] = .{ .game_name = game_name, .tag_line = tag_line, .puuid = puuid };
+        if (name.len == 0) name = game_name;
+        if (tag.len == 0) tag = tag_line;
+        candidates[count.*] = .{
+            .game_name = allocator.dupe(u8, name) catch continue,
+            .tag_line = allocator.dupe(u8, tag) catch continue,
+            .puuid = allocator.dupe(u8, puuid) catch continue,
+        };
         count.* += 1;
+    }
+}
+
+/// 用 Riot Client 的**全局**别名表把一个名字（可以不带 `#标签`）解析成一批候选。
+///
+/// 这是 AK `handleSearchByFuzzy` 的核心：`GET /player-account/aliases/v1/lookup`
+/// **只传 `gameName` 也能回一批结果**，因此「输一个名字就列出同名玩家」在这条路上是
+/// 可行的 —— 早先代码里那句「没有 name→tags 反向索引，做不到」是**错的**。
+///
+/// 返回是否成功发起（不代表一定有候选）。
+fn lookupAliasesByGameName(
+    allocator: std.mem.Allocator,
+    riot_client: *lcu.Client,
+    game_name: []const u8,
+    tag_line: []const u8,
+    candidates: *[summoner_candidate_limit]SummonerCandidate,
+    count: *usize,
+) bool {
+    var encoded_name: [1024]u8 = undefined;
+    var path_buffer: [2048]u8 = undefined;
+    const name_query = percentEncodeQuery(game_name, &encoded_name) catch return false;
+    // 带 tag 时把它一起带上（更精确）；不带 tag 时**不拼 `tagLine=` 参数**，
+    // 让服务端按 gameName 做前缀/模糊匹配，这正是「只给名字也能搜」的来源。
+    const path = if (tag_line.len > 0) blk: {
+        var encoded_tag: [256]u8 = undefined;
+        const tag_query = percentEncodeQuery(tag_line, &encoded_tag) catch return false;
+        break :blk std.fmt.bufPrint(
+            &path_buffer,
+            "/player-account/aliases/v1/lookup?gameName={s}&tagLine={s}",
+            .{ name_query, tag_query },
+        ) catch return false;
+    } else std.fmt.bufPrint(
+        &path_buffer,
+        "/player-account/aliases/v1/lookup?gameName={s}",
+        .{name_query},
+    ) catch return false;
+    const body = riot_client.get(path) catch return false;
+    defer std.heap.page_allocator.free(body);
+    appendAliasCandidates(allocator, candidates, count, body, game_name, tag_line);
+    return true;
+}
+
+/// 一次批量精确查询里的一条 `{ 名字, 标签 }`。
+///
+/// 必须是**具名**类型：Zig 里两个写法相同的匿名 struct **不是同一个类型**，
+/// 调用方声明一个匿名 struct 的数组传进来会直接编译失败。
+const SummonerNameTag = struct { game_name: []const u8, tag_line: []const u8 };
+
+/// 用 LCU **批量**精确查询接口取完整召唤师对象。
+///
+/// 这是 AK 的主力接口：`POST /lol-summoner/v1/summoners/aliases`，body 是
+/// `[{ "gameName": ..., "tagLine": ... }]`（最多一次一批）。它比
+/// `GET /lol-summoner/v1/summoners?name=` 强在两点：
+/// - **批量**：一次请求就能把 RC 回来的几十个候选一起补全；
+/// - **裸名必 422 的问题绕开了**：GET 只传名字会回 `INVALID_EMPTY_REQUEST`，
+///   而 POST 传 `{gameName}` 是合法请求，只是可能回空数组。
+///
+/// `expected` 用来做名字校验（LCU 忽略无效 name 时会回默认账号）。
+fn postSummonerAliasesBatch(
+    allocator: std.mem.Allocator,
+    client: lcu.Client,
+    names: []const SummonerNameTag,
+    candidates: *[summoner_candidate_limit]SummonerCandidate,
+    count: *usize,
+) void {
+    if (names.len == 0) return;
+    var body_buffer: [8192]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&body_buffer);
+    writer.writeAll("[") catch return;
+    for (names, 0..) |entry, index| {
+        if (index > 0) writer.writeAll(",") catch return;
+        writer.writeAll("{\"gameName\":") catch return;
+        jsonString(&writer, entry.game_name) catch return;
+        writer.writeAll(",\"tagLine\":") catch return;
+        jsonString(&writer, entry.tag_line) catch return;
+        writer.writeAll("}") catch return;
+    }
+    writer.writeAll("]") catch return;
+    const response = client.post("/lol-summoner/v1/summoners/aliases", writer.buffered()) catch return;
+    defer std.heap.page_allocator.free(response);
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, response, .{}) catch return;
+    if (parsed != .array) return;
+    for (parsed.array.items) |item| {
+        const returned_name = jsonField(item, "gameName");
+        // 一条批量请求里可能夹着别的名字（服务端宽松匹配），按名字回配：
+        // 只在请求里存在同名条目时才收，避免把不相干的人塞进候选。
+        var matched_request = false;
+        for (names) |entry| {
+            if (candidateNameMatches(returned_name, entry.game_name)) matched_request = true;
+        }
+        if (!matched_request) continue;
+        pushSummonerCandidate(allocator, candidates, count, item, "", null);
     }
 }
 
 /// 给候选补上等级与本 / 灵活段位。
 ///
-/// 只问本地 LCU：它只服务当前登录大区，所以**跨区候选取不到这两项**，字段会保持
-/// null。这是平台边界不是失败，前端据此显示「—」，不要伪装成「无段位」。
-/// 候选通常只有一个（一个 Riot ID 对应一个账号），所以逐个人肉调用成本可控。
-fn enrichSummonerCandidates(allocator: std.mem.Allocator, client: lcu.Client, candidates: []SummonerCandidate) void {
+/// 两条路：**同区候选**问本地 LCU（一次拿到等级 + 两个段位）；**跨区候选**本地 LCU
+/// 服务不了，改问那个区自己的 SGP `summoner-ledge`（拿得到等级，段位那个接口
+/// **不能跨区**，所以跨区候选的段位保持 null）。
+///
+/// `session_token` 是 SGP 跨区接口要的 `league-session` 令牌；拿不到（没有进行中的
+/// 对局）时跨区候选只剩名字，等级/段位都在前端显示「—」。这是平台边界不是失败。
+fn enrichSummonerCandidates(
+    allocator: std.mem.Allocator,
+    client: lcu.Client,
+    session_token: []const u8,
+    candidates: []SummonerCandidate,
+) void {
     for (candidates) |*candidate| {
         if (candidate.puuid.len == 0 or isNumericIdentity(candidate.puuid)) continue;
+        // 已经定位到外区（`summoner-ledge` 命中别的子区）→ 直接问那个区的 SGP。
+        if (candidate.sgp_server_id) |server_id| {
+            enrichCandidateFromSgp(allocator, client, session_token, server_id, candidate);
+            continue;
+        }
+        // 跨区候选：等级去它自己的区问 SGP。
+        var ranked_found = false;
+        var level_found = false;
         var path_buffer: [1280]u8 = undefined;
         if (std.fmt.bufPrint(&path_buffer, "/lol-ranked/v1/ranked-stats/{s}", .{candidate.puuid})) |path| {
             if (client.get(path)) |body| {
                 defer std.heap.page_allocator.free(body);
                 if (std.json.parseFromSliceLeaky(std.json.Value, allocator, body, .{})) |parsed| {
                     candidate.ranked = parsed;
+                    ranked_found = true;
                 } else |_| {}
             } else |_| {}
         } else |_| {}
@@ -3017,30 +3481,158 @@ fn enrichSummonerCandidates(allocator: std.mem.Allocator, client: lcu.Client, ca
             if (client.get(path)) |body| {
                 defer std.heap.page_allocator.free(body);
                 if (std.json.parseFromSliceLeaky(std.json.Value, allocator, body, .{})) |parsed| {
-                    candidate.summoner_level = summonerLevelFromJson(firstJsonValue(parsed));
+                    if (summonerLevelFromJson(firstJsonValue(parsed))) |level| {
+                        candidate.summoner_level = level;
+                        level_found = true;
+                    }
                 } else |_| {}
             } else |_| {}
         } else |_| {}
+        // ⚠️ **LCU 服务不了别的大区**（召唤师对象回 404）。所以「本地 LCU 拿不到」就是
+        // 「这个人在别的子区」的**决定性判据**，不需要我们再猜本机是哪个区。
+        // 这时用 `searchSummoner` 已经探到的那个子区去问 SGP（至少把等级补上；
+        // 段位跨区拿不到 —— SGP 的 `leagues-ledge` 明确不支持，保持 null）。
+        //
+        // 以前这条路根本走不到：`probed_region` 从不被填（`sgp_server_id` 恒为 null），
+        // 于是**所有跨区候选的等级永远显示「—」**。
+        if (!level_found and !ranked_found) if (candidate.probed_region) |region| {
+            enrichCandidateFromSgp(allocator, client, session_token, region, candidate);
+        };
     }
+}
+
+/// 把 `TENCENT_TJ101` 这类**带前缀的全区 id** 变成 SGP URL 里的子区。
+///
+/// AK 的 `_getSubId` 就是干这个的：`TENCENT` 开头时取 `_` 后面那段
+/// （`TENCENT_TJ101` → `TJ101`），非腾讯区原样返回。
+fn sgpSubId(server_id: []const u8) []const u8 {
+    if (std.ascii.startsWithIgnoreCase(server_id, "TENCENT_")) return server_id[8..];
+    return server_id;
+}
+
+/// 跨区候选的等级与名字：问候选**所在子区**的 SGP `summoner-ledge`。
+///
+/// 这是 AK `getSummoners(puuids, 'sgp', sgpServerId)` 的等价物，两个请求：
+/// - `POST /summoner-ledge/v1/regions/{subId}/summoners/puuids`（body 是 puuid 数组）
+///   → 拿等级；
+/// - `POST /player-account/lookup/v1/namesets-for-puuids`（body `{puuids:[]}`）
+///   → 拿权威 `gameName`/`tagLine`（SGP 那边不一定回名字）。
+///
+/// 注意 SGP 走的是 **`league-session` 令牌**（`/lol-league-session/v1/league-session-token`），
+/// 和战绩用的 `entitlements` 令牌是**两套**，不能混用。
+///
+/// 段位**不在这里补**：AK 的 `leagues-ledge/v2/rankedStats` 注释明确写了「此 API 无法跨区」。
+/// 所以跨区候选只有等级，段位保持 null。
+fn enrichCandidateFromSgp(
+    allocator: std.mem.Allocator,
+    client: lcu.Client,
+    token: []const u8,
+    server_id: []const u8,
+    candidate: *SummonerCandidate,
+) void {
+    if (token.len == 0) return;
+    const sub_id = sgpSubId(server_id);
+    const host = sgpHostForSubId(sub_id) orelse return;
+
+    // ① 等级：SGP summoner-ledge。
+    var url_buffer: [1024]u8 = undefined;
+    if (std.fmt.bufPrint(
+        &url_buffer,
+        "https://{s}/summoner-ledge/v1/regions/{s}/summoners/puuids",
+        .{ host, sub_id },
+    )) |url| {
+        var body_buffer: [512]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&body_buffer);
+        writer.writeAll("[") catch return;
+        jsonString(&writer, candidate.puuid) catch return;
+        writer.writeAll("]") catch return;
+        if (client.postBearerUrl(url, token, sgp_user_agent, writer.buffered())) |response| {
+            defer std.heap.page_allocator.free(response);
+            if (std.json.parseFromSliceLeaky(std.json.Value, allocator, response, .{})) |parsed| {
+                if (parsed == .array and parsed.array.items.len > 0 and parsed.array.items[0] == .object) {
+                    // SGP `summoner-ledge` 的等级字段叫 `level`（不是 LCU 的
+                    // `summonerLevel`）——只读后者会让跨区候选的等级永远显示「—」。
+                    const raw_level = jsonInt(parsed.array.items[0], "level");
+                    candidate.summoner_level = if (raw_level > 0)
+                        @as(i64, raw_level)
+                    else
+                        summonerLevelFromJson(parsed.array.items[0]);
+                }
+            } else |_| {}
+        } else |_| {}
+    } else |_| {}
+
+    // ② 权威名字：RC namesets（全局接口，不分子区）。
+    if (lookupNamesetForPuuid(allocator, client, candidate.puuid)) |found| {
+        if (found.game_name.len > 0) candidate.game_name = found.game_name;
+        if (found.tag_line.len > 0) candidate.tag_line = found.tag_line;
+    }
+    candidate.sgp_server_id = allocator.dupe(u8, server_id) catch candidate.sgp_server_id;
+}
+
+/// `POST /player-account/lookup/v1/namesets-for-puuids` 取单个 puuid 的权威名字。
+///
+/// 响应形如 `{ "namesets": [{ "puuid": ..., "gnt": { "gameName": ..., "tagLine": ... } }] }`。
+/// 名字字段几个版本间在 `gnt` / 顶层之间飘，所以两个地方都试。
+fn lookupNamesetForPuuid(
+    allocator: std.mem.Allocator,
+    riot_client: lcu.Client,
+    puuid: []const u8,
+) ?struct { game_name: []const u8, tag_line: []const u8 } {
+    if (puuid.len == 0) return null;
+    var body_buffer: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&body_buffer);
+    writer.writeAll("{\"puuids\":[") catch return null;
+    jsonString(&writer, puuid) catch return null;
+    writer.writeAll("]}") catch return null;
+    const response = riot_client.post(
+        "/player-account/lookup/v1/namesets-for-puuids",
+        writer.buffered(),
+    ) catch return null;
+    defer std.heap.page_allocator.free(response);
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, response, .{}) catch return null;
+    const namesets = firstJsonValue(parsed);
+    if (namesets != .array or namesets.array.items.len == 0) return null;
+    const entry = namesets.array.items[0];
+    if (entry != .object) return null;
+    // 先试内层 `gnt`，再退回顶层。
+    var name: []const u8 = "";
+    var tag: []const u8 = "";
+    const inner = jsonField(entry, "gnt");
+    if (inner.len > 0) {
+        if (std.json.parseFromSliceLeaky(std.json.Value, allocator, inner, .{})) |gnt| {
+            name = jsonField(gnt, "gameName");
+            tag = jsonField(gnt, "tagLine");
+        } else |_| {}
+    }
+    if (name.len == 0) name = jsonField(entry, "gameName");
+    if (tag.len == 0) tag = jsonField(entry, "tagLine");
+    if (name.len == 0) return null;
+    return .{ .game_name = name, .tag_line = tag };
 }
 
 /// 把一个「可能不完整」的召唤师查询解析成候选列表。
 ///
-/// ## 平台现实（决定了这个命令能做什么、不能做什么）
+/// 移植自 LeagueAkari `useSummonerSearch`（`searchType` 三分支），三条路对应三种输入：
 ///
-/// 本机有两个查询入口，覆盖面不同：
-/// - LCU `lol-summoner/v1/summoners?name=`：**只覆盖当前登录大区**，且只回一个人；
-///   裸名和完整 `名字#TAG` 它都收。
-/// - Riot Client `player-account/aliases/v1/lookup?gameName=&tagLine=`：**全局**，
-///   但必须同时给 gameName **和** tagLine 两个字段（见 `rank-analysis` 的
-///   `resolve_puuid_by_riot_id`，注释里明确写了「全区查询必须带 TAG」）。
+/// - **puuid**（`^[0-9a-fA-F]{8}-…$`）：直接按 puuid 取召唤师，不做名字匹配。
+/// - **exact**（含 `#`，形如 `名字#TAG`）：**先 RC 全局 lookup**，拿到 puuid 后
+///   同区走 LCU、跨区遍历腾讯 7 个 SGP 子区。
+/// - **fuzzy**（只有名字）：**RC `player-account/aliases/v1/lookup` 只传 `gameName`**，
+///   它会回一批同名玩家 —— 这正是「输一个名字列出所有同名」的实现方式。
 ///
-/// 所以「只给一个名字、把某个名字在所有大区的所有 TAG 枚举出来」在本地 API 上做不到
-/// ——没有任何接口提供 name→tags 的反向索引（WeGame 那种同名全服搜索是服务端聚合，
-/// 本机拿不到）。这个命令能提供的是：
-/// - 带 `#TAG` 时走 RC 全局解析，**不受当前大区限制**；
-/// - 只给名字时退化成一次 LCU 裸名查询（少数版本能解析唯一名字），失败就回空候选并
-///   置 `requiresTag`，由前端提示「需要完整 Riot ID」。
+/// ## 为什么以前「有些人搜不到」
+///
+/// 老实现只有两条路，都有洞：
+/// 1. 裸名走 `GET /lol-summoner/v1/summoners?name=`，这个接口**只覆盖当前登录大区**，
+///    而且实测裸名会直接回 **422 INVALID_EMPTY_REQUEST**（它要求完整 Riot ID）→ 只给名字时
+///    基本必然搜不到；
+/// 2. RC lookup **永远被拼上 `tagLine=`**，于是「模糊匹配」这条路根本没被用到；
+/// 3. 跨区完全没做：`#TAG` 只查一次 RC，瑞丽的人能被 RC 认出来，但**等级/名字补不上**
+///    （本地 LCU 服务不了别的大区）。
+///
+/// 现在按 AK 的接口原样来：`POST /lol-summoner/v1/summoners/aliases`（批量精确）、
+/// RC aliases（模糊 + 跨区解析）、SGP `summoner-ledge`（跨区等级）。
 fn searchSummoner(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     const self = runtime(context);
     const request_json = parsePayload(struct { query: []const u8 = "" }, invocation.request.payload) catch return error.InvalidRequest;
@@ -3053,6 +3645,9 @@ fn searchSummoner(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     const game_name = if (separator) |index| std.mem.trim(u8, raw[0..index], " \t\r\n") else raw;
     const tag_line = if (separator) |index| std.mem.trim(u8, raw[index + 1 ..], " \t\r\n") else "";
     const has_tag = game_name.len > 0 and tag_line.len > 0;
+    const is_puuid_input = separator == null and looksLikePuuid(raw);
+    // 只有「一个合法名字 + 没有 tag」才算模糊查询。
+    const is_fuzzy = !is_puuid_input and !has_tag and game_name.len > 0;
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -3060,62 +3655,141 @@ fn searchSummoner(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
 
     var candidates: [summoner_candidate_limit]SummonerCandidate = undefined;
     var count: usize = 0;
+    // 跨区定位的痕迹。**必须挂在 live 分支外面**：写响应那一段在分支之外，
+    // 挂进去就成不了作用域（跨区搜索的结果要一路带到 JSON 里给前端）。
+    var region_log = RegionProbeLog{};
+    var located_buffer: [16]u8 = undefined;
+    var located_len: usize = 0;
 
     if (self.mode == .live) if (self.io) |io| {
-        if (has_tag) {
-            // 首选 RC：跨区，且不受当前登录大区限制。
-            if (lcu.Client.discoverRiotClient(std.heap.page_allocator, io)) |found| {
-                var riot_client = found;
-                defer riot_client.deinit();
-                riot_client.timeout_ms = runtimeRequestTimeoutMs(self);
-                riot_client.verify_tls = build_options.lcu_verify_tls;
-                riot_client.control = snapshotControl(self);
-                riot_client.lane = self.snapshot_lane;
-                var encoded_name: [1024]u8 = undefined;
-                var encoded_tag: [256]u8 = undefined;
-                var path_buffer: [2048]u8 = undefined;
-                const name_query = percentEncodeQuery(game_name, &encoded_name) catch null;
-                const tag_query = percentEncodeQuery(tag_line, &encoded_tag) catch null;
-                if (name_query != null and tag_query != null) {
-                    const path = std.fmt.bufPrint(
-                        &path_buffer,
-                        "/player-account/aliases/v1/lookup?gameName={s}&tagLine={s}",
-                        .{ name_query.?, tag_query.? },
-                    ) catch null;
-                    if (path) |lookup_path| {
-                        if (riot_client.get(lookup_path)) |body| {
-                            defer std.heap.page_allocator.free(body);
-                            appendAliasCandidates(allocator, &candidates, &count, body, game_name, tag_line);
-                        } else |_| {}
-                    }
-                }
-            } else |_| {}
+        // ---- RC（全局）：模糊枚举 + 精确跨区解析，都从这里起步 ----
+        var riot_client_storage: ?lcu.Client = null;
+        if (lcu.Client.discoverRiotClient(std.heap.page_allocator, io)) |found| {
+            riot_client_storage = found;
+        } else |_| {}
+        if (riot_client_storage) |*riot_client| {
+            defer riot_client.deinit();
+            riot_client.timeout_ms = runtimeRequestTimeoutMs(self);
+            riot_client.verify_tls = build_options.lcu_verify_tls;
+            riot_client.control = snapshotControl(self);
+            riot_client.lane = self.snapshot_lane;
+
+            if (is_fuzzy) {
+                // ✅ 模糊：**不拼 `tagLine=`**，服务端按 gameName 回一批同名玩家。
+                _ = lookupAliasesByGameName(allocator, riot_client, game_name, "", &candidates, &count);
+            } else if (has_tag) {
+                // ✅ 精确：RC 全局解析（别名全区唯一，跨区也能认出来）。
+                _ = lookupAliasesByGameName(allocator, riot_client, game_name, tag_line, &candidates, &count);
+            }
         }
-        // RC 不可用 / 未命中时退回 LCU。带 TAG 时按完整 Riot ID 查；只给名字时按裸名查。
-        if (count == 0) {
-            const subject = if (has_tag) raw else game_name;
+
+        // ---- LCU（本区）：精确查询的兜底 + 跨区补全的本地那一半 ----
+        if (self.io) |_| {
             if (discoverClient(self, io)) |found| {
                 var client = found;
                 defer client.deinit();
-                var encoded_buffer: [1024]u8 = undefined;
-                if (percentEncodeQuery(subject, &encoded_buffer)) |encoded| {
+                client.timeout_ms = runtimeRequestTimeoutMs(self);
+                client.verify_tls = build_options.lcu_verify_tls;
+                client.control = snapshotControl(self);
+                client.lane = self.snapshot_lane;
+
+                if (has_tag and count == 0) {
+                    // RC 没认出来（例如 RC 不可用）：退回 LCU 批量精确接口。
+                    // 走 POST 而不是 `GET ?name=`：后者裸名必 422，批量 POST 才是 AK 的主力。
+                    postSummonerAliasesBatch(
+                        allocator,
+                        client,
+                        &.{.{ .game_name = game_name, .tag_line = tag_line }},
+                        &candidates,
+                        &count,
+                    );
+                } else if (is_puuid_input) {
+                    // puuid 输入：LCU 按 puuid 直接取。
                     var path_buffer: [1280]u8 = undefined;
-                    if (std.fmt.bufPrint(&path_buffer, "/lol-summoner/v1/summoners?name={s}", .{encoded})) |path| {
+                    if (std.fmt.bufPrint(&path_buffer, "/lol-summoner/v2/summoners/puuid/{s}", .{raw})) |path| {
                         if (client.get(path)) |body| {
                             defer std.heap.page_allocator.free(body);
-                            appendSummonerCandidate(allocator, &candidates, &count, body, game_name);
+                            appendSummonerCandidate(allocator, &candidates, &count, body, "");
                         } else |_| {}
                     } else |_| {}
-                } else |_| {}
+                } else if (is_fuzzy and count > 0) {
+                    // 模糊已经把候选枚举出来了，但 RC 的名字不全 → 用 LCU 批量补齐本区的那些人。
+                    var names_buffer: [summoner_candidate_limit]SummonerNameTag = undefined;
+                    var names_len: usize = 0;
+                    for (candidates[0..count]) |candidate| {
+                        if (names_len == names_buffer.len) break;
+                        if (candidate.tag_line.len == 0) continue;
+                        names_buffer[names_len] = .{ .game_name = candidate.game_name, .tag_line = candidate.tag_line };
+                        names_len += 1;
+                    }
+                    if (names_len > 0) postSummonerAliasesBatch(allocator, client, names_buffer[0..names_len], &candidates, &count);
+                }
             } else |_| {}
         }
-        // 等级与段位只在这里补一次，两条解析路径共用同一份逻辑。
+
+        // ---- 跨区定位：把这个 puuid 落到具体的腾讯子区 ----
+        //
+        // ⚠️ 这一步以前**等于不存在**：`candidate.sgp_server_id` 的 5 个调用点全传 null，
+        // 唯一给它赋值的地方（`enrichCandidateFromSgp` 末行）又在一个「要求它已经非空」
+        // 的分支里 —— 死代码。后果是三连：
+        //   1. 跨区候选补不了等级（永远「—」）；
+        //   2. 候选没有大区标签，同名的两个人分不开（用户：「也没显示你说的所在大区」）；
+        //   3. **定位结果从不落库** —— `get_matches` 每次都要重新探 8 个子区，
+        //      而它只在「取战绩成功之后」才写 `playerSubjectRegion`，所以任何一次取失败
+        //      都等于白探，用户看到的就是「搜得到人、战绩打不开」。
+        // 现在这里顺手把 `playerSubjectRegion` 预热好，`get_matches` 直接一步取。
+        // ---- 等级 / 段位补全：同区问 LCU，跨区问候选自己的 SGP ----
         if (count > 0) {
             if (discoverClient(self, io)) |found| {
                 var client = found;
                 defer client.deinit();
-                enrichSummonerCandidates(allocator, client, candidates[0..count]);
+                client.timeout_ms = runtimeRequestTimeoutMs(self);
+                client.verify_tls = build_options.lcu_verify_tls;
+                client.control = snapshotControl(self);
+                client.lane = self.snapshot_lane;
+
+                // 跨区部分要用 `league-session` 令牌（和 `entitlements` 是两套）。
+                const session_token = leagueSessionToken(&client) orelse "";
+                defer if (session_token.len > 0) std.heap.page_allocator.free(session_token);
+
+                // 只对**精确 / puuid** 查询逐区定位：模糊查询一次可能回来几十个同名，
+                // 逐个探 8 个子区就是 8×N 个请求，成本不成比例
+                // （AK 的 `useSummonerSearch` 同样只对精确查询做跨区兜底）。
+                if ((has_tag or is_puuid_input) and session_token.len > 0) {
+                    for (candidates[0..count]) |*candidate| {
+                        if (candidate.puuid.len == 0 or isNumericIdentity(candidate.puuid)) continue;
+                        var sub_buffer: [16]u8 = undefined;
+                        var sub_len: usize = 0;
+                        var level: i64 = 0;
+                        if (!probeTencentSubRegionLogged(client, session_token, client.credentials.platformId(), candidate.puuid, &sub_buffer, &sub_len, &level, &region_log)) continue;
+                        const sub_id = sub_buffer[0..sub_len];
+                        candidate.probed_region = allocator.dupe(u8, sub_id) catch null;
+                        if (level > 0 and candidate.summoner_level == null) candidate.summoner_level = level;
+                        if (located_len == 0 and sub_id.len <= located_buffer.len) {
+                            @memcpy(located_buffer[0..sub_id.len], sub_id);
+                            located_len = sub_id.len;
+                        }
+                        // 落库预热：`get_matches` 下次直接去这个子区取战绩，不用再探 8 次。
+                        if (self.storage) |*store| store.put("playerSubjectRegion", candidate.puuid, sub_id) catch {};
+                    }
+                }
+
+                enrichSummonerCandidates(allocator, client, session_token, candidates[0..count]);
             } else |_| {}
+        }
+
+        // 把「查询串 → puuid」记下来，供 `get_matches` 复用。
+        //
+        // 这一步是**跨区战绩能打开的关键**：`get_matches` 拿到的还是前端传回来的原始
+        // 查询串（`名字#TAG`），它自己解析时本地 LCU 对别的区服一律 404。这里把
+        // `search_summoner` 已经证实过的映射落库，`get_matches` 就能一步取到 puuid。
+        //
+        // 只在唯一命中时写：模糊查询回来几十个同名，随便挑一个写进去会让
+        // `get_matches` 和用户点选的结果对不上。
+        if (count == 1) {
+            if (self.storage) |*store| {
+                store.put("historySubject", raw, candidates[0].puuid) catch {};
+            }
         }
     };
 
@@ -3124,9 +3798,33 @@ fn searchSummoner(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     try jsonString(&writer, raw);
     try writer.writeAll(",\"hasTag\":");
     try writer.writeAll(if (has_tag) "true" else "false");
-    // 没拿到候选、而且用户只给了名字 → 前端据此提示「需要完整的名字#TAG」。
+    // 只有「没带 tag、也没拿到任何候选」才提示需要完整 Riot ID。
+    // 模糊查询现在真的能列出同名玩家了（RC 全局 lookup），所以这个标志比老版本罕见得多。
     try writer.writeAll(",\"requiresTag\":");
-    try writer.writeAll(if (!has_tag and count == 0) "true" else "false");
+    try writer.writeAll(if (is_fuzzy and count == 0) "true" else "false");
+    try writer.writeAll(",\"searchType\":");
+    try jsonString(&writer, if (is_puuid_input) "puuid" else if (has_tag) "exact" else "fuzzy");
+    // 「全大区搜索」的过程与结论。
+    //
+    // 用户明确要求把这件事显示出来：「全大区搜索你最起码显示一下吧，说当前大区搜不到，
+    // 然后在哪个正在搜哪个大区、搜索结果什么的」。bridge 是请求/响应式的，没法中途推进度，
+    // 所以把**逐区结果**一次带出去，界面落地后就能如实列出「搜了哪几个区、哪个命中」，
+    // 而不是只给一个空列表让人猜。
+    //
+    // `probed` 命中即止，所以它的条数就是真实发出的 `summoner-ledge` 请求数
+    // （顺序 = `tencent_sub_ids`，本机子区排第一）。
+    try writer.writeAll(",\"regions\":{\"located\":");
+    if (located_len > 0) try jsonString(&writer, located_buffer[0..located_len]) else try writer.writeAll("null");
+    try writer.writeAll(",\"probed\":[");
+    for (region_log.slice(), 0..) |entry, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writer.writeAll("{\"serverId\":");
+        try jsonString(&writer, entry.sub_id);
+        try writer.writeAll(",\"found\":");
+        try writer.writeAll(if (entry.found) "true" else "false");
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]}");
     try writer.writeAll(",\"candidates\":[");
     for (candidates[0..count], 0..) |candidate, index| {
         if (index > 0) try writer.writeAll(",");
@@ -3142,6 +3840,16 @@ fn searchSummoner(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
         } else {
             try writer.writeAll("null");
         }
+        // 跨区候选带出它所在的子区（`TJ101` …），同区为 null。
+        // ⚠️ 前端**必须**用它来区分同名玩家：名字相同但子区不同 = 两个人。
+        try writer.writeAll(",\"sgpServerId\":");
+        // 优先给「实测定位到的子区」：本区的人也会带上（`TJ101`），
+        // 界面上就能显示「本区已搜索 · 联盟五区」而不是一片空白。
+        if (candidate.probed_region orelse candidate.sgp_server_id) |server_id| {
+            try jsonString(&writer, server_id);
+        } else {
+            try writer.writeAll("null");
+        }
         // 同大区才有；跨区候选两项都写 null，前端显示「—」。
         try writer.writeAll(",\"soloRank\":");
         try writeRank(&writer, candidate.ranked, "RANKED_SOLO_5x5");
@@ -3151,6 +3859,37 @@ fn searchSummoner(context: *anyopaque, invocation: native_sdk.bridge.Invocation,
     }
     try writer.writeAll("]}");
     return writer.buffered();
+}
+
+/// 输入是否是合法的 puuid（UUID v4 形状）。AK `isPuuid` 的 Zig 版。
+fn looksLikePuuid(value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len != 36) return false;
+    for (trimmed, 0..) |character, index| {
+        const is_dash = index == 8 or index == 13 or index == 18 or index == 23;
+        if (is_dash) {
+            if (character != '-') return false;
+        } else if (!std.ascii.isHex(character)) return false;
+    }
+    return true;
+}
+
+/// 取 `league-session` 令牌（SGP 跨区接口用）。
+///
+/// `/lol-league-session/v1/league-session-token` 在**没有正在进行对局**时会 404，
+/// 这是预期状态，不是错误 —— 这时跨区等级补不上，候选本身照常返回。
+fn leagueSessionToken(client: *lcu.Client) ?[]const u8 {
+    const body = client.get("/lol-league-session/v1/league-session-token") catch return null;
+    defer std.heap.page_allocator.free(body);
+    // 接口回的是 JSON 字符串字面量（`"eyJ..."`），少数版本回裸 token。
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (trimmed[0] == '"') {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, std.heap.page_allocator, trimmed, .{}) catch return null;
+        if (parsed != .string) return null;
+        return std.heap.page_allocator.dupe(u8, parsed.string) catch null;
+    }
+    return std.heap.page_allocator.dupe(u8, trimmed) catch null;
 }
 
 fn cachedMatchesPageForSubject(self: *Runtime, subject: ?[]const u8, offset: usize, limit: usize, output: []u8) ?[]const u8 {
@@ -3222,7 +3961,6 @@ pub fn fetchSgpHistory(client: lcu.Client, current: std.json.Value, lcu_history_
     const ranked = std.json.parseFromSliceLeaky(std.json.Value, allocator, ranked_json, .{}) catch return error.LcuInvalidResponse;
     const lcu_history = std.json.parseFromSliceLeaky(std.json.Value, allocator, lcu_history_json, .{}) catch return error.LcuInvalidResponse;
     const platform_id = firstPlatformId(&.{ current, ranked, lcu_history });
-    const host = sgpHost(platform_id) orelse return error.UnsupportedRegion;
     if (target_puuid.len == 0) return error.LcuInvalidResponse;
 
     const entitlement_json = try client.get("/entitlements/v1/token");
@@ -3231,11 +3969,287 @@ pub fn fetchSgpHistory(client: lcu.Client, current: std.json.Value, lcu_history_
     const token = jsonField(entitlement, "accessToken");
     if (token.len == 0) return error.LcuInvalidResponse;
 
+    // ⚠️ **必须先试本机所在子区**（绝大多数查询就是查自己或同区的人，命中即返回）。
+    if (sgpHost(platform_id)) |host| {
+        if (fetchSgpHistoryWithContext(client, .{ .host = host, .platform_id = platform_id, .token = token }, target_puuid, start, count)) |body| {
+            if (historyHasGames(body)) return body;
+            std.heap.page_allocator.free(body);
+        } else |_| {}
+    }
+    return error.LcuInvalidResponse;
+}
+
+/// 腾讯大区的全部子区（`summoner-ledge` 只能逐个子区问，没有「全区」端点）。
+///
+/// 这是**兜底顺序**，不是实际探测顺序：`subIdProbeOrder` 会把「本机所在子区」
+/// 旋到第一位（绝大多数查询就是查自己或同区的人，一次命中即停）。
+const tencent_sub_ids = [_][]const u8{ "TJ101", "TJ100", "CQ100", "GZ100", "NJ100", "HN1", "HN10", "BGP2" };
+
+/// 去掉 `TENCENT_` 前缀：LCU 的 `--rso_platform_id` / 连接信息可能给
+/// `TENCENT_TJ101`，而 SGP 的路径参数只认 `TJ101`。
+fn normalizeSubId(sub_id: []const u8) []const u8 {
+    return if (std.ascii.startsWithIgnoreCase(sub_id, "TENCENT_")) sub_id[8..] else sub_id;
+}
+
+/// 逐区探测的**实际**顺序：本机所在子区排第一，其余按 `tencent_sub_ids` 兜底。
+///
+/// 为什么必须这样：注释以前就写着「本机子区排第一」，但代码是照抄 `tencent_sub_ids`
+/// 的固定顺序 —— 在别的区（比如 HN1）上跑，前 5 个请求全是白发的（约 1 秒），
+/// 而且界面上的 chip 列表会以**别人的**区开头，跟上面那句
+/// 「当前大区（X）搜不到」对不上。认不出当前子区时退化成固定顺序，不报错。
+fn subIdProbeOrder(current_sub_id: []const u8, buffer: *[tencent_sub_ids.len][]const u8) []const []const u8 {
+    const normalized = normalizeSubId(current_sub_id);
+    var len: usize = 0;
+    if (normalized.len > 0) for (tencent_sub_ids) |sub_id| {
+        if (std.ascii.eqlIgnoreCase(sub_id, normalized)) {
+            buffer[len] = sub_id;
+            len += 1;
+            break;
+        }
+    };
+    for (tencent_sub_ids) |sub_id| {
+        if (len > 0 and std.mem.eql(u8, buffer[0], sub_id)) continue;
+        buffer[len] = sub_id;
+        len += 1;
+    }
+    return buffer[0..len];
+}
+
+/// **在腾讯大区里找出这个 puuid 属于哪个子区**，并顺手取到等级。
+///
+/// # 为什么必须有这一步（2026-10-03 实测，用户报「这个人在 AK 搜得到、我这里搜不到」）
+///
+/// `player-account/aliases/v1/lookup` 是**全局**的，跨区也能解析出 puuid；
+/// 但战绩数据是**按子区分片**的：`match-history-query` 只会回**本子区**的记录。
+/// 于是查一个外区的人时：
+///
+/// - 本子区主机 → `{"games":[]}`（HTTP 200，**空数组**，不是错误）
+/// - 正确子区主机 → 5 局真实战绩
+///
+/// 而 `fetchSgpHistory` 一律用**本机**的 `platformId` 去选主机，所以外区的人
+/// 永远是空列表 —— 表现成「搜得到人、查不到战绩」。实测那位玩家在 **CQ100**，
+/// 本机在 **TJ101**。
+///
+/// 判据用 `summoner-ledge`：逐个子区问「这个 puuid 在不在你这儿」，
+/// 第一个回非空数组的就是它（顺带把等级也拿到了）。
+///
+/// 返回值指向 `out_buffer`，由调用方提供；`out_len` 是子区 id 的字节数。
+/// 找不着时返回 false（调用方按「仍用本子区」处理，不算错误）。
+/// 一次「全大区定位」的逐区结果。
+///
+/// 为什么要记录下来：用户明确要求「全大区搜索最起码显示一下 —— 当前大区搜不到、
+/// 正在搜哪个大区、结果是什么」。bridge 命令是**请求/响应**式的，没法中途推进度，
+/// 所以把逐区结果一起带回去，界面在结果落地后就能如实列出「搜过哪几个区、哪个命中」，
+/// 而不是含糊地转个圈就没了（用户原话：「我们项目明明是百分百按照他那个翻译过来的，
+/// 为什么不能用呢」）。
+const RegionProbeLog = struct {
+    entries: [tencent_sub_ids.len]RegionProbeEntry = undefined,
+    len: usize = 0,
+
+    const RegionProbeEntry = struct {
+        sub_id: []const u8,
+        found: bool,
+    };
+
+    fn push(self: *RegionProbeLog, sub_id: []const u8, found: bool) void {
+        if (self.len == self.entries.len) return;
+        self.entries[self.len] = .{ .sub_id = sub_id, .found = found };
+        self.len += 1;
+    }
+
+    fn slice(self: *const RegionProbeLog) []const RegionProbeEntry {
+        return self.entries[0..self.len];
+    }
+};
+
+fn probeTencentSubRegion(
+    client: lcu.Client,
+    session_token: []const u8,
+    current_sub_id: []const u8,
+    puuid: []const u8,
+    out_buffer: []u8,
+    out_len: *usize,
+    out_level: ?*i64,
+) bool {
+    return probeTencentSubRegionLogged(client, session_token, current_sub_id, puuid, out_buffer, out_len, out_level, null);
+}
+
+/// `probeTencentSubRegion` 的可记录版本：多接一个 `log`，逐区写「问过谁、中没中」。
+///
+/// 命中即停，所以 `log` 的条数就是真实发出去的 `summoner-ledge` 请求数
+/// （顺序 = `subIdProbeOrder`，**本机子区排第一**）——界面拿它显示
+/// 「已搜索 N 个大区」，chip 的第一个就是用户自己的大区。
+fn probeTencentSubRegionLogged(
+    client: lcu.Client,
+    session_token: []const u8,
+    current_sub_id: []const u8,
+    puuid: []const u8,
+    out_buffer: []u8,
+    out_len: *usize,
+    out_level: ?*i64,
+    log: ?*RegionProbeLog,
+) bool {
+    if (session_token.len == 0 or puuid.len == 0) return false;
+    var order_buffer: [tencent_sub_ids.len][]const u8 = undefined;
+    for (subIdProbeOrder(current_sub_id, &order_buffer)) |sub_id| {
+        const host = sgpHostForSubId(sub_id) orelse continue;
+        var url_buffer: [1024]u8 = undefined;
+        const url = std.fmt.bufPrint(
+            &url_buffer,
+            "https://{s}/summoner-ledge/v1/regions/{s}/summoners/puuids",
+            .{ host, sub_id },
+        ) catch continue;
+        var body_buffer: [512]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&body_buffer);
+        writer.writeAll("[") catch continue;
+        jsonString(&writer, puuid) catch continue;
+        writer.writeAll("]") catch continue;
+        const response = client.postBearerUrl(url, session_token, sgp_user_agent, writer.buffered()) catch {
+            if (log) |entry_log| entry_log.push(sub_id, false);
+            continue;
+        };
+        defer std.heap.page_allocator.free(response);
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), response, .{}) catch {
+            if (log) |entry_log| entry_log.push(sub_id, false);
+            continue;
+        };
+        if (parsed != .array or parsed.array.items.len == 0) {
+            if (log) |entry_log| entry_log.push(sub_id, false);
+            continue;
+        }
+        if (parsed.array.items[0] != .object) {
+            if (log) |entry_log| entry_log.push(sub_id, false);
+            continue;
+        }
+        // 命中：把子区 id 交回去。
+        if (sub_id.len > out_buffer.len) continue;
+        @memcpy(out_buffer[0..sub_id.len], sub_id);
+        out_len.* = sub_id.len;
+        if (out_level) |level| {
+            // SGP `summoner-ledge` 的字段是 `level`，LCU 召唤师对象是 `summonerLevel`。
+            // 两个都试——`enrichCandidateFromSgp` 走的是同一个接口，
+            // 之前拿不到等级就是因为只认了 LCU 那个名字。
+            const found = jsonInt(parsed.array.items[0], "level");
+            const value = if (found > 0) @as(i64, found) else summonerLevelFromJson(parsed.array.items[0]);
+            if (value) |number| level.* = number;
+        }
+        if (log) |entry_log| entry_log.push(sub_id, true);
+        return true;
+    }
+    return false;
+}
+
+/// **跨区**战绩兜底：先问出目标玩家在哪个腾讯子区，再去那台主机取战绩。
+///
+/// 走这一步的前提是「本子区已经查过了但没有对局」（`historyHasGames` 为假）。
+/// 这种情况有两种成因，**必须分开处理**：
+///
+///  1. **网关空窗**（entitlement 正在刷新 / 掉线重连）——本区玩家也会这样。
+///     这种情况换子区也没用，还会白等 8 个请求，所以**先查一次落库的子区**：
+///     之前定位过（`playerSubjectRegion`）就直接去那台主机，一个 `summoner-ledge` 都不用发。
+///  2. **目标在别的子区**——本子区主机永远回空数组。这时才值得花 8 次
+///     `summoner-ledge` 去定位他真实的子区（实测那位玩家在 CQ100，本机在 TJ101）。
+///
+/// 定位结果**落库**（`playerSubjectRegion`），下次查同一个人直接命中，不用再问 8 次。
+fn fetchSgpHistoryCrossRegion(
+    client: lcu.Client,
+    current: std.json.Value,
+    store: ?*storage.Store,
+    target_puuid: []const u8,
+    start: usize,
+    count: usize,
+) ![]u8 {
+    if (target_puuid.len == 0) return error.LcuInvalidResponse;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const entitlement_json = try client.get("/entitlements/v1/token");
+    defer std.heap.page_allocator.free(entitlement_json);
+    const entitlement = std.json.parseFromSliceLeaky(std.json.Value, allocator, entitlement_json, .{}) catch return error.LcuInvalidResponse;
+    const token = jsonField(entitlement, "accessToken");
+    if (token.len == 0) return error.LcuInvalidResponse;
+
+    const ranked_json = try client.get("/lol-ranked/v1/current-ranked-stats");
+    defer std.heap.page_allocator.free(ranked_json);
+    const ranked = std.json.parseFromSliceLeaky(std.json.Value, allocator, ranked_json, .{}) catch return error.LcuInvalidResponse;
+    const platform_id = firstPlatformId(&.{ current, ranked });
+
+    // ① 命中落库的子区：一个额外请求都不发，直接去那台主机取。
+    if (cachedSubjectRegion(store, target_puuid)) |cached_sub_id| {
+        defer std.heap.page_allocator.free(cached_sub_id);
+        if (fetchSgpHistoryForSubRegion(client, cached_sub_id, platform_id, token, target_puuid, start, count)) |body| {
+            if (historyHasGames(body)) return body;
+            std.heap.page_allocator.free(body);
+        } else |_| {}
+    }
+
+    // ② 没有记录：问出他在哪个子区（`summoner-ledge` 要 `league-session` 令牌，
+    //    不是 entitlements；没有进行中的对局时这个接口 404，按查不到处理）。
+    //    `leagueSessionToken` 收的是可变指针，而本函数按值收 client，所以取一份
+    //    本地可变副本——它只被读（令牌来自它的 io/凭据），拷贝不影响语义。
+    var session_client = client;
+    const session_token = leagueSessionToken(&session_client) orelse return error.LcuInvalidResponse;
+    defer std.heap.page_allocator.free(session_token);
+
+    var sub_buffer: [16]u8 = undefined;
+    var sub_len: usize = 0;
+    if (!probeTencentSubRegion(client, session_token, platform_id, target_puuid, &sub_buffer, &sub_len, null)) {
+        return error.LcuInvalidResponse;
+    }
+    const sub_id = sub_buffer[0..sub_len];
+    // 只记「确实查得到战绩」的子区：空列表的子区说明是网关空窗，记下来反而会一直走错。
+    if (fetchSgpHistoryForSubRegion(client, sub_id, platform_id, token, target_puuid, start, count)) |body| {
+        if (historyHasGames(body)) {
+            if (store) |slot| slot.put("playerSubjectRegion", target_puuid, sub_id) catch {};
+            return body;
+        }
+        std.heap.page_allocator.free(body);
+    } else |_| {}
+    return error.LcuInvalidResponse;
+}
+
+/// 读「这个 puuid 上次被定位到哪个子区」。
+fn cachedSubjectRegion(store: ?*storage.Store, puuid: []const u8) ?[]const u8 {
+    const value = (store orelse return null).get("playerSubjectRegion", puuid) catch null orelse return null;
+    if (value.len == 0) {
+        std.heap.page_allocator.free(value);
+        return null;
+    }
+    return value;
+}
+
+/// 查**指定子区**的战绩（`fetchSgpHistory` 的跨区版）。
+///
+/// 与 `fetchSgpHistory` 的区别只有一个：主机由 `sub_id` 指定，而不是本机的
+/// `platformId`。战绩、DTO 形状、过滤逻辑全都一样（`fetchSgpHistoryWithContext` 共用）。
+fn fetchSgpHistoryForSubRegion(
+    client: lcu.Client,
+    sub_id: []const u8,
+    platform_id: []const u8,
+    token: []const u8,
+    target_puuid: []const u8,
+    start: usize,
+    count: usize,
+) ![]u8 {
+    const host = sgpHostForSubId(sub_id) orelse return error.UnsupportedRegion;
+    if (token.len == 0 or target_puuid.len == 0) return error.LcuInvalidResponse;
     return fetchSgpHistoryWithContext(client, .{ .host = host, .platform_id = platform_id, .token = token }, target_puuid, start, count);
 }
 
 fn sgpHost(platform_id: []const u8) ?[]const u8 {
-    const normalized = if (std.ascii.startsWithIgnoreCase(platform_id, "TENCENT_")) platform_id[8..] else platform_id;
+    return sgpHostForSubId(sgpSubId(platform_id));
+}
+
+/// 用 SGP **子区 id**（已去掉 `TENCENT_` 前缀，如 `NJ100`）取 SGP 主机。
+///
+/// 早先只有 `sgpHost(platform_id)`，靠 `startsWithIgnoreCase` 剥前缀；跨区查询拿到的
+/// 已经是子区，所以拆出一个不剥前缀的版本，两个入口共用同一张表。
+fn sgpHostForSubId(sub_id: []const u8) ?[]const u8 {
+    const normalized = normalizeSubId(sub_id);
     if (std.ascii.eqlIgnoreCase(normalized, "HN1")) return "hn1-k8s-sgp.lol.qq.com:21019";
     if (std.ascii.eqlIgnoreCase(normalized, "HN10")) return "hn10-k8s-sgp.lol.qq.com:21019";
     if (std.ascii.eqlIgnoreCase(normalized, "NJ100")) return "nj100-sgp.lol.qq.com:21019";
@@ -4732,6 +5746,14 @@ fn writeParticipant(writer: *std.Io.Writer, participant: std.json.Value, self_te
     const player = if (identity) |value| nestedObject(value, "player") orelse value else std.json.Value{ .null = {} };
     const puuid = if (jsonField(participant, "puuid").len > 0) jsonField(participant, "puuid") else if (player != .null and jsonField(player, "puuid").len > 0) jsonField(player, "puuid") else if (identity) |value| jsonField(value, "puuid") else "";
     const game_name = if (jsonField(participant, "gameName").len > 0) jsonField(participant, "gameName") else if (jsonField(participant, "riotIdGameName").len > 0) jsonField(participant, "riotIdGameName") else if (jsonField(participant, "summonerName").len > 0) jsonField(participant, "summonerName") else if (player != .null and jsonField(player, "gameName").len > 0) jsonField(player, "gameName") else if (player != .null and jsonField(player, "riotIdGameName").len > 0) jsonField(player, "riotIdGameName") else if (identity) |value| jsonField(value, "summonerName") else "未知玩家";
+    // Riot ID 的 `#` 后面那段编号。三种来源，**两份数据源字段名不同**，缺一不可：
+    // - SGP（`match-history-query` 的 DETAILS）：名字在 `participant.riotIdGameName`，
+    //   编号在 `participant.riotIdTagline`，**没有** `participantIdentities`；
+    // - LCU（本机 `/lol-match-history/.../{gameId}`）：participant 上**没有**任何 tag 字段，
+    //   编号只在 `participantIdentities[].player.tagLine`（实测玩家对象里就是 `tagLine`）；
+    // - 少数版本/形态把编号叫 `gameTag`，一起认。
+    // 十人阵容只显示名字时，同名玩家分不开（用户报：「ID 后边没有带上对应的编号」）。
+    const tag_line = if (jsonField(participant, "riotIdTagline").len > 0) jsonField(participant, "riotIdTagline") else if (jsonField(participant, "tagLine").len > 0) jsonField(participant, "tagLine") else if (jsonField(participant, "gameTag").len > 0) jsonField(participant, "gameTag") else if (player != .null and jsonField(player, "tagLine").len > 0) jsonField(player, "tagLine") else if (player != .null and jsonField(player, "gameTag").len > 0) jsonField(player, "gameTag") else if (identity) |value| if (jsonField(value, "gameTag").len > 0) jsonField(value, "gameTag") else jsonField(value, "tagLine") else "";
     const champion_id = jsonInt(participant, "championId");
     const champion_name = catalogChampionName(catalog, champion_id, jsonField(participant, "championName"));
     const kills = statInt(participant, "kills");
@@ -4755,6 +5777,9 @@ fn writeParticipant(writer: *std.Io.Writer, participant: std.json.Value, self_te
     try jsonString(writer, puuid);
     try writer.writeAll(",\"gameName\":");
     try jsonString(writer, game_name);
+    // 编号缺失时写 null（不是空串）：前端要能区分「这个玩家没有编号」与「没取到」。
+    try writer.writeAll(",\"tagLine\":");
+    if (tag_line.len > 0) try jsonString(writer, tag_line) else try writer.writeAll("null");
     try writer.print(",\"isBot\":{},\"championId\":{d},\"championName\":", .{ jsonBool(participant, "isBot"), champion_id });
     try jsonString(writer, champion_name);
     try writer.writeAll(",\"side\":");
@@ -8488,6 +9513,27 @@ test "maps LCU participant identities when participant rows omit puuid" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"puuid\":\"self\"") != null);
 }
 
+// 十人阵容必须带上 `#编号`：同一局里两个人都叫「萌太TnT」时，只有编号能区分他们。
+// 两份数据源的字段名**完全不同**，两边都要认：
+// - LCU（本机战绩）：participant 上没有任何 tag 字段，只在 `participantIdentities[].player.tagLine`；
+// - SGP（跨区 `match-history-query`）：participant 上有 `riotIdTagline`，且**没有** identities。
+// 少认一边，十个人里就会有五个人只显示名字。
+test "participants carry the Riot ID tagLine from both LCU identities and SGP riotId fields" {
+    const lcu_input = "{\"games\":{\"games\":[{\"gameId\":61,\"gameDuration\":600,\"queueId\":420,\"gameMode\":\"CLASSIC\",\"participantIdentities\":[{\"participantId\":1,\"player\":{\"puuid\":\"self\",\"gameName\":\"萌太TnT\",\"tagLine\":\"16720\"}},{\"participantId\":2,\"player\":{\"puuid\":\"mate\",\"gameName\":\"同名玩家\",\"tagLine\":\"00001\"}}],\"participants\":[{\"participantId\":1,\"teamId\":100,\"championId\":103,\"stats\":{\"kills\":1,\"win\":true}},{\"participantId\":2,\"teamId\":100,\"championId\":64,\"stats\":{\"kills\":2,\"win\":true}}]}]}}";
+    var output: [16 * 1024]u8 = undefined;
+    const from_lcu = try matchHistoryDtoPage(lcu_input, "[]", "self", 0, 10, &output);
+    try std.testing.expect(std.mem.indexOf(u8, from_lcu, "\"gameName\":\"萌太TnT\",\"tagLine\":\"16720\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, from_lcu, "\"gameName\":\"同名玩家\",\"tagLine\":\"00001\"") != null);
+
+    // SGP 形状：没有 participantIdentities，编号在 participant.riotIdTagline。
+    const sgp_input = "{\"games\":[{\"json\":{\"gameId\":62,\"gameDuration\":600,\"queueId\":420,\"gameMode\":\"CLASSIC\",\"participants\":[{\"puuid\":\"self\",\"riotIdGameName\":\"我与春风\",\"riotIdTagline\":\"16446\",\"teamId\":100,\"championId\":103,\"kills\":1,\"win\":true},{\"puuid\":\"mate\",\"riotIdGameName\":\"队友\",\"teamId\":100,\"championId\":64,\"kills\":2,\"win\":true}]}}]}";
+    var sgp_output: [16 * 1024]u8 = undefined;
+    const from_sgp = try matchHistoryDtoPage(sgp_input, "[]", "self", 0, 10, &sgp_output);
+    try std.testing.expect(std.mem.indexOf(u8, from_sgp, "\"gameName\":\"我与春风\",\"tagLine\":\"16446\"") != null);
+    // 没有编号时写 null —— 前端要能区分「没有编号」与「字段缺失」。
+    try std.testing.expect(std.mem.indexOf(u8, from_sgp, "\"gameName\":\"队友\",\"tagLine\":null") != null);
+}
+
 test "does not label a single-participant history row as MVP or SVP" {
     const input = "{\"games\":[{\"gameId\":45,\"gameDuration\":1200,\"queueId\":420,\"participants\":[{\"puuid\":\"self\",\"teamId\":100,\"championId\":103,\"kills\":12,\"deaths\":0,\"assists\":8,\"totalDamageDealtToChampions\":30000,\"win\":true}]}]}";
     var output: [16 * 1024]u8 = undefined;
@@ -8585,6 +9631,79 @@ test "maps Tencent platform ids to SGP hosts" {
     try std.testing.expectEqualStrings("nj100-sgp.lol.qq.com:21019", sgpHost("NJ100").?);
     try std.testing.expectEqualStrings("hn1-k8s-sgp.lol.qq.com:21019", sgpHost("tencent_hn1").?);
     try std.testing.expect(sgpHost("UNKNOWN") == null);
+}
+
+test "cross-region SGP lookup strips the TENCENT prefix like LeagueAkari" {
+    // AK 的 `_getSubId` 用 `_` 切分取后半段；这里必须一致，否则 URL 里会出现
+    // `regions/TENCENT_TJ101`，SGP 直接 404。
+    try std.testing.expectEqualStrings("TJ101", sgpSubId("TENCENT_TJ101"));
+    // ⚠️ 只剥前缀、**不改大小写**（AK `_getSubId` 也是纯切分）：sub-id 会被原样拼进
+    // URL 路径，改大小写是另一件事，交给 `sgpHostForSubId` 的 `eqlIgnoreCase` 处理。
+    try std.testing.expectEqualStrings("hn1", sgpSubId("tencent_hn1"));
+    try std.testing.expectEqualStrings("KR", sgpSubId("KR"));
+    // 子区入口同样要能查到主机（跨区路径就是先剥前缀再查表）。
+    try std.testing.expectEqualStrings("tj101-sgp.lol.qq.com:21019", sgpHostForSubId("TJ101").?);
+    try std.testing.expectEqualStrings("tj101-sgp.lol.qq.com:21019", sgpHostForSubId("TENCENT_TJ101").?);
+    try std.testing.expect(sgpHostForSubId("TENCENT_UNKNOWN") == null);
+}
+
+test "puuid-shaped input is detected and plain names are not" {
+    // AK `isPuuid` 的等价物：36 位 UUID 形状才算，普通名字一律不算。
+    try std.testing.expect(looksLikePuuid("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"));
+    try std.testing.expect(looksLikePuuid("0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0"));
+    try std.testing.expect(!looksLikePuuid("玩家名"));
+    // 少一位、位置错、含非十六进制都必须是 false —— 判宽了会把普通名字当 puuid 查。
+    try std.testing.expect(!looksLikePuuid("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f"));
+    try std.testing.expect(!looksLikePuuid("0f1e2d3c4-b5a-6978-8796-a5b4c3d2e1f0"));
+    try std.testing.expect(!looksLikePuuid("zz1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"));
+    try std.testing.expect(!looksLikePuuid(""));
+}
+
+test "fuzzy matching treats an empty returned name as a miss" {
+    // 腾讯区服常把昵称放在 `displayName`，`gameName` 会是空串。
+    // 空串按「包含」处理会让任何查询都命中，所以必须是 false。
+    try std.testing.expect(!candidateNameContains("", "张三"));
+    try std.testing.expect(!candidateNameContains("张三", ""));
+    try std.testing.expect(candidateNameContains("张三很帅", "张三"));
+    // 大小写无关（ASCII 昵称占多数）。
+    try std.testing.expect(candidateNameContains("FakerFan", "fakerfan"));
+    try std.testing.expect(candidateNameContains("xxfakerxx", "FAKER"));
+    try std.testing.expect(!candidateNameContains("Jackey", "JackeyLove"));
+}
+
+test "summoner candidates dedupe by puuid across RC, LCU and SGP" {
+    // 同一个 puuid 可能被 RC（模糊枚举）和 LCU（批量补全）各命中一次，
+    // 不去重的话界面上会出现两个一模一样的候选。
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var candidates: [summoner_candidate_limit]SummonerCandidate = undefined;
+    var count: usize = 0;
+    const first = "{\"puuid\":\"p-1\",\"gameName\":\"同名\",\"tagLine\":\"AAA\",\"summonerLevel\":30}";
+    const second = "{\"puuid\":\"p-1\",\"gameName\":\"同名\",\"tagLine\":\"AAA\",\"summonerLevel\":30}";
+    const third = "{\"puuid\":\"p-2\",\"gameName\":\"同名\",\"tagLine\":\"BBB\",\"summonerLevel\":40}";
+    pushSummonerCandidate(allocator, &candidates, &count, std.json.parseFromSliceLeaky(std.json.Value, allocator, first, .{}) catch unreachable, "", null);
+    pushSummonerCandidate(allocator, &candidates, &count, std.json.parseFromSliceLeaky(std.json.Value, allocator, second, .{}) catch unreachable, "", null);
+    pushSummonerCandidate(allocator, &candidates, &count, std.json.parseFromSliceLeaky(std.json.Value, allocator, third, .{}) catch unreachable, "", null);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings("p-1", candidates[0].puuid);
+    try std.testing.expectEqualStrings("p-2", candidates[1].puuid);
+}
+
+test "exact-name guard rejects the local account echoed back by a bad name query" {
+    // LCU `?name=` 在部分版本里忽略无法解析的名字、直接回当前登录账号。
+    // `expected_name` 非空时必须把它挡掉，否则「查无此人」会显示成「查到的就是你自己」。
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var candidates: [summoner_candidate_limit]SummonerCandidate = undefined;
+    var count: usize = 0;
+    const self_account = "{\"puuid\":\"me-1\",\"gameName\":\"我自己\",\"tagLine\":\"0001\"}";
+    pushSummonerCandidate(allocator, &candidates, &count, std.json.parseFromSliceLeaky(std.json.Value, allocator, self_account, .{}) catch unreachable, "别人", null);
+    try std.testing.expectEqual(@as(usize, 0), count);
+    // 名字对上就收。
+    pushSummonerCandidate(allocator, &candidates, &count, std.json.parseFromSliceLeaky(std.json.Value, allocator, self_account, .{}) catch unreachable, "我自己", null);
+    try std.testing.expectEqual(@as(usize, 1), count);
 }
 
 test "maps champ select teams into lobby profiles" {
@@ -8963,7 +10082,8 @@ test "参团率钳制在 100% 以内（处决死亡给助攻不给击杀的数�
     try std.testing.expectEqual(@as(f64, 0), killParticipationRatio(3, 5, 0));
 }
 
-test "release notes 截断落在 UTF-8 字符边界上" {    var output: [2048]u8 = undefined;
+test "release notes 截断落在 UTF-8 字符边界上" {
+    var output: [2048]u8 = undefined;
     const current = "3.4.1";
     // 400 个三字节汉字 = 1200 字节，正好在上限内；再加一个就超，必须截断且不出现半个字符。
     const long_notes = "好" ** 401;
@@ -9307,39 +10427,32 @@ test "disambiguates LCU timeline lane where top laners are reported as jungle" {
     const allocator = arena.allocator();
 
     // 上单 DrMundo：lane 被服务端写成 JUNGLE，角色 NONE，没带惩戒 → 必须还原成 TOP。
-    const top = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
-        "{\"championId\":36,\"teamId\":100,\"spell1Id\":6,\"spell2Id\":4,\"timeline\":{\"lane\":\"JUNGLE\",\"role\":\"NONE\"}}", .{});
+    const top = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"championId\":36,\"teamId\":100,\"spell1Id\":6,\"spell2Id\":4,\"timeline\":{\"lane\":\"JUNGLE\",\"role\":\"NONE\"}}", .{});
     try std.testing.expectEqualStrings("TOP", participantPosition(top));
 
     // 同局打野 Viego：lane 同样是 JUNGLE，但带惩戒 → 保持 JUNGLE。
-    const jungle = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
-        "{\"championId\":234,\"teamId\":100,\"spell1Id\":4,\"spell2Id\":11,\"timeline\":{\"lane\":\"JUNGLE\",\"role\":\"NONE\"}}", .{});
+    const jungle = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"championId\":234,\"teamId\":100,\"spell1Id\":4,\"spell2Id\":11,\"timeline\":{\"lane\":\"JUNGLE\",\"role\":\"NONE\"}}", .{});
     try std.testing.expectEqualStrings("JUNGLE", participantPosition(jungle));
 
     // 辅助 Pantheon：lane BOTTOM + role SUPPORT → 辅助（旧口径只认 DUO_SUPPORT，会错报下路）。
-    const support = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
-        "{\"championId\":80,\"teamId\":100,\"spell1Id\":4,\"spell2Id\":14,\"timeline\":{\"lane\":\"BOTTOM\",\"role\":\"SUPPORT\"}}", .{});
+    const support = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"championId\":80,\"teamId\":100,\"spell1Id\":4,\"spell2Id\":14,\"timeline\":{\"lane\":\"BOTTOM\",\"role\":\"SUPPORT\"}}", .{});
     try std.testing.expectEqualStrings("UTILITY", participantPosition(support));
 
     // 中路 Fizz 不受影响。
-    const mid = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
-        "{\"championId\":105,\"teamId\":100,\"spell1Id\":14,\"spell2Id\":4,\"timeline\":{\"lane\":\"MIDDLE\",\"role\":\"SOLO\"}}", .{});
+    const mid = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"championId\":105,\"teamId\":100,\"spell1Id\":14,\"spell2Id\":4,\"timeline\":{\"lane\":\"MIDDLE\",\"role\":\"SOLO\"}}", .{});
     try std.testing.expectEqualStrings("MIDDLE", participantPosition(mid));
 
     // ARAM（lane NONE）不该被编出一个分路来。
-    const aram = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
-        "{\"championId\":36,\"teamId\":100,\"spell1Id\":4,\"spell2Id\":14,\"timeline\":{\"lane\":\"NONE\",\"role\":\"SUPPORT\"}}", .{});
+    const aram = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"championId\":36,\"teamId\":100,\"spell1Id\":4,\"spell2Id\":14,\"timeline\":{\"lane\":\"NONE\",\"role\":\"SUPPORT\"}}", .{});
     try std.testing.expectEqualStrings("", participantPosition(aram));
 
     // SGP/match-v5 的 teamPosition 是权威值：**即使不带惩戒**也按它来，
     // 不能被上面的消歧逻辑误改成 TOP。
-    const sgp = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
-        "{\"championId\":64,\"teamPosition\":\"JUNGLE\",\"individualPosition\":\"JUNGLE\",\"lane\":\"JUNGLE\",\"role\":\"NONE\"}", .{});
+    const sgp = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"championId\":64,\"teamPosition\":\"JUNGLE\",\"individualPosition\":\"JUNGLE\",\"lane\":\"JUNGLE\",\"role\":\"NONE\"}", .{});
     try std.testing.expectEqualStrings("JUNGLE", participantPosition(sgp));
 
     // 顺带把「SGP 少一个字段」的形状也钉一下：只有 individualPosition。
-    const individual = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
-        "{\"championId\":875,\"individualPosition\":\"TOP\"}", .{});
+    const individual = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"championId\":875,\"individualPosition\":\"TOP\"}", .{});
     try std.testing.expectEqualStrings("TOP", participantPosition(individual));
 }
 
@@ -9469,6 +10582,33 @@ test "runtime persistence paths share one stable data root" {
     try std.testing.expect(std.mem.endsWith(u8, moved.databasePath(), "lol-desktop.sqlite3"));
     try std.testing.expect(std.mem.startsWith(u8, moved.configPath(), moved.dataDir()));
     try std.testing.expect(std.mem.startsWith(u8, moved.databasePath(), moved.dataDir()));
+}
+
+test "逐区探测把本机子区排第一，认不出时退化成兜底顺序" {
+    var buffer: [tencent_sub_ids.len][]const u8 = undefined;
+
+    // 本机在 HN1：4 个别的区不该排在它前面（否则每次查询都白发几个请求，
+    // 界面 chip 列表还会以别人的区开头）。
+    const from_hn1 = subIdProbeOrder("HN1", &buffer);
+    try std.testing.expectEqual(tencent_sub_ids.len, from_hn1.len);
+    try std.testing.expectEqualStrings("HN1", from_hn1[0]);
+    var seen = std.StringHashMap(void).init(std.testing.allocator);
+    defer seen.deinit();
+    for (from_hn1) |sub_id| {
+        try std.testing.expect(!seen.contains(sub_id));
+        try seen.put(sub_id, {});
+    }
+
+    // `TENCENT_` 前缀要能认出来（LCU 的 --rso_platform_id 两种写法都见过）。
+    const from_prefixed = subIdProbeOrder("TENCENT_TJ100", &buffer);
+    try std.testing.expectEqualStrings("TJ100", from_prefixed[0]);
+
+    // 认不出来（海外服 / 空值）时退化成固定顺序，且不重复、不丢。
+    for ([_][]const u8{ "", "NA1" }) |unknown| {
+        const fallback = subIdProbeOrder(unknown, &buffer);
+        try std.testing.expectEqual(tencent_sub_ids.len, fallback.len);
+        try std.testing.expectEqualStrings(tencent_sub_ids[0], fallback[0]);
+    }
 }
 
 test "bootstrap JSON escapes Windows persistence paths" {

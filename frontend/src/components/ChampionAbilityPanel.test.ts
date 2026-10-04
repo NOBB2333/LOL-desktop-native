@@ -310,10 +310,13 @@ describe("技能面板：逐级数值（CommunityDragon）", () => {
 
     const body = wrapper.get(".abilities__body");
     const text = body.text();
-    // 逐级数组按 " / " 拼出来，且第 6/7 格也在（技能能点 5 级但数组给到 7 格是官方的）。
+    // 逐级数组按 " / " 拼出来，**只到第 5 格**——两份数据源都给 7 格（技能只能点 5 级），
+    // 2026-10-03 起统一裁到 5（用户要的就是「5 个层级、5 个技能点」）。
     expect(body.html()).toContain("ab-value");
-    expect(text).toContain("40 / 80 / 120 / 160 / 200 / 240 / 280");
-    expect(text).toContain("30 / 40 / 50 / 60 / 70 / 80 / 90");
+    expect(text).toContain("40 / 80 / 120 / 160 / 200");
+    expect(text).not.toContain("240");
+    expect(text).toContain("30 / 40 / 50 / 60 / 70");
+    expect(text).not.toContain("80 / 90");
     // 取到的整块替换 → 正文里不该再有这几个占位符。
     expect(text).not.toContain("@PowerBallDamage@");
     expect(text).not.toContain("@SlowPercent@");
@@ -360,17 +363,21 @@ describe("技能面板：逐级数值（CommunityDragon）", () => {
     wrapper.unmount();
   });
 
-  it("带加成系数的项单独列一行，并写明乘的是哪个属性", async () => {
+  it("加成直接写在正文的伤害后面，且不再单开一个框（2026-10-03 去重）", async () => {
     valuesState.data = rammusValues();
     const wrapper = mountRammus();
     await flushPromises();
     await flushPromises();
-    const scaling = wrapper.get(".abilities__scaling");
-    expect(scaling.text()).toContain("PowerBallDamage");
-    // 关键：不是干巴巴的「AP」，而是「法术强度」——用户问的就是「它是什么加成」。
-    expect(scaling.text()).toContain("+ 1 法术强度");
-    // 正文里的那一格只放基础值，不带系数，否则会被读成一个数。
-    expect(wrapper.get(".abilities__text").text()).not.toContain("+ 1 ");
+    // 正文（最后一个 `.abilities__text` 是带官方变量的完整描述）里紧跟基础值写出来，
+    // 这就是客户端面板的写法，也是用户 2026-10-03 明确要的「直接写在伤害后面」。
+    const texts = wrapper.findAll(".abilities__text");
+    expect(texts[texts.length - 1].text()).toContain("40 / 80 / 120 / 160 / 200 + 100% 法术强度");
+    // 关键是写成「法术强度」而不是干巴巴的「AP」——用户问的就是「它是什么加成」。
+    expect(texts[texts.length - 1].text()).toContain("法术强度");
+    // ⚠️ 那个「带系数的项」独立框已删除：它和下面的速查表逐行重复。
+    expect(wrapper.find(".abilities__scaling").exists()).toBe(false);
+    // 变量名仍然只出现在速查表里（正文只有数字，看不出乘的是谁）。
+    expect(wrapper.get(".abilities__values").text()).toContain("PowerBallDamage");
     wrapper.unmount();
   });
 });
@@ -408,6 +415,10 @@ describe("技能面板：龙王 Q 的原文（用户报的那段）", () => {
             // 客户端文案写 `@AOEModifier*100@%`，原始值就是 0.5。
             AOEModifier: { values: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], percent: true },
             BurstDamage: { values: [50, 60, 70, 80, 90], ratio: 0.35, ratioStat: "AP" },
+            // 2026-10-02 起后端能解析出这一项：读数取星尘层数（2），
+            // 加成属性由公式里消费的数据值推出来（`QMaxHealthTrueDamagePerStack` → 最大生命值）。
+            // ⚠️ 它**没有** `ratio`——不是「基础值 + 系数」那种形状。
+            BurstBonusTrueDamageToChamps: { values: [2, 2, 2, 2, 2, 2, 2], ratioStat: "MaxHealth" },
           },
         },
       ],
@@ -442,16 +453,20 @@ describe("技能面板：龙王 Q 的原文（用户报的那段）", () => {
     wrapper.unmount();
   });
 
-  it("「+0.6 法术强度」写在面板上——这就是「它是什么加成」的答案", async () => {
+  it("「+60% 法术强度」写在面板上——这就是「它是什么加成」的答案", async () => {
     const wrapper = mountAsol();
     await flushPromises();
     await flushPromises();
-    const scaling = wrapper.get(".abilities__scaling").text();
-    expect(scaling).toContain("DamagePerSecond");
-    expect(scaling).toContain("+ 0.6 法术强度");
+    // 正文里直接跟在基础值后面（客户端面板的写法）。
+    const texts = wrapper.findAll(".abilities__text");
+    const dynamic = texts[texts.length - 1].text();
+    expect(dynamic).toContain("+ 60% 法术强度");
     // 爆发那一段也是法强加成（客户端文案没写，我们补上）。
-    expect(scaling).toContain("BurstDamage");
-    expect(scaling).toContain("+ 0.35 法术强度");
+    expect(dynamic).toContain("+ 35% 法术强度");
+    // 具体是哪个变量只能在速查表里对上号。
+    const values = wrapper.get(".abilities__values").text();
+    expect(values).toContain("DamagePerSecond");
+    expect(values).toContain("BurstDamage");
     wrapper.unmount();
   });
 
@@ -461,11 +476,56 @@ describe("技能面板：龙王 Q 的原文（用户报的那段）", () => {
     await flushPromises();
     const values = wrapper.get(".abilities__values").text();
     expect(values).toContain("MaxChannelDuration");
-    expect(values).toContain("3.25 / 3.25 / 3.25 / 3.25 / 3.25 / 9999 / 9999");
+    // 逐级数组统一裁到 5 格（技能只能点 5 级）；第 6/7 格的 9999 不该再出现。
+    expect(values).toContain("3.25 / 3.25 / 3.25 / 3.25 / 3.25");
+    expect(values).not.toContain("9999");
     // 分数按百分数显示，不能是 0.5。
     expect(values).toContain("AOEModifier");
     expect(values).toContain("50%");
     expect(values).not.toContain("0.5");
+    wrapper.unmount();
+  });
+
+  it("`@BurstBonusTrueDamageToChamps@` 填上星尘层数，并写明「按最大生命值算」", async () => {
+    const wrapper = mountAsol();
+    await flushPromises();
+    await flushPromises();
+    const texts = wrapper.findAll(".abilities__text");
+    const text = texts[texts.length - 1].text();
+    // 正文里的变量名必须被替换掉（这就是用户报的那个「词汇没翻译」）。
+    expect(text).not.toContain("BurstBonusTrueDamageToChamps");
+    // 值是星尘层数 2，不是那个 0.031%。
+    expect(text).toContain("2最大生命值的魔法伤害");
+    expect(text).not.toContain("0.031");
+    // 「它是什么加成」的答案在速查表里。
+    const values = wrapper.get(".abilities__values").text();
+    expect(values).toContain("BurstBonusTrueDamageToChamps");
+    expect(values).toContain("按最大生命值算");
+    // ⚠️ 没有系数时就**不能**编一个「+ 最大生命值」出来。
+    expect(values).not.toContain("+ 按最大生命值算");
+    wrapper.unmount();
+  });
+
+  it("逐级不同的系数按级展开，不能把 5 级的加成显示成 1 级的", async () => {
+    const data = abilitiesFixture({ championId: 136, alias: "Jinx", name: "暴走萝莉" });
+    data.spells[0] = { ...data.spells[0], name: "震荡电磁波", dynamicDescription: "造成@TotalDamage@伤害" };
+    abilitiesState.data = data;
+    valuesState.data = {
+      alias: "Jinx",
+      spells: [{
+        slot: "q",
+        values: {
+          // 照金克丝 W 的真实形状：AD 系数逐级变（1.4 → 1.8）。
+          TotalDamage: { values: [10, 45, 80, 115, 150], ratio: 1.4, ratios: [1.4, 1.5, 1.6, 1.7, 1.8], ratioStat: "AD" },
+        },
+      }],
+    } as ChampionAbilityValues;
+    const wrapper = mountPanel(136);
+    await flushPromises();
+    await flushPromises();
+    // 整条都要在，不能只留第 1 格，而且直接跟在基础值后面。
+    const texts = wrapper.findAll(".abilities__text");
+    expect(texts[texts.length - 1].text()).toContain("10 / 45 / 80 / 115 / 150 + 140 / 150 / 160 / 170 / 180% 攻击力");
     wrapper.unmount();
   });
 
@@ -474,10 +534,11 @@ describe("技能面板：龙王 Q 的原文（用户报的那段）", () => {
     await flushPromises();
     await flushPromises();
     const note = wrapper.get(".abilities__note").text();
-    // `BurstBonusTrueDamageToChamps` 依赖星尘层数，本地算不出来 → 保留原文并说明。
-    expect(note).toContain("按英雄等级与");
-    // 而已经填上的那几个（含表达式形式）不能被报成缺失。
+    // 本地算不出来的变量全没了之后，只剩拼接位那句说明。
+    expect(note).toContain("拼接装备与符文加成");
+    // 已经填上的那几个（含表达式形式）不能被报成缺失。
     expect(note).not.toContain("AOEModifier");
+    expect(note).not.toContain("BurstBonusTrueDamageToChamps");
     wrapper.unmount();
   });
 
@@ -501,6 +562,200 @@ describe("技能面板：龙王 Q 的原文（用户报的那段）", () => {
     expect(note).toContain("拼接装备与符文加成");
     // 不能退化成那句「取不到值」的泛泛说明。
     expect(note).not.toContain("按英雄等级与");
+    wrapper.unmount();
+  });
+});
+
+/**
+ * 用户 2026-09-30 报的第二段：斯莫德 Q。
+ *
+ * 他质疑「你是不是只改了那一个英雄」——这一段原文里正好同时有三处**通用**缺口：
+ * 1. `@spell.SmolderP:Passive_QDamageIncrease@` 跨技能引用（22 个英雄有）
+ * 2. `<li>` + `<keywordMajor>` 列表/重点标记（8 / 108 个英雄有）
+ * 3. `@SpellModifierDescriptionAppend@` 拼接位（本来就该空）
+ *
+ * 这三条都不是斯莫德专属，所以这一组钉死的是**通用能力**，不是某一个英雄。
+ */
+describe("技能面板：斯莫德 Q 的原文（跨技能引用 + 列表标记）", () => {
+  /** 斯莫德 Q 原文，照 2026-09-30 从 LCU 拉到的真数据抄。 */
+  const SMOLDER_Q =
+    "斯莫德喷出烈焰，造成<physicalDamage>@TotalDamage@物理伤害</physicalDamage> + " +
+    "<magicDamage>@spell.SmolderP:Passive_QDamageIncrease@魔法伤害</magicDamage>。如果目标阵亡，" +
+    "斯莫德会返还<scaleMana>@ManaRestore@法力值</scaleMana>，这个效果在每次施放仅触发一次。<br><br>" +
+    "基于<spellName>龙之研习</spellName>的层数，这个技能会不断进化，获得以下效果：" +
+    "<li><keywordMajor>@StackTier1@层</keywordMajor>：对目标周围的所有敌人造成伤害。" +
+    "<li><keywordMajor>@StackTier2@层</keywordMajor>：在目标后侧引发<spellName>@Tier2_NumberOfBlowback@</spellName>" +
+    "次爆炸，造成此技能@Tier2_BlowbackPercentageDamage@%的伤害。" +
+    "<li><keywordMajor>@StackTier3@层</keywordMajor>：灼烧目标，@Tier3_DotLength@秒内持续造成共" +
+    "<trueDamage>@Tier3_Burn@最大生命值的真实伤害</trueDamage>。" +
+    "敌方英雄如果在灼烧期间总生命值降至<trueDamage>@Tier3_ExecuteThreshold@</trueDamage>以下，则会被立刻击杀。" +
+    "@SpellModifierDescriptionAppend@";
+
+  function mountSmolder() {
+    const data = abilitiesFixture({ championId: 901, alias: "Smolder", name: "炽炎雏龙" });
+    data.spells[0] = { ...data.spells[0], name: "超级灼热龙息", dynamicDescription: SMOLDER_Q };
+    abilitiesState.data = data;
+    valuesState.data = {
+      alias: "Smolder",
+      spells: [
+        {
+          slot: "q",
+          values: {
+            TotalDamage: { values: [50, 60, 70, 80, 90, 100, 110], ratio: 1.3, ratioStat: "AD" },
+            // ⚠️ 跨技能引用的键是**完整调用名**——后端就是这么落的。
+            "spell.SmolderP:Passive_QDamageIncrease": { values: [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25] },
+            ManaRestore: { values: [15, 15, 15, 15, 15, 15, 15] },
+            StackTier1: { values: [25, 25, 25, 25, 25, 25, 25] },
+            StackTier2: { values: [125, 125, 125, 125, 125, 125, 125] },
+            StackTier3: { values: [225, 225, 225, 225, 225, 225, 225] },
+            Tier2_NumberOfBlowback: { values: [2, 2, 2, 2, 2, 2, 2] },
+            Tier2_BlowbackPercentageDamage: { values: [50, 50, 50, 50, 50, 50, 50] },
+            Tier3_DotLength: { values: [3, 3, 3, 3, 3, 3, 3] },
+          },
+        },
+      ],
+    } as ChampionAbilityValues;
+    return mountPanel(901);
+  }
+
+  it("跨技能引用被填上：`@spell.SmolderP:…@` 换成真实数字", async () => {
+    const wrapper = mountSmolder();
+    await flushPromises();
+    await flushPromises();
+    const texts = wrapper.findAll(".abilities__text");
+    const text = texts[texts.length - 1].text();
+    // 关键：不能把 `spell.SmolderP:Passive_QDamageIncrease` 露在界面上。
+    expect(text).not.toContain("spell.SmolderP");
+    expect(text).not.toContain("Passive_QDamageIncrease");
+    expect(text).toContain("0.25 / 0.25");
+    // 它也不能被报成「没取到值」。
+    const note = wrapper.find(".abilities__note");
+    if (note.exists()) expect(note.text()).not.toContain("Passive_QDamageIncrease");
+    wrapper.unmount();
+  });
+
+  it("三档进化各占一行，不再挤成一整段，也不印出标签字面量", async () => {
+    const wrapper = mountSmolder();
+    await flushPromises();
+    await flushPromises();
+    const html = wrapper.get(".abilities__body").html();
+    expect(html).not.toContain("<li>");
+    expect(html).not.toContain("keywordMajor");
+    // 三档 → 至少三个块级列表项
+    expect(html.match(/ab-listitem/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
+    const text = wrapper.get(".abilities__body").text();
+    expect(text).toContain("25 / 25 / 25 / 25 / 25层");
+    expect(text).toContain("125 / 125 / 125 / 125 / 125层");
+    expect(text).toContain("225 / 225 / 225 / 225 / 225层");
+    // 第 6/7 格（官方多给的）不该再印出来。
+    expect(text).not.toContain("25 / 25 / 25 / 25 / 25 / 25");
+    wrapper.unmount();
+  });
+
+  it("取不到值的变量很少（只剩拼接位），说明文案不夸大缺失", async () => {
+    const wrapper = mountSmolder();
+    await flushPromises();
+    await flushPromises();
+    const note = wrapper.find(".abilities__note");
+    // 这一组 fixture 里 `@Tier3_Burn@` / `@Tier3_ExecuteThreshold@` 故意没给 →
+    // 会走那句泛泛说明；但**已填上**的跨技能引用与分层数绝不能被报成缺失。
+    if (note.exists()) {
+      const text = note.text();
+      expect(text).not.toContain("Passive_QDamageIncrease");
+      expect(text).not.toContain("StackTier1");
+      expect(text).not.toContain("TotalDamage");
+    }
+    wrapper.unmount();
+  });
+});
+
+/**
+ * 2026-10-03 用户报的两件事，都是从这一段真机文案里看出来的：
+ *
+ * ```text
+ * <spellPassive>被动：</spellPassive>…<spellActive>主动：</spellActive>瑞兹释放一次魔爆，
+ * 造成<magicDamage>@QDamageCalc@魔法伤害</magicDamage>…使这个技能造成
+ * @Spell.RyzeR:OverloadDamageBonus@%伤害提升…
+ * ```
+ *
+ * 1. `<spellActive>` / `<spellPassive>` 当时不在白名单里 → 界面上直接印出标签字面量；
+ * 2. 「伤害加成」（法术强度 / 最大法力值）整块是空的 → 因为后端只认
+ *    `StatByNamedDataValueCalculationPart`，而瑞兹这条公式用的是**字面系数**
+ *    （`{0.55}` + `{0.02, mStatFormula:2}`），两段都被跳过了。
+ */
+describe("技能面板：多段加成与国服标签", () => {
+  function mountRyze() {
+    const data = abilitiesFixture({ championId: 13, alias: "Ryze", name: "符文法师" });
+    data.spells[0] = {
+      ...data.spells[0],
+      name: "超负荷",
+      dynamicDescription:
+        "<spellPassive>被动：</spellPassive>其它基础技能会重置这个技能的冷却时间。" +
+        "<br><br><spellActive>主动：</spellActive>瑞兹释放一次魔爆，对命中的第一个敌人造成" +
+        "<magicDamage>@QDamageCalc@魔法伤害</magicDamage>。如果目标带有" +
+        "<keywordMajor>涌动</keywordMajor>，则它会将其消耗，使这个技能造成" +
+        "@Spell.RyzeR:OverloadDamageBonus@%伤害提升。",
+    };
+    abilitiesState.data = data;
+    valuesState.data = {
+      alias: "Ryze",
+      spells: [
+        {
+          slot: "q",
+          values: {
+            // 真机：基础值 + 55% 法术强度（`StatByCoefficientCalculationPart`）
+            // + 2% 最大法力值（`AbilityResourceByCoefficientCalculationPart`）。
+            QDamageCalc: {
+              values: [55, 75, 95, 115, 135, 155, 175],
+              ratio: 0.55,
+              ratioStat: "AP",
+              ratioItems: [
+                { ratio: 0.55, stat: "AP" },
+                { ratio: 0.02, stat: "MaxMana" },
+              ],
+            },
+            // 跨技能引用：文案写 `@Spell.RyzeR:OverloadDamageBonus@`（大写 S），
+            // 后端按 CDragon 短名拼出来的键是小写 `spell.RyzeR:…`。
+            "spell.RyzeR:OverloadDamageBonus": { values: [10, 20, 30, 40, 50] },
+          },
+        },
+      ],
+    } as ChampionAbilityValues;
+    return mountPanel(13);
+  }
+
+  it("「主动：」「被动：」不再印成 <spellActive> 字面量", async () => {
+    const wrapper = mountRyze();
+    await flushPromises();
+    await flushPromises();
+    const html = wrapper.get(".abilities__body").html();
+    expect(html).not.toContain("spellActive");
+    expect(html).not.toContain("spellPassive");
+    expect(html).toContain('class="ab-active"');
+    expect(wrapper.get(".abilities__body").text()).toContain("主动：");
+    wrapper.unmount();
+  });
+
+  it("两段加成一起写在面板上（法术强度 + 最大法力值）", async () => {
+    const wrapper = mountRyze();
+    await flushPromises();
+    await flushPromises();
+    // 两段加成都要进正文——只留第一段（法强）就是用户报的「加成全没了」，
+    // 最大法力值那一段也必须在（用户 2026-10-03 贴的正是这句）。
+    const texts = wrapper.findAll(".abilities__text");
+    expect(texts[texts.length - 1].text()).toContain("55 / 75 / 95 / 115 / 135 + 55% 法术强度 + 2% 最大法力值");
+    // 变量名在速查表里。
+    expect(wrapper.get(".abilities__values").text()).toContain("QDamageCalc");
+    wrapper.unmount();
+  });
+
+  it("跨技能引用的大小写对不上也能取到值（@Spell.X@ ↔ spell.X）", async () => {
+    const wrapper = mountRyze();
+    await flushPromises();
+    await flushPromises();
+    const text = wrapper.get(".abilities__body").text();
+    expect(text).not.toContain("Spell.RyzeR");
+    expect(text).toContain("10 / 20 / 30 / 40 / 50%伤害提升");
     wrapper.unmount();
   });
 });

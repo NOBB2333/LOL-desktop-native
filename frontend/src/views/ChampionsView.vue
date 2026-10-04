@@ -142,11 +142,16 @@ function toggleAbilities(championId: number) {
 <style scoped>
 .champions-page--dense { max-width: 1540px; }
 .champions-toolbar { display: flex; align-items: center; gap: 5px; }
-.champions-toolbar .n-input { width: 190px; }.champions-toolbar .n-base-selection { width: 112px; }.champions-toolbar .champion-sort { width: 150px; }
+/* 搜索框是这一行里唯一需要「看清自己输了什么」的控件（支持俗称，可输入很长）。
+   固定 190px 时「龙龟」「文森特」这类词会被截掉，看不出是搜错了还是没搜到 →
+   改成 `flex: 1` + 上下限：窄窗口下自己让位给筛选器，宽窗口下吃满剩余空间。
+   `min-width: 0` 是关键：否则 flex 子项的 `min-width: auto` 会拒绝收缩，
+   整行溢出而不是把搜索框压扁。 */
+.champions-toolbar .n-input { flex: 1 1 260px; min-width: 200px; max-width: 420px; }.champions-toolbar .n-base-selection { width: 112px; flex: none; }.champions-toolbar .champion-sort { width: 150px; flex: none; }
 .champions-toolbar__scope { margin-left: 4px; padding-left: 8px; border-left: 1px solid var(--line); color: var(--text-muted); font-size: 10px; white-space: nowrap; }
 /* 「跟随本机」只是状态说明，压到最小，别和真正的控件抢注意力。 */
 .champions-toolbar__scope em { margin-left: 5px; padding: 1px 5px; border-radius: 7px; color: var(--accent); background: var(--accent-soft); font-size: 8px; font-style: normal; }
-.champions-toolbar .champion-region { width: 132px; }.champions-toolbar .champion-stats-tier { width: 112px; }
+.champions-toolbar .champion-region { width: 132px; flex: none; }.champions-toolbar .champion-stats-tier { width: 112px; flex: none; }
 .view-toggle { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); }
 .view-toggle button { display: grid; place-items: center; width: 28px; height: 26px; border: 0; border-radius: 3px; color: var(--text-secondary); background: transparent; cursor: pointer; }.view-toggle button.active { color: var(--accent); background: var(--accent-soft); }
 .champion-data-banner { display: flex; align-items: center; gap: 9px; padding: 11px 13px; margin-bottom: 12px; border: 1px solid var(--line); background: var(--surface-raised); color: var(--text-secondary); }.champion-data-banner > div:first-of-type { flex: 1; min-width: 0; }.champion-data-banner strong, .champion-data-banner span { display: block; }.champion-data-banner strong { color: var(--text-primary); font-size: 11px; }.champion-data-banner span { margin-top: 3px; font-size: 10px; }.champion-data-banner b { color: var(--text-primary); font-size: 11px; font-variant-numeric: tabular-nums; }.champion-data-banner__sources { display: flex; align-items: center; gap: 5px; }.source-chip { display: inline-flex; align-items: center; padding: 3px 5px; border: 1px solid var(--line); border-radius: 3px; font-size: 8px !important; white-space: nowrap; }.source-chip--lcu { color: var(--accent); background: var(--accent-soft); }.source-chip--opgg { color: var(--green); background: var(--green-soft); }

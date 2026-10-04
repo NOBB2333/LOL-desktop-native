@@ -2,6 +2,12 @@ const std = @import("std");
 
 /// 双方共用一个队列，同时最多处理五名玩家的资料。
 pub const Queue = struct {
+    /// 同时处理几名玩家（4 个工作线程 + 调用线程自己也下场）。
+    ///
+    /// 这个数字决定批次对 LCU 的**峰值并发**：每人最多同时挂 3 个本地请求，
+    /// 所以峰值 = `max_concurrency * 3`，`profiles` 配额的取值就照它定。
+    pub const max_concurrency = 5;
+
     next: std.atomic.Value(usize) = .init(0),
     cancelled: std.atomic.Value(bool) = .init(false),
     count: usize,
@@ -18,7 +24,7 @@ pub const Queue = struct {
     }
 
     pub fn run(self: *Queue) void {
-        var threads: [4]?std.Thread = .{null} ** 4;
+        var threads: [max_concurrency - 1]?std.Thread = .{null} ** (max_concurrency - 1);
         for (&threads) |*thread| thread.* = std.Thread.spawn(.{}, worker, .{self}) catch null;
         self.worker();
         for (threads) |thread| if (thread) |value| value.join();
@@ -49,12 +55,14 @@ test "首名玩家较慢时其余九名照常完成且并发有上限" {
     queue.run();
     try std.testing.expectEqual(@as(usize, 9), context.slow_saw);
     try std.testing.expectEqual(@as(usize, 10), context.completed.load(.acquire));
-    try std.testing.expect(context.peak.load(.acquire) <= 5);
+    try std.testing.expect(context.peak.load(.acquire) <= Queue.max_concurrency);
 }
 
 test "取消会话后不再启动排队玩家" {
     const Context = struct {
-        fn execute(_: *anyopaque, _: usize) void { @panic("已取消的任务不应启动"); }
+        fn execute(_: *anyopaque, _: usize) void {
+            @panic("已取消的任务不应启动");
+        }
     };
     var dummy: u8 = 0;
     var queue = Queue{ .count = 10, .context = &dummy, .execute = Context.execute };

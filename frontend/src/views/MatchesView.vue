@@ -12,7 +12,7 @@ import PageHeader from "../components/PageHeader.vue";
 import { backend } from "../services/backend";
 import { useAppStore } from "../stores/app";
 import type { MatchSummary, RankQueueSummary, SummonerSearchCandidate, SummonerSearchResult } from "../types/domain";
-import { championImage, percentOrDash, rankName, roleName, shortDate } from "../utils/format";
+import { championImage, percentOrDash, platformRegionLabel, rankName, roleName, shortDate } from "../utils/format";
 import { localPlayerRiotId, searchLocalPlayers } from "../matches/localPlayers";
 import { matchHistoryQueryKey } from "../matches/query";
 import { useMatchDetail } from "../composables/useMatchDetail";
@@ -31,10 +31,9 @@ const search = ref("");
 /**
  * 查询表单的解析结果：候选「名字#TAG」列表 + 是否需要补全标签。
  *
- * 本地接口（LCU 的 `lol-summoner/v1/summoners?name=`、Riot Client 的
- * `player-account/aliases/v1/lookup`）都是**精确匹配**，没有任何 name→tags 的
- * 反向索引，所以只给名字不一定查得到；把结果留下来才能在界面上把这件事说清楚，
- * 而不是把「解析失败」伪装成「这个人没有对局」。
+ * 三条路（移植自 LeagueAkari 的 `useSummonerSearch`）：只给名字走 Riot Client 的
+ * **模糊** lookup（能一次列出一批同名玩家），`名字#标签` 走全局精确解析，puuid 直接查。
+ * 所以「只给名字」现在是真的能搜到人的，`requiresTag` 只在模糊枚举也空手而归时才为真。
  */
 const searchResult = ref<SummonerSearchResult | null>(null);
 const searchError = ref("");
@@ -102,8 +101,21 @@ const hasNextPage = computed(() => rows.value.length === pageSize);
 const subjectProfile = useQuery({
   queryKey: computed(() => ["summoner-profile", app.mode, activeSummoner.value.trim()]),
   queryFn: async () => {
-    const found = await backend.searchSummoner(activeSummoner.value.trim());
-    return found.candidates.find((candidate) => candidate.puuid && candidate.puuid === app.connection.puuid) ?? found.candidates[0] ?? null;
+    const query = activeSummoner.value.trim();
+    const found = await backend.searchSummoner(query);
+    // ⚠️ 别再拿「本机账号那条」优先：以前写成 `find(puuid === connection.puuid) ?? candidates[0]`，
+    // 于是查一个和你同名的人时，信息条会显示**你自己**的等级段位 —— 看起来像「查了但没变」。
+    // 现在按**完整 Riot ID** 精确配对（`名字#编号` 才是这个查询的身份），
+    // 配不上才退回唯一候选 / 第一个候选。
+    if (query) {
+      const exact = found.candidates.find((candidate) => riotIdOf(candidate).toLowerCase() === query.toLowerCase());
+      if (exact) return exact;
+    }
+    if (!query.includes("#")) {
+      const self = found.candidates.find((candidate) => candidate.puuid && candidate.puuid === app.connection.puuid);
+      if (self) return self;
+    }
+    return found.candidates[0] ?? null;
   },
   enabled: computed(() => app.initialized && Boolean(activeSummoner.value.trim())),
   staleTime: 300_000,
@@ -120,6 +132,15 @@ const currentAccountRiotId = computed(() => {
   return app.connection.tagLine ? `${name}#${app.connection.tagLine}` : name;
 });
 const viewedName = computed(() => (viewingOther.value ? activeSummoner.value : currentAccountRiotId.value));
+/**
+ * 正在查看的玩家所在**大区**。
+ *
+ * 为什么要在信息条里再写一遍：跨区玩家在候选列表里已经有小标签了，但一点进来
+ * 就只剩「名字#标签」，等级与段位在本地一律是「—」——用户会以为「这个人查不到」。
+ * 把大区亮出来，才看得出「他不是没数据，是在别的区」。
+ * （2026-10-03 用户报：「也没显示你说的所在大区」。）
+ */
+const viewedRegion = computed(() => (viewingOther.value ? regionLabel(viewedProfile.value?.sgpServerId) : ""));
 
 /** 「翡翠 II · 63 LP」；缺数据显示「—」，不写「无段位」（那是另一个含义）。 */
 function rankLabel(rank: RankQueueSummary | null | undefined) {
@@ -215,15 +236,22 @@ async function searchSummoner() {
     // 完整的「名字#TAG」即使没解析出候选也值得直接交给 LCU 试一次：
     // 候选解析失败只说明 Riot Client 不可用，不代表这个人不存在。
     if (result.candidates.length === 0 && result.hasTag) return void applySummoner(query);
-    // 只给名字又解析不到：不发起注定落空的查询，改为提示补全标签。
+    // 只给名字、模糊枚举也一个都没回来：不发起注定落空的查询。
     if (result.candidates.length === 0) {
       // 本地档案里有像的人就直接指出来——比一句「请补全标签」有用得多，
       // 而且这些人是我们**确实见过**的，点一下就带着完整的 `名字#标签` 去查。
       if (localHits.value.length) message.info(`本地档案里有 ${localHits.value.length} 位相近的玩家，点选一位即可查询`);
-      else message.warning("客户端只能精确匹配，请补全为「名字#标签」后再试");
+      else message.warning("没有找到这个名字对应的玩家，请确认名字，或补全为「名字#标签」后再试");
       return;
     }
-    message.info(`匹配到 ${result.candidates.length} 个账号，请选择要查询的玩家`);
+    // 候选多、且名字全都一样时，真正能把人分开的是**大区**，提示里点一下。
+    const hasCrossRegion = result.candidates.some((candidate) => Boolean(candidate.sgpServerId));
+    const searchedCount = result.regions?.probed.length ?? 0;
+    message.info(
+      hasCrossRegion
+        ? `匹配到 ${result.candidates.length} 个账号（含其他大区，已搜索 ${searchedCount} 个大区），请按大区选择要查询的玩家`
+        : `匹配到 ${result.candidates.length} 个账号，请选择要查询的玩家`,
+    );
   } catch (cause) {
     searchError.value = cause instanceof Error ? cause.message : String(cause);
   } finally {
@@ -236,6 +264,72 @@ function riotIdOf(candidate: SummonerSearchCandidate) {
   return candidate.tagLine ? `${candidate.gameName}#${candidate.tagLine}` : candidate.gameName;
 }
 
+/**
+ * SGP 子区 → 大区名。
+ *
+ * ⚠️ **这里曾经自己抄过一张表，而且抄错了**：`HN1` 写成「河南一区」、`HN10` 写成
+ * 「河南十区」、`TJ101` 写成「天津二区」……全错。真名是
+ * `HN1=艾欧尼亚 / HN10=黑色玫瑰 / TJ100=联盟四区 / TJ101=联盟五区 /
+ * NJ100=联盟一区 / GZ100=联盟二区 / CQ100=联盟三区 / BGP2=峡谷之巅`
+ * —— 也就是 `utils/format.ts` 里那份（和客户端「大区速查」同一个来源）。
+ *
+ * 用户当场就发现不对（「联盟一区、二区、三区，只是用特殊的标符」），因为
+ * **`TJ`/`HN`/`NJ`/`GZ`/`CQ` 是机房代号，不是城市**。名字错本身不报错，
+ * 只会让人以为搜索坏了，所以大区名**只留一份来源**，别再抄第二张表。
+ */
+const regionLabel = (serverId?: string | null) => platformRegionLabel(serverId);
+
+/**
+ * 「全大区搜索」的结论，给用户看的三件事：搜了哪些区、命中哪个、本区有没有。
+ *
+ * 为什么必须显示：跨区玩家在本区是**搜得到人、查不到战绩**的，看起来就像功能坏了
+ * （用户原话：「全大区搜索你最起码显示一下吧，说当前大区搜不到，然后在哪个正在搜哪个大区」）。
+ * 后端已经把逐区结果带出来了（`regions.probed`），这里只负责说人话。
+ */
+const regionProbe = computed(() => searchResult.value?.regions ?? null);
+const regionProbeLocated = computed(() => regionLabel(regionProbe.value?.located));
+const regionProbeSearched = computed(() =>
+  (regionProbe.value?.probed ?? []).map((entry) => ({ ...entry, label: regionLabel(entry.serverId) })),
+);
+/** 本机当前大区（后端每次刷新连接时带回来）。 */
+const currentRegionLabel = computed(() => regionLabel(app.connection.platformId));
+/**
+ * 这次查询**已经解析出账号**了吗（RC 全局限别名表认得这个人）。
+ *
+ * 为什么必须区分：精确搜索命中候选时，说「各大区都没这个人」是**自相矛盾**的
+ * —— 人明明已经解析出来了，只是逐区没定位到他属于哪个大区。2026-10-03 用户实报：
+ * 「精确匹配 1 个账号」下面紧接着「8 个大区都没这个人」，一眼就是错的。
+ * 解析到了就说「定位失败」，没解析到才能说「都没这个人」。
+ */
+const regionProbeResolvedAccount = computed(() => (searchResult.value?.candidates.length ?? 0) > 0);
+
+/**
+ * 战绩查询失败时的说明。
+ *
+ * ⚠️ 以前这里**什么都不显示**：`get_match_history` 抛错时 `rows` 是空数组，
+ * 页面就只剩一句「没有匹配的对局」，和后端那条链在哪一环断掉完全无关
+ * （应用自己的库里能看到 `historySubject` 已写入、`playerHistory` 却没有，就是这种形态）。
+ * 跨区玩家最容易撞上：解析成功了，取战绩那一步失败，用户却看到「搜不到」。
+ */
+const matchesError = computed(() => {
+  if (!matches.isError.value) return "";
+  const cause = matches.error.value;
+  return cause instanceof Error ? cause.message : String(cause ?? "");
+});
+const MATCH_ERROR_HINTS: Record<string, string> = {
+  LcuNotRunning: "没检测到 League Client：请先启动客户端再查战绩。",
+  LcuRequestFailed: "客户端接口没有返回战绩。若这是别的玩家，通常说明跨区取数被网关拦了，稍后重试即可。",
+  SummonerLookupFailed: "解析不到这个 Riot ID：请确认写成「名字#编号」，或换用上面的查询先选中候选。",
+  PlatformMismatch: "切换过的账号与大区对不上，请刷新一次连接。",
+  AccountChanged: "中途切换了账号，请重新查询。",
+};
+const matchesErrorHint = computed(() => {
+  const raw = matchesError.value;
+  if (!raw) return "";
+  for (const [key, hint] of Object.entries(MATCH_ERROR_HINTS)) if (raw.includes(key)) return hint;
+  return "取战绩时出错了。可以先点「刷新」，若一直这样请把这条消息反馈给我们。";
+});
+
 /** 把当前查询切到某位玩家（或空串恢复当前账号）并刷新列表。 */
 async function applySummoner(riotId: string) {
   summonerQuery.value = riotId;
@@ -245,7 +339,10 @@ async function applySummoner(riotId: string) {
   detailOpen.value = true;
   await router.replace({ query: riotId ? { summoner: riotId } : {} });
   await matches.refetch();
-  message.success(riotId ? `已查询召唤师：${riotId}` : "已恢复当前账号战绩");
+  // 定位到哪个大区一并说出来：同一个「名字#编号」在不同大区是不同的人，
+  // 而且跨区取战绩本来就慢，用户需要知道刚才那一趟去了哪里。
+  const located = regionLabel(searchResult.value?.regions?.located);
+  message.success(riotId ? `已查询召唤师：${riotId}${located ? `（${located}）` : ""}` : "已恢复当前账号战绩");
 }
 
 function pickCandidate(candidate: SummonerSearchCandidate) {
@@ -295,10 +392,15 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
         <strong>{{ viewedName || "—" }}</strong>
       </div>
       <div class="matches-account-strip__stat"><span>等级</span><strong>{{ viewedLevel ? `Lv.${viewedLevel}` : "—" }}</strong></div>
+      <div v-if="viewedRegion" class="matches-account-strip__stat"><span>大区</span><strong>{{ viewedRegion }}</strong></div>
       <div class="matches-account-strip__stat"><span>单双排</span><strong>{{ rankLabel(viewedSolo) }}</strong></div>
       <div class="matches-account-strip__stat"><span>灵活组排</span><strong>{{ rankLabel(viewedFlex) }}</strong></div>
       <p v-if="viewingOther && !viewedProfile && !subjectProfileLoading" class="matches-account-strip__hint">
-        本机解析不到这位玩家的等级与段位：跨区玩家在本地客户端没有段位数据，下面只显示对局记录。
+        <!-- 跨区玩家等级也拿不到时才这样说；拿得到等级就只解释段位为什么是空。 -->
+        本机解析不到这位玩家的资料：跨区玩家的段位在本地客户端没有数据，下面只显示对局记录。
+      </p>
+      <p v-else-if="viewingOther && viewedRegion && !viewedSolo && !viewedFlex && !subjectProfileLoading" class="matches-account-strip__hint">
+        段位在<strong>别的区</strong>：{{ viewedRegion }}的段位本机取不到（官方接口不支持跨区读段位），但战绩是从{{ viewedRegion }}直接拉的。
       </p>
     </section>
 
@@ -309,12 +411,20 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
         <p>先尝试解析查询：唯一命中会直接跳转；留空则恢复当前登录账号。</p>
       </form>
 
-      <!-- 候选：名字重复时列出所有精确命中，点一下即查询。 -->
+      <!-- 候选：模糊查询可能一次回来一批同名玩家，点一下即查询。 -->
       <div v-if="searchResult && searchResult.candidates.length" class="matches-candidates">
-        <span class="matches-candidates__label">精确匹配 {{ searchResult.candidates.length }} 个账号</span>
+        <span class="matches-candidates__label">
+          {{ searchResult.searchType === "puuid" ? "按 ID 命中" : searchResult.searchType === "exact" ? "精确匹配" : "同名玩家" }}
+          {{ searchResult.candidates.length }} 个账号
+        </span>
         <button v-for="(candidate, index) in searchResult.candidates" :key="candidate.puuid" type="button" class="matches-candidate" @click="pickCandidate(candidate)">
           <strong>{{ candidate.gameName }}</strong>
           <small v-if="candidate.tagLine">#{{ candidate.tagLine }}</small>
+          <!--
+            跨区候选必须把大区亮出来：同名同标签的两个人在列表里长得一模一样，
+            唯一能区分的就是 sgpServerId。
+          -->
+          <em v-if="candidate.sgpServerId" class="matches-candidate__region">{{ regionLabel(candidate.sgpServerId) }}</em>
           <em v-if="candidate.puuid === app.connection.puuid">当前账号</em>
           <em v-else-if="isDuplicatedCandidate(candidate)" class="matches-candidate__ordinal">候选 {{ index + 1 }}</em>
         </button>
@@ -338,15 +448,60 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
       </p>
 
       <!--
-        只说「为什么只给名字查不到」：本地客户端没有 name→tags 的反向索引。
-        这里**不再列大区清单**——大区根本不需要选，列出编号只会让人以为要选。
+        模糊枚举（RC 全局 lookup）也一个都没回来时才提示补全标签。
+        这条比老版本罕见得多：老版本把「只给名字」直接判死，现在名字是能搜的。
       -->
       <p v-if="searchResult?.requiresTag" class="matches-query-note" data-tone="warning">
-        本地客户端只有精确匹配，没有「按名字列出所有标签」的接口：只给名字时只会去当前大区里找，
-        而且只回一个人。同名的人散在不同大区时，光凭名字没法把他们列出来。请补全为
-        <b>名字#标签</b>后再查。
+        没有找到「{{ searchResult.query }}」对应的玩家：只给名字时会去全局别名表里找同名账号，
+        这次一个都没命中。请确认名字是否写对，或补全为 <b>名字#标签</b> 后再查。
       </p>
       <p v-else-if="searchError" class="matches-query-note" data-tone="warning">{{ searchError }}</p>
+
+      <!--
+        正在搜索时的进度。bridge 是请求/响应式的，中途拿不到「正在搜哪个区的第几个」，
+        所以这里如实说的是**这一步在做什么**（解析账号 → 逐个问大区 → 取战绩），
+        不编一个假的百分比。
+      -->
+      <p v-if="searchPending" class="matches-query-note" data-tone="progress" data-testid="matches-search-progress">
+        正在解析「{{ summonerQuery.trim() }}」：先查当前大区（{{ currentRegionLabel || "本区" }}），
+        认不出就逐个问腾讯各大区，然后才去取战绩。
+      </p>
+
+      <!--
+        「全大区搜索」的结论：搜了哪几个区、命中哪个、本区有没有。
+        用户明确要求把这件事显示出来 —— 跨区玩家在本区搜得到人却查不到战绩，
+        不把大区亮出来，看起来就是「搜不到」。
+      -->
+      <div v-if="regionProbeSearched.length" class="matches-query-note" data-tone="info" data-testid="matches-region-probe">
+        <template v-if="regionProbeLocated">
+          已搜索 <b>{{ regionProbeSearched.length }}</b> 个大区，定位到该玩家在
+          <b>{{ regionProbeLocated }}</b><template v-if="currentRegionLabel && regionProbeLocated !== currentRegionLabel">（不是本机所在的{{ currentRegionLabel }}）</template>。
+        </template>
+        <template v-else-if="regionProbeResolvedAccount">
+          <!-- 账号已经解析出来了，就不能说「没这个人」—— 那是逐区定位失败，是另一回事。 -->
+          当前大区（{{ currentRegionLabel || "本区" }}）搜不到，<b>{{ regionProbeSearched.length }}</b>
+          个大区也都没能定位到这个账号属于哪个大区。账号本身是解析到了的，但<b>取不到所属大区</b>，
+          下面的战绩大概率为空。
+        </template>
+        <template v-else>
+          当前大区（{{ currentRegionLabel || "本区" }}）搜不到，已把
+          <b>{{ regionProbeSearched.length }}</b> 个大区全问过一遍，都没这个人。
+        </template>
+        <span class="matches-region-probe__list">
+          <span v-for="entry in regionProbeSearched" :key="entry.serverId" class="matches-region-probe__chip" :data-found="entry.found">
+            {{ entry.label }}<i>{{ entry.found ? "命中" : "无" }}</i>
+          </span>
+        </span>
+      </div>
+
+      <!--
+        取战绩失败时的说明。跨区玩家最容易撞上这一步：账号解析成功、大区也定位到了，
+        「取战绩」那一环失败 —— 以前页面只会给一个空列表，看起来像「搜不到人」。
+      -->
+      <p v-if="matchesErrorHint" class="matches-query-note" data-tone="warning" data-testid="matches-error">
+        取战绩失败：{{ matchesErrorHint }}
+        <small v-if="matchesError">（{{ matchesError }}）</small>
+      </p>
 
       <div class="matches-filter-row">
         <div class="matches-filter-title"><Filter :size="14" /><span>当前页筛选</span></div>
@@ -420,7 +575,22 @@ watch(() => route.query.summoner, (value) => { const next = typeof value === "st
 /* 本地档案是「猜测」而不是「精确命中」，用虚线把它和上面的精确匹配区分开。 */
 .matches-candidates--local { border-top-style: dashed; }
 .matches-candidates--local .matches-candidate { border-style: dashed; }.matches-candidate { display: inline-flex; align-items: center; gap: 3px; padding: 4px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--text-primary); background: var(--surface-raised); cursor: pointer; font-size: 11px; transition: border-color 140ms ease, background 140ms ease; }.matches-candidate:hover { border-color: var(--accent); background: var(--accent-soft); }.matches-candidate strong { font-weight: 700; }.matches-candidate small { color: var(--text-secondary); font-size: 10px; }.matches-candidate em { padding: 1px 5px; border-radius: 3px; color: var(--accent); background: var(--accent-soft); font-size: 8px; font-style: normal; font-weight: 700; }.matches-candidate em.matches-candidate__ordinal { color: var(--text-secondary); background: var(--surface-muted); }
+/* 大区标签：同名候选之间唯一能区分的东西，给它一个和「当前账号」不同的低饱和色，
+   避免玩家把它误当成状态标记。 */
+.matches-candidate em.matches-candidate__region { color: var(--text-secondary); background: var(--surface-muted); font-weight: 600; }
 .matches-query-note { margin: 0; padding: 8px 10px; border: 1px dashed var(--line-strong); border-left: 3px solid var(--amber); color: var(--text-secondary); background: var(--surface-raised); font-size: 10px; line-height: 1.5; }.matches-query-note b { color: var(--text-primary); }
+/* 「正在搜索」用中性色：它只是进度，不是错误（错误才是琥珀色那条）。 */
+.matches-query-note[data-tone="progress"] { border-left-color: var(--accent); color: var(--text-secondary); }
+/* 「全大区搜索结果」是结论，用信息色把它和上下两条警告区分开。 */
+.matches-query-note[data-tone="info"] { border-left-color: var(--blue); }
+.matches-query-note[data-tone="warning"] { border-left-color: var(--amber); }
+.matches-query-note small { color: var(--text-muted); }
+/* 逐区结果：一排小胶囊，命中那个用强调色 —— 一眼能看出「搜了 3 个区，第 3 个中」。 */
+.matches-region-probe__list { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-left: 6px; }
+.matches-region-probe__chip { display: inline-flex; align-items: center; gap: 3px; padding: 1px 6px; border: 1px solid var(--line); border-radius: 999px; color: var(--text-muted); background: var(--surface); font-size: 9px; }
+.matches-region-probe__chip i { color: var(--text-muted); font-size: 8px; font-style: normal; }
+.matches-region-probe__chip[data-found="true"] { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.matches-region-probe__chip[data-found="true"] i { color: var(--accent); font-weight: 700; }
 .matches-summary { display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)) minmax(230px, 1.4fr); gap: 1px; margin-bottom: 14px; border: 1px solid var(--line); background: var(--line); }.matches-summary > div { min-height: 70px; padding: 12px 15px; background: var(--surface); }.matches-summary span, .matches-summary strong { display: block; }.matches-summary span { color: var(--text-secondary); font-size: 10px; }.matches-summary strong { margin-top: 9px; font-size: 20px; font-variant-numeric: tabular-nums; }.matches-summary small { color: var(--text-secondary); font-size: 11px; font-weight: 500; }.matches-summary__result { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 11px; }.matches-summary__result span { display: inline; }
 .match-table-shell { border: 1px solid var(--line); background: var(--surface); }.match-table-heading { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; padding: 13px 15px 10px; border-bottom: 1px solid var(--line); }.match-table-heading h2 { margin: 4px 0 0; font-size: 16px; }.match-table-heading__hint { color: var(--text-muted); font-size: 9px; }.match-list--full { padding: 8px; overflow-x: auto; }
 .matches-workspace { display: grid; grid-template-columns: minmax(184px, .16fr) minmax(0, 1fr); gap: 8px; min-width: 0; align-items: stretch; }.matches-index, .matches-detail-panel { min-width: 0; border: 1px solid var(--line); background: var(--surface); }.matches-index { display: flex; flex-direction: column; overflow: hidden; }.matches-index__header { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; padding: 11px 12px 9px; border-bottom: 1px solid var(--line); }.matches-index__header h2 { margin: 3px 0 0; font-size: 14px; }.matches-index__header > span { color: var(--text-secondary); font-size: 8px; font-variant-numeric: tabular-nums; }.matches-index__list { display: grid; align-content: start; flex: 1; gap: 4px; padding: 5px; overflow: auto; }

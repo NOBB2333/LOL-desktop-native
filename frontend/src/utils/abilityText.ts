@@ -39,12 +39,58 @@ const TAG_CLASSES: Record<string, string> = {
   attention: "attention",
   passive: "passive",
   active: "active",
+  /**
+   * `spellPassive` / `spellActive`——国服文案里**真正的**「被动：」「主动：」标签。
+   *
+   * ⚠️ 别和上面那对弄混：`<passive>` / `<active>` 只在少数英雄用（20 / 14 处），
+   * `<spellPassive>` / `<spellActive>` 才是常态——2026-10-03 全量扫描 245 个英雄，
+   * 前者 264 处、后者 212 处。不加进来就会被当文本转义，界面上直接印出
+   * `<spellActive>主动：</spellActive>` 这种字面量（用户 2026-10-03 报的）。
+   */
+  spellpassive: "passive",
+  spellactive: "active",
+  /**
+   * 「开始蓄力 / 释放 / 秒放 / 蓄力」这类**阶段标签**（加里奥 W、沃里克 E…）。
+   * 和「再次施放」是同一个角色：一句动作的导语。共用 `recast` 的样式。
+   */
+  charge: "recast",
+  release: "recast",
+  tap: "recast",
+  hold: "recast",
+  /**
+   * 一堆「关键词上色」标签，语义都是「这是个机制名词，给它一点强调」。
+   *
+   * 逐个列是因为**上色方式不同**：`keywordMajor` 走 `<font color>`（内联色），
+   * 这些没有颜色属性，统一走 `.ab-keyword` 的中性强调色。
+   * 2026-10-03 全量扫描：`keywordStealth` 86、`onHit` 38、`toggle` 28、`evolve` 16、
+   * `keywordName` 6、`magicPen`/`danger`/`factionIonia1`/`specialRules`/`lifeSteal`/
+   * `armorPen`/`gold`/`slow`/`omnivamp` 各 2~4 处。
+   */
+  keywordstealth: "keyword",
+  keywordname: "keyword",
+  onhit: "keyword",
+  toggle: "keyword",
+  evolve: "keyword",
+  danger: "keyword",
+  factionionia1: "keyword",
+  specialrules: "keyword",
+  lifesteal: "keyword",
+  omnivamp: "keyword",
+  magicpen: "keyword",
+  armorpen: "keyword",
+  gold: "keyword",
+  slow: "keyword",
   scalead: "scale",
   scalemr: "scale",
   scalearmor: "scale",
   scaleap: "scale",
   scalehp: "scale",
   scalemana: "scale",
+  scalehealth: "scale",
+  scalelevel: "scale",
+  /** 攻速、冷却这类「带单位的数值」——和移速同样处理（`275%攻击速度`、`10秒`）。 */
+  attackspeed: "speed",
+  cooldown: "speed",
   /**
    * 客户端用来给「关键词」上色的标签，比如龙王的【星尘】：
    *
@@ -57,6 +103,33 @@ const TAG_CLASSES: Record<string, string> = {
    */
   font: "fontcolor",
   color: "fontcolor",
+  /**
+   * 国服文案里更常见的「关键词/重点」标签（2026-09-30 全英雄扫描：**108 个英雄**用它）。
+   *
+   * ```html
+   * <li><keywordMajor>25 / 25 / …层</keywordMajor>：对目标周围的所有敌人造成伤害。
+   * ```
+   *
+   * 不加进来就会被当文本转义，界面上直接印出 `<keywordMajor>` 字面量。
+   */
+  keywordmajor: "keyword",
+  keyword: "keyword",
+  keywordminor: "keyword",
+  /**
+   * 客户端用 `<li>` 排**列表项**（斯莫德 Q 的三档进化、薇恩 W 的三环…）。
+   *
+   * ⚠️ 它**不是**合法 HTML 的 `<li>` 语义——文案里是「连着写一串 `<li>`、
+   * 没有 `<ul>` 包裹、也常常不闭合」。直接当文本转义会让三档效果挤成一句话；
+   * 当 HTML 塞进 `<p>` 又会产生非法嵌套。所以映射成 `block` 类
+   * （`display: block` + 行首符号），既不挤行也不破坏结构。
+   */
+  li: "listitem",
+  /**
+   * `<ul>` 是 `<li>` 的容器（皮肤介绍里的「四套搭配了智能战甲的致命枪械」那种列表）。
+   * 映射成 `block` 而不是转义：不认它就会把 `<ul>` 字面量印出来。
+   * 它**没有**配对闭合也常见，所以和 `li` 一样进 `OPTIONAL_CLOSE`。
+   */
+  ul: "block",
   // 纯排版
   br: "br",
   i: "italic",
@@ -65,6 +138,16 @@ const TAG_CLASSES: Record<string, string> = {
   stats: "block",
   rules: "block",
   flavortext: "flavor",
+  /**
+   * `<p>` / `<hr>`：皮肤介绍那种整段文案在用。
+   *
+   * - `<p>` 映射成块级 **span**（`block`）而不是 `<p>`——我们的渲染结果本身就塞在
+   *   一个 `<p class="abilities__text">` 里，再嵌一层 `<p>` 是非法 HTML，
+   *   浏览器会自动补闭合，把后面的内容挤到段落外面。
+   * - `<hr>`（凯隐两种形态之间的分隔线）是自闭合标签，见 `VOID_TAGS`。
+   */
+  p: "block",
+  hr: "separator",
 };
 
 /**
@@ -87,10 +170,10 @@ function attrValue(inner: string, name: string): string | undefined {
 }
 
 /** 自闭合：不需要配对的标签名。 */
-const VOID_TAGS = new Set(["br"]);
+const VOID_TAGS = new Set(["br", "hr"]);
 
 /** 没有对应 `</tag>` 也要能处理的标签（客户端偶尔只开不闭）。 */
-const OPTIONAL_CLOSE = new Set(["br", "maintext", "stats", "rules", "flavortext"]);
+const OPTIONAL_CLOSE = new Set(["br", "maintext", "stats", "rules", "flavortext", "li", "ul", "p", "hr"]);
 
 function escapeHtml(text: string): string {
   return text
@@ -151,6 +234,132 @@ export function parsePlaceholderExpression(input: string): PlaceholderExpression
 }
 
 /**
+ * 客户端文案里的**图标占位符**：`%i:cooldown%`、`%i:OnHit%`、`%i:scaleAP%`…
+ *
+ * 2026-10-03 全量扫描 245 个英雄：共 999 处，其中 `%i:cooldown%` 占 974 处。
+ * 客户端把它们渲染成一个小图标，我们没有那套图标资源；**删掉**最干净——
+ * 旁边的文字已经把意思说全了（`10秒 %i:cooldown%`、`攻击特效 %i:OnHit%`），
+ * 留着就会在界面上印出 `%i:cooldown%` 这种字面量。
+ */
+const ICON_TOKEN = /%i:[A-Za-z0-9_.]+%/g;
+
+/**
+ * 引擎侧的**散文占位符**：名字能解析出来，但**永远不会对应一个数值**——
+ * 它是游戏引擎往里拼「技能修饰器说明」的位置，和 `DataValues` /
+ * `mSpellCalculations` 没有半点关系。两份数据源都查过，拿不到：
+ *
+ *  - 客户端（LCU）英雄 JSON：`spells[]` 里根本没有这个键（只有
+ *    spellKey/name/description/dynamicDescription/…）；
+ *  - CommunityDragon 的 `ryze.bin.json`：整份文件里不存在 `Modifier` / `Append` 字段。
+ *
+ * 对绝大多数英雄这里本来就该是空的（瑞兹四个技能都没有修饰器）。以前会原样印出
+ * `@SpellModifierDescriptionAppend@` 这个字面量——纯噪音，现在渲染时整段抹掉。
+ *
+ * 注意：**只抹渲染，不抹 `remainingPlaceholders`**。技能面板本来就用这一项来判断
+ * 「剩下的全是拼接位」→ 显示「末尾没有显示内容的那一处，是客户端用来拼接装备与符文
+ * 加成的位置」那句说明（见 `ChampionAbilityPanel.vue` 的 `leftoverIsOnlyAppend`）。
+ * 那句说明本来就写着「没有显示内容」，所以抹掉渲染输出正好让它名副其实；
+ * 若把 `remainingPlaceholders` 也一起改掉，那句说明就永远不会触发了。
+ */
+const PROSE_PLACEHOLDERS = new Set(["SpellModifierDescriptionAppend"]);
+
+/**
+ * 在取值表里找一个占位符**命中的那个键**（不只是值）。
+ *
+ * 四级降级，**顺序要紧**：
+ *  1. 完整名字（`spell.SmolderP:Passive_QDamageIncrease`）——后端对跨技能引用
+ *     正是用完整名字做键的，这一级命中就说明跨技能引用已经打通。
+ *  2. 完整名字的**大小写无关**匹配——客户端文案写 `@Spell.RyzeR:OverloadDamageBonus@`
+ *     （大写 `S`），而后端是按 CDragon 短名拼键的（`spell.RyzeR:…`，小写 `s`）。
+ *     实测同一份数据里两种写法都有（拉莫斯 R 是 `@spell.PowerBall:…@`），
+ *     只认一种就会把一个**明明取到了值**的占位符当成没取到。
+ *  3. 冒号后的部分（`Passive_QDamageIncrease`）——老后端 / 只给短名的场合。
+ *  4. 最后一段（`.` 与 `:` 都切开）。
+ *
+ * 不能只留第 1 级：同一份数据里两种键都可能出现；也不能只留第 4 级：
+ * `spell.A:Foo` 与 `spell.B:Foo` 会互相抢（同一英雄里极少，但不是不可能）。
+ *
+ * ⚠️ 返回**键**而不是值，是为了让「这段文案到底引用了哪几个变量」
+ * （`referencedValueKeys`）能和取值走**同一套**匹配规则——两套规则各写一遍，
+ * 迟早会出现「明明填上了却报没填」的自相矛盾。
+ */
+function matchValueKey(values: Record<string, string> | undefined, name: string): string | undefined {
+  if (!values) return undefined;
+  if (values[name] !== undefined) return name;
+  // 大小写无关：见上面第 2 条。
+  const lower = name.toLowerCase();
+  for (const key of Object.keys(values)) {
+    if (key.toLowerCase() === lower) return key;
+  }
+  const afterColon = name.includes(":") ? name.slice(name.indexOf(":") + 1) : undefined;
+  if (afterColon !== undefined && values[afterColon] !== undefined) return afterColon;
+  const last = name.split(/[.:]/).pop();
+  if (last !== undefined && values[last] !== undefined) return last;
+  return undefined;
+}
+
+/** 按 `matchValueKey` 的降级链取值。 */
+function lookupValue(values: Record<string, string> | undefined, name: string): string | undefined {
+  const key = matchValueKey(values, name);
+  return key === undefined ? undefined : values?.[key];
+}
+
+/**
+ * 后端给**跨技能引用**加的键前缀（`spell.PowerBall:PowerBallDamage`）。
+ *
+ * 它同时是「这一项是不是本技能自己的变量」的判据——见 `referencedValueKeys`。
+ */
+const CROSS_SKILL_KEY = /^spell\.[A-Za-z0-9_]+:/;
+
+/** 这一项是不是跨技能引用（`spell.<短名>:<变量>`）。 */
+export function isCrossSkillKey(name: string): boolean {
+  return CROSS_SKILL_KEY.test(name);
+}
+
+/**
+ * 这段文案**真正引用到**了取值表里的哪些键。
+ *
+ * # 为什么必须过滤
+ *
+ * 后端为了支持 `@spell.X:Y@` 这种跨技能引用，会把**其他每个技能整体**收一遍、
+ * 统一加上 `spell.<短名>:` 前缀塞进当前槽位。做法本身没错，但结果是**每个槽位
+ * 都拿到全英雄的变量**——实测拉莫斯 5 个槽位各 46 项、cross 集合逐字相同：
+ *
+ * ```text
+ * Q（动力冲刺）的取值表里混进了 spell.PuncturingTaunt:MonsterDamageCalc、
+ *   spell.Tremors2:TurretDamageModifier、spell.RammusP:BaseDamage …
+ * ```
+ *
+ * 界面上就表现为「点开任何一个技能，下面都列 46 行、大半跟这个技能无关」
+ * （用户 2026-10-03 报的：拉莫斯 W 下面挂着 Q/E/R 的伤害系数）。
+ *
+ * CDragon 那份角色文件里**没有任何文案**（实测 `@` 出现 0 次、连中文都没有），
+ * 所以后端无从判断谁被引用；而这一层手里正好有原文，就该在这里收口。
+ *
+ * @param text 该技能的原文（`description` + `dynamicDescription` + 被动的 `description`）
+ * @param values 该槽位的取值表
+ * @returns 被引用到的键集合；文案里没有任何占位符时返回**空集合**（由调用方决定退化成什么）
+ */
+export function referencedValueKeys(
+  text: string,
+  values: Record<string, unknown> | undefined,
+): Set<string> {
+  const hit = new Set<string>();
+  if (!text || !values) return hit;
+  const re = /@([^@]+)@/g;
+  let match = re.exec(text);
+  while (match) {
+    const expression = parsePlaceholderExpression(match[1]);
+    if (expression) {
+      const key = matchValueKey(values as Record<string, string>, expression.name);
+      if (key !== undefined) hit.add(key);
+    }
+    match = re.exec(text);
+  }
+  return hit;
+}
+
+/**
  * 把解析出来的表达式渲染成一段 HTML。取不到值返回 null（由调用方标出原文）。
  *
  * 关键一步是 `*100`：CDragon 那边的 `AOEModifier` 存的是 **0.5**，客户端文案写成
@@ -163,7 +372,7 @@ export function renderPlaceholderExpression(
   valueClass: string,
 ): string | null {
   const { name, scale, offset } = expression;
-  const raw = values?.[name] ?? values?.[name.split(/[.:]/).pop() ?? name];
+  const raw = lookupValue(values, name);
   if (raw === undefined || raw === "") return null;
 
   // 只有「单值」才做运算：逐级数组（`"40 / 80 / 120"`）没法整体乘，保留就好。
@@ -183,8 +392,10 @@ export function renderPlaceholderExpression(
  * - `<br>` → `<br />`。
  * - `@Name@` → `values[Name]`（有值）或原样保留。
  */
-export function renderAbilityText(raw: string, options: RenderOptions = {}): string {
-  if (!raw) return "";
+export function renderAbilityText(rawInput: string, options: RenderOptions = {}): string {
+  if (!rawInput) return "";
+  // 先把图标占位符摘掉（见 `ICON_TOKEN`），后面整段逻辑就不用再管它。
+  const raw = rawInput.replace(ICON_TOKEN, "");
   const { values, valueClass = "value" } = options;
   let out = "";
   let index = 0;
@@ -248,13 +459,14 @@ export function renderAbilityText(raw: string, options: RenderOptions = {}): str
         // 白名单外：原样转义成可见文本（而不是丢掉，避免句子断掉）。
         out += escapeHtml(raw.slice(next, gt + 1));
       } else if (VOID_TAGS.has(name)) {
-        out += '<br />';
+        // 自闭合标签各有各的空元素：`<br>` 换行、`<hr>` 分隔线。
+        out += name === "hr" ? '<hr class="ab-separator" />' : "<br />";
       } else if (closing) {
         closeTo(name);
       } else {
-        // 自闭合写法 `<br/>` 也要认。
+        // 自闭合写法 `<br/>` / `<hr/>` 也要认。
         if (inner.endsWith("/")) {
-          out += '<br />';
+          out += name === "hr" ? '<hr class="ab-separator" />' : "<br />";
         } else if (cls === "fontcolor") {
           // 带属性上色：颜色只认十六进制（见 safeColor），其余退回默认强调色。
           const color = safeColor(attrValue(inner, "color") ?? attrValue(inner, "style"));
@@ -283,6 +495,11 @@ export function renderAbilityText(raw: string, options: RenderOptions = {}): str
       // `@` 只是普通字符（比如邮箱），别误吞。
       out += "@";
       index = next + 1;
+      continue;
+    }
+    // 引擎散文占位符（见 `PROSE_PLACEHOLDERS`）：既取不到值、也不该露出原文，整段抹掉。
+    if (PROSE_PLACEHOLDERS.has(expression.name)) {
+      index = close + 1;
       continue;
     }
     const rendered = renderPlaceholderExpression(expression, values, valueClass);
@@ -321,8 +538,10 @@ export function remainingPlaceholders(raw: string, values: Record<string, string
       continue;
     }
     const { name } = expression;
-    const short = name.split(/[.:]/).pop() ?? name;
-    if (values[name] === undefined && values[short] === undefined) found.add(name);
+    // ⚠️ 必须走和渲染**同一套**查找（见 `lookupValue`），否则跨技能引用
+    // （`spell.SmolderP:Passive_QDamageIncrease`）明明是后端给了值的，这里却会
+    // 因为只比了短名而报成「没取到」，界面上就会出现自相矛盾的两句话。
+    if (lookupValue(values, name) === undefined) found.add(name);
     match = re.exec(raw);
   }
   return [...found];
@@ -343,6 +562,73 @@ export function formatLevelValues(values: number[]): string {
   return `${part(values[0])} … ${part(values[values.length - 1])}`;
 }
 
+/**
+ * 一个变量该按「百分数」还是「普通数字」显示。
+ *
+ * - `percent`：`0.5` 要印成 `50`（`%` 由文案自己带在占位符外面）。
+ * - `number`：`0.5` 就印 `0.5`。
+ */
+export type AbilityUnit = "percent" | "number";
+
+/**
+ * **正文自己声明的单位**——这是唯一权威依据。
+ *
+ * 官方文案在占位符后面**紧贴着**就写了单位，所以根本不用猜：
+ *
+ * ```text
+ * 击飞敌人@KnockupDuration@秒      → number（0.5 秒，**否决**百分数）
+ * 持续@SlowDuration@秒的@SlowAmount*100@%  → number / 不表态
+ * ```
+ *
+ * 客户端自己的措辞就说明了一切，值落在 `[0, 1]` 只是**巧合**
+ * （0.5 秒和 50% 在数值上无法区分）。
+ *
+ * # 为什么不靠「值像不像分数」来判断
+ *
+ * 早先只按「全部取值落在 `[0,1]`」判百分数，结果**击飞时长 0.5 秒被印成 50 秒**——
+ * 而且这不是个别英雄的问题：2026-10-03 全量扫描 245 个英雄，
+ * **`SlowDuration` / `StunDuration` / `KnockupDuration` / `CooldownRefund` 等 76 个
+ * 时长类变量名、167 个英雄**都会中招（正文里共 151 处 `@XxxDuration@秒`）。
+ * 逐个英雄加白名单是没有出路的——问题在**判据**，不在具体英雄。
+ *
+ * # ⚠️ `%` **不**作为「按分数处理」的依据，只在「秒」时表态
+ *
+ * 容易写错的一点：文案里的 `%` 只是**单位符号**，不代表这个值是 0~1 的分数。
+ * `@SlowPercent@%` 的取值本来就是 `30 / 40 / …`（已经是百分数），
+ * `@SlowAmount*100@%` 才是 0~1 的分数、靠占位符里的 `*100` 换算。
+ * 若把 `%` 也当成「按分数处理」，`SlowPercent` 就会被再乘 100 → **3000%**。
+ * 所以这里**只在正文说「秒」时返回 `number`（用来否决后端的 percent 猜测）**，
+ * 其余情况一律返回 null，交给后端的 `unit` 决定。
+ *
+ * @param text 该技能的 `description` / `dynamicDescription` 原文
+ * @param name 变量名（不含 `@`、不含 `*100` 之类修饰）
+ * @returns 只在正文明确说「秒」时返回 `"number"`；其余（含 `%`、判不出、两种都有）返回 null
+ */
+export function detectUnitFromText(text: string, name: string): AbilityUnit | null {
+  if (!text || !name) return null;
+  // 变量名在正文里的三种写法都要认：
+  //   `@SlowDuration@`                 —— 直接引用
+  //   `@SlowAmount*100@`               —— 带运算修饰（只关心它后面的单位）
+  //   `@spell.PowerBall:KnockupDuration@` —— 跨技能引用（前面带 `技能名:` 前缀）
+  // 所以**不要求** `@` 紧贴名字：只按「结尾是这个名字 + 可选的 `技能名:` 前缀」匹配。
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // 前缀 `(?:[A-Za-z0-9_.]+:)?` 覆盖 `spell.PowerBall:`；`(?![A-Za-z0-9_])`
+  // 是**关键**的边界保证——否则查 `SlowAmount` 会错配到 `SlowAmountExtra` 之类
+  // 更长名字的前缀上。
+  const re = new RegExp(`(?:[A-Za-z0-9_.]+:)?${escaped}(?![A-Za-z0-9_])(?:[*+][-\\d.]+)?@\\s*(%|秒)`, "g");
+  const units = new Set<string>();
+  let scan = re.exec(text);
+  while (scan) {
+    units.add(scan[1]);
+    scan = re.exec(text);
+  }
+  // 全部命中都是「秒」→ 确定是时间，返回 number 去否决 percent。
+  // 出现 `%`（或两种都有）→ 不表态，交给后端的 `unit`。
+  if (units.size === 1 && units.has("秒")) return "number";
+  return null;
+}
+
+
 /** 后端的 `ratioStat` 代码 → 中文。用户问的「它是什么加成」就是靠这张表回答。 */
 const STAT_LABELS: Record<string, string> = {
   AP: "法术强度",
@@ -355,6 +641,8 @@ const STAT_LABELS: Record<string, string> = {
   MoveSpeed: "移动速度",
   Crit: "暴击",
   Mana: "法力值",
+  /** 「按最大法力值的百分比」（瑞兹 Q/W/E、布里茨被动护盾 35% 最大法力值）。 */
+  MaxMana: "最大法力值",
 };
 
 /** `ratioStat` 代码 → 中文（认不出来就给原文，不吞掉）。 */
@@ -385,32 +673,156 @@ export function formatPercentValues(values: number[], options: { withSign?: bool
 }
 
 /**
+ * 一段「系数 × 属性」。
+ *
+ * `ratio` 与 `ratios` 都可能是 null（只有属性的那种），**不要**当成系数 0。
+ */
+export interface AbilityRatioItem {
+  /** 系数（逐级不同时为 null，看 `ratios`）。 */
+  ratio: number | null;
+  /** 系数**逐级**值；只有确实逐级不同时才有。 */
+  ratios: number[] | null;
+  /** 乘的属性代码（`AP` / `AD` / `MaxMana`…）；认不出为 null。 */
+  stat: string | null;
+}
+
+/** 取值项里与加成有关的字段（后端形状的最小交集，便于测试直接构造）。 */
+export interface AbilityRatioSource {
+  ratio?: number;
+  ratios?: number[];
+  ratioStat?: string;
+  ratioItems?: { ratio?: number; ratios?: number[]; stat?: string }[];
+}
+
+/**
+ * 取出一个变量的**全部**加成段。
+ *
+ * # 为什么是「多段」
+ *
+ * 一个计算项可以同时吃好几个属性，客户端文案也是并着写的：
+ *
+ * ```text
+ * 艾瑞莉娅 W  MinDamageCalc = 基础值 + 40% 攻击力 + 50% 法术强度
+ * 瑞兹     Q  QDamageCalc   = 基础值 + 55% 法术强度 + 2% 最大法力值
+ * ```
+ *
+ * 老形状只留**第一段**（`ratio` / `ratios` / `ratioStat`），第二段直接丢失。
+ * 新后端在多段时会额外给 `ratioItems`，所以这里**优先**读它、没有再回退老字段。
+ *
+ * ⚠️ 「只有 `ratioStat`、没有系数」（龙王 Q 的 `BurstBonusTrueDamageToChamps`）
+ * 也返回一段，`ratio` 为 null——它的意思是「按这个属性算」，不是「系数 0」。
+ */
+export function abilityRatioItems(entry: AbilityRatioSource): AbilityRatioItem[] {
+  if (entry.ratioItems?.length) {
+    return entry.ratioItems.map((item) => ({
+      // 系数 0 视为「这一段不生效」：CDragon 里有 0 占位，列出来只会让人以为是加成。
+      ratio: typeof item.ratio === "number" && item.ratio !== 0 ? item.ratio : null,
+      ratios: item.ratios?.length ? item.ratios : null,
+      stat: item.stat ?? null,
+    }));
+  }
+  const ratio = typeof entry.ratio === "number" && entry.ratio !== 0 ? entry.ratio : null;
+  const ratios = entry.ratios?.length ? entry.ratios : null;
+  if (ratio === null && !ratios && !entry.ratioStat) return [];
+  return [{ ratio, ratios, stat: entry.ratioStat ?? null }];
+}
+
+/**
+ * 一段系数 → `10% 护甲` 里的前半截。
+ *
+ * # 为什么按百分数写
+ *
+ * 系数在数据里一律是**分数**（`APRatio = 1`、`DamageArmorRatio = 0.1`、
+ * 艾瑞莉娅 W 的 `mCoefficient = 0.4`），而客户端自己的写法就是百分数：
+ * 「造成 15（+10% 护甲）魔法伤害」。以前印成 `0.1 护甲`，用户看不懂，
+ * 也正是「这个加成怎么才 0.1」的疑惑来源之一（2026-10-03 反馈）。
+ *
+ * 逐级不同的系数整条展开（`22.5 / 30 / … / 67.5%`），否则 5 级的加成会显示成 1 级的。
+ */
+export function formatRatioText(item: AbilityRatioItem): string {
+  if (item.ratios) return formatPercentValues(item.ratios, { withSign: true });
+  if (item.ratio !== null) return formatPercentValues([item.ratio], { withSign: true });
+  return "";
+}
+
+/**
+ * 一个变量的加成 → 一句人话：`100% 法术强度`、`10% 护甲 + 10% 魔法抗性`。
+ *
+ * 只保留**有系数**的段；「只有属性」的段由调用方单独说成「按最大生命值算」
+ * （硬套一个系数是错的）。没有加成时返回空串。
+ */
+export function formatAbilityRatios(entry: AbilityRatioSource): string {
+  return abilityRatioItems(entry)
+    .map((item) => ({ text: formatRatioText(item), stat: statLabel(item.stat ?? undefined) }))
+    .filter((part) => part.text !== "")
+    .map((part) => `${part.text} ${part.stat}`)
+    .join(" + ");
+}
+
+/**
  * 把后端的取值表拍平成 `renderAbilityText` 要的 `values` 映射。
  *
  * 这一层是**喂给正文替换**的，所以分数**不带百分号**——客户端文案里 `%` 写在
  * 占位符外面（`@SlowAmount*100@%`），这里再带一个就变成 `80%%`。
  * 需要带百分号的场合（取值速查表）直接用 `formatPercentValues`。
+ *
+ * # `text` 参数：正文里声明的单位**优先于**后端给的 `unit`
+ *
+ * 后端只能靠「值像不像分数」猜，而 `0.5 秒` 和 `50%` 在数值上完全一样——
+ * 这正是「击飞 50 秒」的来源（详见 `detectUnitFromText`）。
+ * 客户端文案里紧跟着占位符的 `秒` / `%` 才是权威，所以传正文进来覆盖后端判断。
  */
 export function flattenAbilityValues(
-  values: Record<string, { values: number[]; ratio?: number; ratioStat?: string; percent?: boolean }> | undefined,
-  options: { withRatio?: boolean } = {},
+  values: Record<string, { values: number[]; ratio?: number; ratios?: number[]; ratioStat?: string; ratioItems?: { ratio?: number; ratios?: number[]; stat?: string }[]; percent?: boolean; unit?: string }> | undefined,
+  options: { withRatio?: boolean; text?: string } = {},
 ): Record<string, string> {
   const out: Record<string, string> = {};
   if (!values) return out;
   for (const [name, entry] of Object.entries(values)) {
-    const levels = entry.percent
-      ? formatPercentValues(entry.values, { withSign: false })
-      : formatLevelValues(entry.values);
+    const levels = formatEntryValues(name, entry, options.text, false);
     if (!levels) continue;
     // 系数是**另一个独立变量**（`QTotalDamage` 那种），塞进同一格会让读者以为
     // 「40/80/120 +1.0 法强」是一体的。所以系数只在明确要求时才拼上。
-    if (options.withRatio && entry.ratio) {
-      out[name] = `${levels}（+${entry.ratio} ${statLabel(entry.ratioStat)}）`;
+    //
+    // ⚠️ 拼法必须是**平铺的 ` + `**，不能加括号。官方文案/客户端面板里就是
+    // 「造成 30 / 60 / 90 / 120 / 150（+60% 法术强度）」写成一行连着的，
+    // 而用户 2026-10-03 明确要求「有加成的直接写在伤害后面」——
+    // 括号会把「基础值」和「加成」读成两件事，平铺才是一句话。
+    if (options.withRatio) {
+      const ratioText = formatAbilityRatios(entry);
+      out[name] = ratioText ? `${levels} + ${ratioText}` : levels;
     } else {
       out[name] = levels;
     }
   }
   return out;
+}
+
+/**
+ * 单个变量的逐级值 → 一句话，**单位按 `detectUnitFromText` 的判据**决定。
+ *
+ * 判据优先级（高到低）：
+ *  1. 正文里紧跟占位符的 `秒` / `%`（权威，客户端自己写的）；
+ *  2. 后端给的 `unit` 字段；
+ *  3. 后端给的 `percent` 布尔（老缓存 / 老后端的形状）。
+ */
+export function formatEntryValues(
+  name: string,
+  entry: { values: number[]; percent?: boolean; unit?: string },
+  text?: string,
+  withSign = true,
+): string {
+  if (!entry || !Array.isArray(entry.values) || entry.values.length === 0) return "";
+  const unit = detectUnitFromText(text ?? "", name) ?? normalizeUnit(entry);
+  return unit === "percent"
+    ? formatPercentValues(entry.values, { withSign })
+    : formatLevelValues(entry.values);
+}
+
+/** 后端 `unit` 字符串 → 前端口径；老形状只有 `percent` 布尔。 */
+function normalizeUnit(entry: { percent?: boolean; unit?: string }): AbilityUnit {
+  if (entry.unit === "percent" || entry.unit === "number") return entry.unit;
+  return entry.percent ? "percent" : "number";
 }
 
 export { OPTIONAL_CLOSE };

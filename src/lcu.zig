@@ -3,14 +3,52 @@ const builtin = @import("builtin");
 const windows_http = @import("lcu/http_windows.zig");
 pub const transport = windows_http;
 pub const RequestControl = @import("lcu/request_control.zig").Control;
-/// 每条 lane 由 bridge 的一个独立 worker 线程消费。事件轮询与连接刷新原本挤在
-/// roster lane 上，会推迟阵容结果的到达时间，因此各自独立成 lane。
-pub const RequestLane = enum(u8) { state, roster, query, action, events, connection };
+/// 每条 lane 由 bridge 的**一个或多个**独立 worker 线程消费。事件轮询与连接刷新
+/// 原本挤在 roster lane 上，会推迟阵容结果的到达时间，因此各自独立成 lane。
+///
+/// `asset` 是**图标/头像取字节**的专属 lane。它和 `query` 分开是为了让「一屏 200 多个
+/// 英雄头像」这类纯装饰性、可并行的请求**不去挤**交互式查询（点开英雄看技能、
+/// 选人阶段的段位战绩）。分开之后两者各自有独立的 worker 数量（见 `lane_worker_count`）
+/// 与配额通道（见 `http_windows.zig` 的 `budget_limits`）。
+pub const RequestLane = enum(u8) { state, roster, query, action, events, connection, asset };
 pub const lane_count = @typeInfo(RequestLane).@"enum".fields.len;
+
+/// 每条 lane 起几个 worker 线程（消费 bridge 队列的消费者数量）。
+///
+/// **为什么不是一条 lane 一个 worker**（这是本改动要修的根因）：原先每条 lane 只有
+/// 一个 worker，于是同一条 lane 上的命令被**严格串行**执行——前端"10 个并发"发出去的
+/// 请求，到了这里就是一个一个过。英雄页首屏 245 个 `lol.get_asset` 全在 `query` 上，
+/// 排队排到天荒地老，用户看到的就是「头像一个一个慢慢往外冒」。
+///
+/// 图标取字节是**互相独立、只读、没有顺序依赖**的，天然可以并行；给它 4 个 worker
+/// （再叠加 `asset` 独立 lane 与独立配额）之后，245 张图的墙钟时间从「245 × 单次」
+/// 回落到「245 / 并发 × 单次」。
+///
+/// 其余 lane 保持 1 个 worker：`state` / `roster` / `action` / `events` 里的命令有
+/// 共享状态机或明确的先后语义（阵容合并、动作执行、事件轮询），多消费者反而会
+/// 打乱顺序、放大锁竞争，收益为负。
+pub const lane_worker_count = blk: {
+    var counts = [_]usize{1} ** lane_count;
+    counts[@intFromEnum(RequestLane.query)] = 4;
+    counts[@intFromEnum(RequestLane.asset)] = 4;
+    break :blk counts;
+};
 
 test {
     std.testing.refAllDecls(windows_http);
     std.testing.refAllDecls(RequestControl);
+}
+
+test "图标与查询通道是多消费者，其余保持单消费者" {
+    // 多消费者是本轮「请求串行」性能修复的核心：队列已经按 lane 分开，消费端还得
+    // 能并行，否则前端再多并发也只是一个一个过。这条同时是 `lane_worker_count` 的
+    // 形状护栏——它被误改回全 1 时，这个用例会立刻红。
+    try std.testing.expect(lane_worker_count[@intFromEnum(RequestLane.asset)] > 1);
+    try std.testing.expect(lane_worker_count[@intFromEnum(RequestLane.query)] > 1);
+    // 有顺序/状态语义的通道必须仍是单消费者。
+    for ([_]RequestLane{ .state, .roster, .action, .events, .connection }) |lane| {
+        try std.testing.expectEqual(@as(usize, 1), lane_worker_count[@intFromEnum(lane)]);
+    }
 }
 
 pub const websocket = @import("lcu/websocket.zig");
@@ -64,6 +102,12 @@ pub const Client = struct {
     verify_tls: bool = false,
     control: RequestControl = .{},
     lane: RequestLane = .query,
+    /// 显式覆盖本地请求走的配额通道；`null` 时按 `lane` 推导。
+    ///
+    /// `lane` 只管 bridge 把命令派给哪个 worker，而十人资料富化批次是自己起线程
+    /// 跑的、根本不经过 bridge，所以它想要一条独立配额只能从这里指定。改 `lane`
+    /// 会顺带搬动命令的派发位置，不能拿来干这件事。
+    budget: ?windows_http.Budget = null,
 
     pub fn discover(allocator: std.mem.Allocator, io: std.Io, configured: []const []const u8, env_map: ?*const std.process.Environ.Map) !Client {
         if (builtin.os.tag == .windows) {
@@ -238,13 +282,27 @@ pub const Client = struct {
         self.allocator.free(self.credentials.protocol);
     }
 
-    fn localBudget(self: Client) windows_http.Budget {
+    /// 本地请求实际会走的配额通道。公开是为了让「批次到底挂在哪条配额上」
+    /// 能被验证入口直接打印出来——只报毫秒数看不出是快还是侥幸。
+    pub fn localBudget(self: Client) windows_http.Budget {
+        if (self.budget) |value| return value;
         return switch (self.lane) {
             .roster => .roster,
             .action => .action,
             .events => .events,
+            .asset => .asset,
             else => .lcu,
         };
+    }
+
+    test "显式指定的配额通道优先于 lane 推导" {
+        const base = Client{ .allocator = std.testing.allocator, .io = std.testing.io, .credentials = .{ .port = 1, .protocol = "http", .token = "" } };
+        try std.testing.expectEqual(windows_http.Budget.lcu, base.localBudget());
+        var overridden = base;
+        overridden.budget = .profiles;
+        // lane 仍是 `.query`（推导出 `.lcu`），但覆盖值必须赢——否则批次又会
+        // 和英雄图标挤在同一个 6 名额上。
+        try std.testing.expectEqual(windows_http.Budget.profiles, overridden.localBudget());
     }
 
     pub fn get(self: Client, path: []const u8) ![]u8 {
@@ -328,7 +386,99 @@ pub const Client = struct {
         return result.stdout;
     }
 
-    /// Request a public HTTPS endpoint from the native layer. This is used
+    /// `postBearerUrl` 的请求头。
+    ///
+    /// 抽成独立函数**唯一的目的就是能被单测**：这个 415 之所以能藏那么久，
+    /// 正是因为「POST 的请求头里到底有没有 `Content-Type`」当时没有任何用例覆盖，
+    /// 而它只写在 curl 分支里、WinHTTP 分支漏掉，Windows 上又没有任何测试会发真请求。
+    fn bearerPostHeaders(token: []const u8, buffer: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "Authorization: Bearer {s}\r\nContent-Type: application/json", .{token});
+    }
+
+    /// Request a Riot SGP endpoint with a bearer token **and a JSON body**.
+    ///
+    /// SGP's `summoner-ledge` / `namesets-for-puuids` are POSTs; the GET-only
+    /// `getBearerUrl` above could not reach them. Same credential handling:
+    /// the URL and token stay inside the native layer.
+    /// Bearer 令牌的跨区 POST。
+    ///
+    /// ⚠️ **必须带 `Content-Type: application/json`**（2026-10-03 实测定位）。
+    ///
+    /// SGP 网关对**没有** `Content-Type` 的 POST 一律回 **415 Unsupported Media Type**：
+    ///
+    /// ```text
+    /// POST /summoner-ledge/v1/regions/CQ100/summoners/puuids
+    ///   Authorization: Bearer …                          → 415 {"status":{…"Unsupported Media Type"…}}
+    ///   Authorization + Content-Type: application/json   → 200 [{"puuid":"…","level":670,…}]
+    /// ```
+    ///
+    /// 原来只有下面那个 **curl 分支**发了这个头，WinHTTP 分支漏了 —— 于是
+    /// **Windows 上所有 `postBearerUrl` 调用都在收 415**，而 macOS/Linux 是好的。
+    /// 受影响的是仅有的两个调用点，且都是跨区功能：
+    /// `probeTencentSubRegionLogged`（逐区定位）与 `enrichCandidateFromSgp`（跨区等级）。
+    /// 界面上的表现就是「精确匹配到了人，8 个大区却都说没这个人」+ 跨区战绩打不开。
+    /// **GET（`getBearerUrl`）不受影响**，同一个网关对 GET 不要求这个头 ——
+    /// 这也是它藏得深的原因：查自己的战绩一直好使，只有跨区那条路是死的。
+    pub fn postBearerUrl(
+        self: Client,
+        url: []const u8,
+        token: []const u8,
+        user_agent: []const u8,
+        body: []const u8,
+    ) ![]u8 {
+        try self.control.check();
+        if (!std.mem.startsWith(u8, url, "https://") or token.len == 0) return error.InvalidPath;
+        var authorization_buffer: [16 * 1024]u8 = undefined;
+        const authorization = try std.fmt.bufPrint(&authorization_buffer, "Authorization: Bearer {s}", .{token});
+        if (builtin.os.tag == .windows) {
+            // 复用同一块缓冲区：这一支直接 return，下面的 curl 分支不会再读到 `authorization`。
+            return windows_http.request(self.allocator, .{
+                .method = "POST",
+                .url = url,
+                .headers = try bearerPostHeaders(token, &authorization_buffer),
+                .user_agent = user_agent,
+                .body = body,
+                .timeout_ms = self.timeout_ms,
+                .verify_tls = true,
+                .max_response_bytes = 16 * 1024 * 1024,
+                .io = self.io,
+                .control = self.control,
+                .budget = .remote,
+            });
+        }
+        var timeout_buffer: [16]u8 = undefined;
+        const timeout = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{(@as(u32, self.timeout_ms) + 999) / 1000});
+        const result = std.process.run(self.allocator, self.io, .{
+            .argv = &.{
+                "curl",
+                "--silent",
+                "--show-error",
+                "--fail-with-body",
+                "--max-time",
+                timeout,
+                "--header",
+                authorization,
+                "--header",
+                "Content-Type: application/json",
+                "--request",
+                "POST",
+                "--data",
+                body,
+                "--user-agent",
+                user_agent,
+                url,
+            },
+            .stdout_limit = .limited(16 * 1024 * 1024),
+            .stderr_limit = .limited(64 * 1024),
+            .timeout = .{ .duration = .{ .raw = .{ .nanoseconds = @as(i96, self.timeout_ms) * std.time.ns_per_ms }, .clock = .awake } },
+        }) catch return error.RequestFailed;
+        defer self.allocator.free(result.stderr);
+        if (result.term != .exited or result.term.exited != 0) {
+            self.allocator.free(result.stdout);
+            return error.RequestFailed;
+        }
+        return result.stdout;
+    }
     /// for provider snapshots such as OP.GG; callers still control the fixed
     /// URL and the response never crosses the bridge as raw credentials.
     pub fn getPublicUrl(self: Client, url: []const u8, user_agent: []const u8) ![]u8 {
@@ -779,4 +929,22 @@ test "rejects malformed credentials" {
     try std.testing.expectError(error.InvalidLockfile, fromLockfile("LeagueClient:1:2"));
     try std.testing.expectError(error.MissingToken, fromCommandLine("LeagueClientUx.exe --app-port=1234"));
     try std.testing.expectError(error.InvalidPort, fromLockfile("LeagueClient:1:nope:secret:https"));
+}
+
+test "Bearer POST 必须带 Content-Type，否则 SGP 网关回 415" {
+    // 2026-10-03 实机实测（curl，同一个 league-session 令牌打
+    // `POST /summoner-ledge/v1/regions/CQ100/summoners/puuids`）：
+    //   只有 Authorization                        → 415 Unsupported Media Type
+    //   Authorization + Content-Type: application → 200 [{puuid, level:670, …}]
+    //
+    // 当时 WinHTTP 分支只发了 Authorization（curl 分支反而是对的），
+    // 于是 **Windows 上逐区定位 8 个区全灭**、跨区等级永远取不到，
+    // 界面上表现为「精确匹配到了人，却都说 8 个大区没这个人」。
+    // 这条用例就是给那次回归上的锁：请求头里必须两个字头都在。
+    var buffer: [512]u8 = undefined;
+    const headers = try Client.bearerPostHeaders("test-token", &buffer);
+    try std.testing.expect(std.mem.indexOf(u8, headers, "Authorization: Bearer test-token") != null);
+    try std.testing.expect(std.mem.indexOf(u8, headers, "Content-Type: application/json") != null);
+    // 换行必须是 CRLF：WinHTTP 的 lpszHeaders 靠它分隔多个头，用 LF 会被当成一个头名。
+    try std.testing.expect(std.mem.indexOf(u8, headers, "\r\n") != null);
 }

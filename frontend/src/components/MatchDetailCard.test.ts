@@ -38,6 +38,31 @@ describe("MatchDetailCard", () => {
   });
 
   /**
+   * 十人阵容里的召唤师要带 `#编号`。
+   *
+   * 同一局里两个人都叫「萌太TnT」时，只有编号能区分他们 —— 用户报的就是
+   * 「所有召唤师原本的 ID 后边没有带上对应的编号」。
+   * 编号缺失（人机局 / 老数据）时只显示名字，不能补一个假的 `#`。
+   */
+  it("appends the Riot ID tag to every participant and omits it when unknown", () => {
+    const match = structuredClone(fixtureMatches[0]);
+    match.participants = match.participants.map((participant) => ({ ...participant, tagLine: participant.puuid.endsWith("0") ? "16666" : null }));
+    const wrapper = mount(MatchDetailCard, {
+      props: { match, expanded: true },
+      global: { stubs: { AssetIcon: true } },
+    });
+
+    const lines = wrapper.findAll(".participant-line");
+    const withTag = lines.filter((line) => line.find(".participant-line__tag").exists());
+    expect(withTag.length).toBeGreaterThan(0);
+    expect(withTag[0].get(".participant-line__tag").text()).toBe("#16666");
+    // 没有编号的那些行**不能**出现空的 `#`。
+    expect(lines.filter((line) => !line.find(".participant-line__tag").exists()).length)
+      .toBe(10 - withTag.length);
+    expect(wrapper.text()).not.toContain("#null");
+  });
+
+  /**
    * 两个召唤师技能必须贴在**头像右边**（跟外面的对局行同一套读法），不能排到
    * 装备后面去占格子：以前它们排在装备右面，列宽一挤就把装备整片裁掉，
    * 看起来像「技能格把装备挡住了」。
