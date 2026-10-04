@@ -1608,14 +1608,23 @@ fn runLiveLoadJobs(batch: *LiveLoadBatch, client: lcu.Client, current: std.json.
     // 峰值并发（5 名玩家 × 每人 3 个请求）和两轮一样，墙钟时间却回落到
     // 「两名玩家」的量级而不是「两段各自最慢」。
     //
-    // 单轮还把发布从两次压成一次：每次发布都要在全局互斥量下把整份 244KB 快照
-    // 解析、逐人更新、再序列化，两次发布就是双倍的无谓开销，而且第二次发布
-    // 期间还会把 400ms 一次的进度轮询一起堵在锁上。
+    // **一遍跑完十人（纯本地数据），每个人跑完立刻单独发布**（见 `loadLivePlayer`）。
+    //
+    // 原先是「我方 5 人一轮 → 发布 → 敌方 5 人一轮 → 再发布」。两轮之间隔着一次
+    // `queue.run()` 的 join，那是一道硬栅栏：敌方第一个请求要等我方**最慢**的
+    // 那位落地才发得出去，十个人的耗时于是被串成 `max(我方) + max(敌方)`——
+    // 而这两段本来是可以重叠的。改成单轮（`for ally/enemy` 依次入队，见上），
+    // 谁先跑完就立刻接手下一个下标，峰值并发（5 名玩家 × 每人 3 个请求）和两轮
+    // 一样，墙钟时间却回落到「两名玩家」的量级而不是「两段各自最慢」。
+    //
+    // 发布也一并改掉（2026-10-04）：以前是单轮跑完再一次性发布，于是**十人里只要
+    // 有一个慢，其余九个即使早就好了也不显示**——这正是「十几秒才拉全」的观感
+    // 来源。现在每个玩家在自己的 worker 上跑完就发布（`loadLivePlayer`），
+    // 界面上玩家一个一个冒出来，和 AK 的行为一致。这里不再补发。
     if (jobs.items.len > 0) {
         batch.queue.count = jobs.items.len;
         batch.queue.next.store(0, .monotonic);
         batch.queue.run();
-        publishLoadedProfiles(batch);
     }
     // 核心数据落地就算「加载完成」：最后一遍补公网数据不再计入进度，界面上的
     // 「加载中 10/10 人 · N 秒」到此定格，不会因为回落 / 标签还在拉就继续涨。
@@ -1654,18 +1663,46 @@ fn loadLivePlayer(context: *anyopaque, index: usize) void {
     if (job.remote) return;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
+    const allocator = arena.allocator();
     const profile = if (job.failure == null) std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), job.output.?[0..job.output_len], .{}) catch null else null;
-    // 这里**不发布**：发布整体挪到 `queue.run()` 之后一次做完（见 publishLoadedProfiles）。
-    // 逐人发布会让 live_lobby_version 一位玩家跳一次，界面就成「一个人一个人冒出来」。
+    // **逐人发布**（2026-10-04 改）。
+    //
+    // 原先是「本地那遍十人全跑完，`queue.run()` 返回后一次性发布」。那样有个硬
+    // 栅栏：只要十人里有**一个**慢（公网回落、或一次超时重试），其余九个即使早就
+    // 好了也不显示，界面停在旧状态——这正是「十几秒才把几个人拉全」的观感来源。
+    // AK 的做法恰恰相反：每个玩家一份独立任务，谁先回来谁先推给界面，玩家一个
+    // 一个冒出来，看着就是「秒开」。这里对齐它。
+    //
+    // 原来担心的「逐人发布会让人一位玩家跳一次 version、界面看成一个人一个人冒
+    // 出来」——那其实**就是想要的效果**（渐进呈现好过整块卡住）。真正要防的是
+    // `version` 被无意义地频繁撞动，所以只在**真的发布了新资料**时才推进版本
+    // （`publishLiveProfiles` 内部按内容比对，见该函数）。
+    //
+    // 注意：`batch.jobs` 的 `output` 挂在 `runLiveLoadJobs` 的 arena 上，worker
+    // 结束前一直有效；这里解析出的 `profile` 是本函数 arena 的副本，发布时会被
+    // `publishLiveProfiles` 复制进主快照，所以跨线程安全。
     lockBackendMutex(&batch.parent.command_mutex);
     defer batch.parent.command_mutex.unlock();
     if (batch.generation != batch.parent.live_generation or batch.parent.mode != .live or batch.queue.cancelled.load(.acquire)) return;
     batch.completed += 1;
     if (batch.first_player_ms == null) batch.first_player_ms = runtimeMonotonicMillis(batch.snapshot) - batch.started_ms;
-    if (profile == null) batch.failed += 1;
+    if (profile == null) {
+        batch.failed += 1;
+        return;
+    }
+    var publication = profile.?;
+    const key = jsonField(job.player, "rosterKey");
+    publication.object.put(allocator, "rosterKey", .{ .string = if (key.len > 0) key else jsonField(job.player, "puuid") }) catch return;
+    const one = [_]LiveProfilePublication{.{ .original = job.player, .profile = publication, .side = job.side, .index = job.index }};
+    publishLiveProfiles(batch.parent, one[0..]) catch {};
 }
 
-/// `queue.run()` 返回后统一发布。
+/// `queue.run()` 返回后统一发布。**现在只给「公网遍」用**（本地遍已改成在
+/// `loadLivePlayer` 里逐人发布，见那里的说明）。
+///
+/// 公网遍之所以仍然整批发布：它是最后一遍补数据、不参与进度，逐个发布反而会让
+/// `live_lobby_version` 在用户已经看到「已加载 10/10」之后再抖动十几次；
+/// 一次性补完更安静。
 ///
 /// 此时所有 worker 都已退出，`job.output` 仍然挂在 `runLiveLoadJobs` 的 arena 上，
 /// 可以安全地再解析一遍——不需要让 worker 把 profile 跨线程搬运。
@@ -1742,7 +1779,7 @@ test "图标取字节独占一条 lane 与一条配额，不再挤交互式查�
     try std.testing.expectEqual(@as(usize, 1), lcu.lane_worker_count[@intFromEnum(lcu.RequestLane.action)]);
 }
 
-test "本地那遍十人只跑一轮：中途没有插入发布" {
+test "本地那遍十人只跑一轮，且每人跑完立刻单独发布" {
     var state = Runtime.init();
     state.mode = .live;
     // 5 名我方 + 5 名敌方，都不带 `dataComplete`，所以十个人全部会入队。
@@ -1750,11 +1787,14 @@ test "本地那遍十人只跑一轮：中途没有插入发布" {
     refreshLiveGeneration(&state);
     const baseline = state.live_lobby_version;
 
-    // 探针顶替真正的资料抓取：它只关心「这个任务开始跑的时候快照版本是多少」。
+    // 探针顶替真正的资料抓取。这里钉两件事：
     //
-    // 版本在本地那遍中途变了 ⇒ 说明这遍被拆成了多轮、中间插了一次发布，
-    // 也就是「我方先冒出来、敌方再等一整轮」。那正是被测的行为，所以这里
-    // 不比对耗时、只钉住结构：一轮之内版本必须纹丝不动。
+    // 1. **一轮跑完十人**：不再有「我方先跑一轮、发布、敌方再跑一轮」的硬栅栏
+    //    （那道栅栏会把十人耗时串成 `max(我方)+max(敌方)`）。
+    // 2. **逐人发布**（2026-10-04 改）：每个玩家自己的 worker 一跑完就发布，
+    //    所以本地那遍**中途**版本就会变——这正是想要的行为（谁先好谁先显示），
+    //    与旧设计「十人到齐才发一次」相反。以前这条断言是 `published_midway == 0`，
+    //    现在必须是 `> 0`，否则就等于把「一个人慢、九个一起等」又写回来了。
     const Probe = struct {
         batch: *LiveLoadBatch,
         baseline: u64,
@@ -1773,6 +1813,8 @@ test "本地那遍十人只跑一轮：中途没有插入发布" {
             const output = job.output orelse return;
             @memcpy(output[0..text.len], text);
             job.output_len = text.len;
+            // 直接调逐人发布路径，复刻 `loadLivePlayer` 的真实行为。
+            loadLivePlayer(self.batch, index);
         }
     };
     var batch = LiveLoadBatch{
@@ -1788,10 +1830,12 @@ test "本地那遍十人只跑一轮：中途没有插入发布" {
     try runLiveLoadJobs(&batch, client, std.json.Value{ .null = {} }, std.json.Value{ .null = {} });
 
     try std.testing.expectEqual(@as(usize, 10), probe.local_runs.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), probe.published_midway.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 10), batch.completed);
+    // 逐人发布：整轮跑完时十个人都已经落地（每个 worker 自己发的）。
     try std.testing.expect(batch.cores_done);
-    // 本地那遍确实发布过一次（发布把版本号换成了新内容的哈希）。
-    try std.testing.expect(state.live_lobby_version != baseline);
+    // 十个人的资料都真的进了快照。以我方第一名为例，它的 puuid 必须能在快照里找到。
+    try std.testing.expect(std.mem.indexOf(u8, state.live_lobby[0..state.live_lobby_len], "我方0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.live_lobby[0..state.live_lobby_len], "敌方4") != null);
 }
 
 pub fn verifyLiveProfilePipeline(io: std.Io, port: u16) !void {

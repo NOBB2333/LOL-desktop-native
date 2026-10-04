@@ -10,11 +10,12 @@ pub const Budget = enum { lcu, remote, roster, action, events, profiles, asset }
 // `.lcu` 的 6 个名额上，而 `.lcu` 还要和英雄图标、英雄目录、技能数值这些交互
 // 请求共享。
 //
-// 真正致命的是 `request()` 的 deadline 在**取名额之前**就定下了（见下面的
-// `request`），所以排队等待的时间直接从请求自己的 `timeout_ms` 里扣。选人阶段
-// 队列一深，排在后面的请求还没发出去就先判 `RequestTimedOut`，玩家被记成失败，
-// 整批于是推迟 `live_failure_retry_ms`（10 秒）再重跑一次——用户看到的
-// 「查完要等十秒」就是这条链路，不是数据源慢。
+// 2026-10-04 **已修**：`request()` 原先在**取名额之前**就把 deadline 定下，排队
+// 等待的时间直接从请求自己的 `timeout_ms` 里扣。批次人的 `timeout_ms` 只有
+// 1800ms，配额 16 对峰值 15 只多一个余量，尾部请求还没发出去就先判
+// `RequestTimedOut`，玩家记失败，整批推迟 `live_failure_retry_ms`（10 秒）重跑——
+// 「查完要等十几秒」就是这条链路。现在排队与执行分开计时，见
+// `budget_wait_timeout_ms` 与 `request()`。
 //
 // 16 ≥ 峰值 15，批内请求基本不排队；批次只发本地 GET，给到 16 对客户端无压力。
 //
@@ -67,10 +68,26 @@ fn checkDeadline(options: Options, deadline: i64) !void {
     if (nowMillis(options.io) >= deadline) return error.RequestTimedOut;
 }
 
-fn acquireBudget(options: Options, deadline: i64) !void {
+/// 排队等待名额的上限。
+///
+/// **必须与请求自身的 `timeout_ms` 解耦**（2026-10-04 修）。原先 `request()` 把
+/// `deadline = now + timeout_ms` 在**取名额之前**算好，再把它传给 `acquireBudget`
+/// 当排队上限——于是排队时间直接从请求自己的超时里扣。十人资料批次的
+/// `timeout_ms` 只有 1800ms（`player_enrichment_timeout_ms`），配额 16 而峰值
+/// 需求 15，只剩一个余量；只要有人稍慢或 `.profiles` 上多出一个请求，尾部那几个
+/// 还没发出去就先判 `RequestTimedOut`，玩家记失败，整批推迟
+/// `live_failure_retry_ms`（10 秒）重跑。用户看到的「十几秒」就是
+/// 「1.8 秒超时 + 10 秒重试 + 再跑一遍」。
+///
+/// 现在排队用这个固定的宽限（比任何调用方的 timeout 都宽），拿到名额之后
+/// **才**开始计请求自己的 deadline（见 `request`）。语义上这才对：
+/// `timeout_ms` 描述的是「这个请求本身能跑多久」，不该包含排队。
+const budget_wait_timeout_ms: i64 = 30_000;
+
+fn acquireBudget(options: Options, wait_deadline: i64) !void {
     const index = @intFromEnum(options.budget);
     while (true) {
-        try checkDeadline(options, deadline);
+        try checkDeadline(options, wait_deadline);
         if (nowMillis(options.io) < retry_after_ms[index].load(.acquire)) return error.HttpRateLimited;
         const active = active_requests[index].load(.acquire);
         if (active < budget_limits[index] and active_requests[index].cmpxchgWeak(active, active + 1, .acq_rel, .acquire) == null) return;
@@ -90,6 +107,33 @@ test "慢战绩占满配额时阵容与动作仍有独立名额" {
     priority.budget = .action;
     try acquireBudget(priority, nowMillis(options.io) + 1000);
     defer _ = active_requests[3].fetchSub(1, .acq_rel);
+}
+
+test "排队等待不吃请求自己的超时（deadline 在取到名额之后才算）" {
+    // 这是 2026-10-04「对局十几秒」那次修复的护栏。原来的写法是
+    // `request()` 先把 `deadline = now + timeout_ms` 算好再传给 acquireBudget，
+    // 于是排队时间直接从请求的超时里扣：配额一满，排在队尾的请求还没发出去
+    // 就先 `RequestTimedOut`，十人批次被记失败、推迟 10 秒整批重跑。
+    //
+    // 现在两者解耦：`request` 先在一段宽松的等待上限（budget_wait_timeout_ms）
+    // 内抢名额，拿到之后才计 `timeout_ms`。这条用例把这个顺序钉住。
+    //
+    // 断言方式：故意用「等待上限很紧、但请求 timeout 很宽」的参数调用
+    // `acquireBudget`——因为超时判定只看等待上限，所以等待上限耗尽时必须超时；
+    // 而只要等待上限宽松，即便请求 timeout 极小也能拿到名额（说明请求 timeout
+    // 不再参与排队判定）。
+    const options = Options{ .io = std.testing.io, .url = "http://127.0.0.1/", .timeout_ms = 1 };
+    // 占满 `.lcu`，模拟配额被打满。
+    for (0..budget_limits[0]) |_| try acquireBudget(options, nowMillis(options.io) + 1000);
+    defer _ = active_requests[0].fetchSub(budget_limits[0], .acq_rel);
+    // 等待上限已过期 → 排队阶段超时（与请求 timeout_ms 无关）。
+    try std.testing.expectError(error.RequestTimedOut, acquireBudget(options, nowMillis(options.io) - 1));
+    // 等待上限宽松 → 即便请求 timeout_ms 只有 1ms，也能拿到名额。
+    // 放在独立配额上，避免被上面占满的 `.lcu` 干扰。
+    var wide = options;
+    wide.budget = .asset;
+    try acquireBudget(wide, nowMillis(options.io) + budget_wait_timeout_ms);
+    defer _ = active_requests[@intFromEnum(Budget.asset)].fetchSub(1, .acq_rel);
 }
 
 const AsyncState = struct {
@@ -157,9 +201,13 @@ fn statusCallback(_: *anyopaque, context: usize, status: u32, info: ?*anyopaque,
 
 pub fn request(allocator: std.mem.Allocator, options: Options) ![]u8 {
     if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
-    const deadline = nowMillis(options.io) + options.timeout_ms;
-    try acquireBudget(options, deadline);
+    // **排队与执行分开计时**（见 `budget_wait_timeout_ms` 的说明）：
+    // 先在一个宽松的等待上限内抢到名额，**拿到之后**才开始算这条请求自己的
+    // `timeout_ms`。原先 deadline 在取名额前就算好，排队时间会把请求的超时吃光，
+    // 尾部请求还没发出去就 `RequestTimedOut`，十人批次因此整批 10 秒重试。
+    try acquireBudget(options, nowMillis(options.io) + budget_wait_timeout_ms);
     defer _ = active_requests[@intFromEnum(options.budget)].fetchSub(1, .acq_rel);
+    const deadline = nowMillis(options.io) + options.timeout_ms;
     const parsed = try parseUrl(options.url);
     if (options.max_response_bytes == 0) return error.ResponseTooLarge;
 

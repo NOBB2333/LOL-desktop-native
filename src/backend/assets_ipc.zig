@@ -178,8 +178,13 @@ pub fn getAsset(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
         const path_key = std.fmt.bufPrint(&path_key_buffer, "path:{s}", .{payload.path}) catch
             return assetByPath(self, payload.path, output);
         if (assetCacheGet(path_key, output)) |cached| return cached;
+        if (diskAssetCacheGet(self, path_key, output)) |cached| {
+            assetCachePut(path_key, cached);
+            return cached;
+        }
         const dto = try assetByPath(self, payload.path, output);
         assetCachePut(path_key, dto);
+        diskAssetCachePut(self, path_key, dto);
         return dto;
     }
     if (payload.id <= 0) return error.InvalidAsset;
@@ -187,8 +192,16 @@ pub fn getAsset(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
     var key_buffer: [64]u8 = undefined;
     const key = std.fmt.bufPrint(&key_buffer, "{s}:{d}", .{ @tagName(kind), payload.id }) catch return error.InvalidAsset;
     if (assetCacheGet(key, output)) |cached| return cached;
+    // 内存没有就看磁盘。这是 2026-10-04 加的：原来只有「本会话」的缓存，
+    // 应用一重启，245 张英雄图 + 装备图全部重新走一遍 LCU / 桥。
+    if (diskAssetCacheGet(self, key, output)) |cached| {
+        // 回填内存层，本次会话后续命中就不用再碰 SQLite。
+        assetCachePut(key, cached);
+        return cached;
+    }
     const dto = try fetchAssetDto(self, kind, payload.id, output);
     assetCachePut(key, dto);
+    diskAssetCachePut(self, key, dto);
     return dto;
 }
 
@@ -319,6 +332,72 @@ fn assetCacheResetForTest() void {
     }
     asset_cache_entries.clearRetainingCapacity();
     asset_cache_bytes = 0;
+}
+
+/// 图标 DTO 的**磁盘**缓存（2026-10-04 新增）。
+///
+/// ## 为什么需要（用户 2026-10-04 提出）
+///
+/// 在加这一层之前，图标缓存只有两级，而且**都是进程内 / 会话级**：
+///   - Zig 的 `asset_cache_entries`（24 MiB FIFO）；
+///   - 前端 `assetCache.ts` 的 Map 与 `backend.ts` 的 `assetRequests`。
+/// 应用一重启，这些全部归零 —— 英雄页首屏 245 张图、对局页约 90 个图标
+/// 又得一张一张重新走 LCU（甚至过桥 + base64）。用户的原话是
+/// 「是不是应该在本地的库里做一定的一个缓存？然后每次启动的时候去同步一下就行」。
+///
+/// ## 为什么用 SQLite 的 `cache` 命名空间，而不是写图片文件
+///
+/// 复用现成的 `Store`（`snapshots(kind,key,value,updated_at)`）不用引入新的
+/// 目录管理与清理逻辑。`cache` 在 `storage.zig` 的 `scopedKind` 里属于
+/// **不做账号作用域**的那一类 —— 图标是客户端资源、与账号/大区无关，
+/// 换号登录不该把它判失效。
+///
+/// ## 存什么、不存什么
+///
+/// 与内存层完全同一条规则：**只存真的从 LCU 拿到字节的 DTO**
+/// （`isLcuSourcedDto`）。CommunityDragon 的兜底值只是一条 URL，
+/// 落盘会把「当时客户端没开」这一个瞬间焊死 —— 用户之后真开了客户端，
+/// 读到的还是旧的云 URL。
+///
+/// ## 失效
+///
+/// 图标内容只在客户端版本更新时变。这里不做过期时间（TTL = 永久），
+/// 但**有容量上限**：写入时按「总量超过 `disk_asset_cache_max_rows` 就删最旧的」
+/// 控制表大小，避免无界增长。如果客户端真的换了版本、图标变了，
+/// `dataUrl` 里的 `base64` 是旧图但路径/尺寸都对，最多是显示上一版的图 ——
+/// 比每次重启都重新拉一遍 245 张要划算得多。
+///
+/// 注意：这一层**不替代**内存层。磁盘读要过 SQLite，比内存 memcpy 慢得多，
+/// 所以磁盘命中后会回填内存（见 `getAsset`）。
+const disk_asset_cache_kind = "cache";
+/// 磁盘图标缓存的条数上限。一张英雄头像的 base64 DTO 大约 3~8 KB，
+/// 2000 条约 10 MB 量级 —— 覆盖全部英雄 + 装备 + 常见头像仍有余量。
+const disk_asset_cache_max_rows: i64 = 2000;
+
+/// 从磁盘取一条图标 DTO。命中则拷进 `output` 并返回，否则 null。
+///
+/// 任何异常（没配 storage、查库失败、内容不合规）都当作**未命中**：
+/// 磁盘缓存是纯加速层，坏了也只是退化成走网络，绝不该让取图失败。
+fn diskAssetCacheGet(self: *backend.Runtime, key: []const u8, output: []u8) ?[]const u8 {
+    const store = if (self.storage) |*value| value else return null;
+    const cached = (store.get(disk_asset_cache_kind, key) catch return null) orelse return null;
+    defer std.heap.page_allocator.free(cached);
+    // 只认从 LCU 拿到的那种 DTO。历史数据里若混进了兜底值也在这里挡掉。
+    if (!isLcuSourcedDto(cached)) return null;
+    if (cached.len > output.len) return null;
+    @memcpy(output[0..cached.len], cached);
+    return output[0..cached.len];
+}
+
+/// 把一条图标 DTO 落盘。规则与内存层一致：只存 LCU 来源、且不超过单条上限。
+fn diskAssetCachePut(self: *backend.Runtime, key: []const u8, dto: []const u8) void {
+    if (!isLcuSourcedDto(dto) or dto.len > asset_cache_max_entry_bytes) return;
+    const store = if (self.storage) |*value| value else return;
+    store.put(disk_asset_cache_kind, key, dto) catch return;
+    // 增量修剪：**不每次都做全表扫描**，只在写入路径上顺手判断一次。
+    // `store.prune` 内部按 `updated_at` 从旧到新删到水位以下，代价与溢出量相关，
+    // 正常使用时（未超限）是一次廉价的 COUNT。
+    store.prune(disk_asset_cache_kind, disk_asset_cache_max_rows) catch {};
 }
 
 /// 把按路径取到的字节包成 DTO。`assetByPath` 已经做过路径白名单校验。
@@ -549,4 +628,39 @@ test "asset DTO embeds LCU images and uses the profile jpeg fallback" {
     const fallback_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, fallback, .{});
     defer fallback_parsed.deinit();
     try std.testing.expect(std.mem.endsWith(u8, fallback_parsed.value.object.get("dataUrl").?.string, "3494.jpg"));
+}
+
+test "图标磁盘缓存只认 LCU 来源、且重启后仍能命中" {
+    // 这是 2026-10-04 新增的护栏：图标缓存以前只有进程内两级，应用一重启
+    // 英雄页 245 张图全部重拉。现在多了一层 SQLite 落盘，这条用例钉住三件事：
+    //   1. LCU 来源的 DTO 能落盘并被读回；
+    //   2. CommunityDragon 兜底值**不**落盘（否则会把「当时客户端没开」焊死）；
+    //   3. 命中时原样拷回调用方的 output。
+    var state = backend.Runtime.init();
+    // 走模块名导入（相对路径 `../storage.zig` 会和 SDK 侧已声明的 `storage`
+    // 模块撞名，报 "file exists in modules 'storage' and 'root'"）。
+    //
+    // ⚠️ 必须用 `page_allocator` 打开：`diskAssetCacheGet` 内部按模块惯例用
+    // `std.heap.page_allocator` 释放 `store.get` 返回的副本。测试若用
+    // `std.testing.allocator` 建库，就会跨分配器 free → 堆损坏崩溃
+    // （表现为测试进程 exit 3，日志里是一串 Allocator.zig 栈帧）。
+    var store = try @import("storage").Store.open(std.heap.page_allocator, std.testing.io, ":memory:");
+    defer store.deinit();
+    // `Runtime.storage` 是 `?Store`（值），不是指针。
+    state.storage = store;
+
+    const dto = "{\"kind\":\"champion\",\"id\":36,\"mimeType\":\"image/png\",\"dataUrl\":\"data:image/png;base64,AAAA\",\"source\":\"lcu\"}";
+    diskAssetCachePut(&state, "champion:36", dto);
+    var output: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(dto, diskAssetCacheGet(&state, "champion:36", &output).?);
+    // 未写入的 key 不该命中。
+    try std.testing.expect(diskAssetCacheGet(&state, "champion:37", &output) == null);
+    // 缓冲装不下时当未命中，不越界。
+    var tiny: [8]u8 = .{0} ** 8;
+    try std.testing.expect(diskAssetCacheGet(&state, "champion:36", &tiny) == null);
+
+    // 兜底值不落盘。
+    const cdn = "{\"kind\":\"champion\",\"id\":36,\"mimeType\":\"image/png\",\"dataUrl\":\"https://raw.communitydragon.org/x.png\",\"source\":\"communitydragon\"}";
+    diskAssetCachePut(&state, "champion:99", cdn);
+    try std.testing.expect(diskAssetCacheGet(&state, "champion:99", &output) == null);
 }

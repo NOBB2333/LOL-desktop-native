@@ -104,6 +104,43 @@ pub const Store = struct {
         return c.sqlite3_column_int64(statement.?, 0);
     }
 
+    /// 把某个 kind 的快照数压到 `max_rows` 以内，**优先删写入时间最旧的**。
+    ///
+    /// 给图标磁盘缓存用（`backend/assets_ipc.zig` 的 `diskAssetCachePut`）。
+    /// 图标是「写一次、之后一直读」的小对象，天然不需要 LRU —— 老的图标
+    /// 不代表没用（经典皮肤头像、旧版装备图都还在被引用），但总量必须封顶，
+    /// 否则一个长期使用的客户端会把整张表撑到几百 MB。
+    ///
+    /// 只有真的超限才删：正常情况下这是一次廉价的 COUNT。删除操作用一条
+    /// `DELETE ... WHERE rowid IN (SELECT ... ORDER BY updated_at LIMIT n)` 完成，
+    /// 避免把行全读进内存。
+    pub fn prune(self: *Store, kind: []const u8, max_rows: i64) !void {
+        var kind_buffer: [512]u8 = undefined;
+        const scoped_kind = self.scopedKind(kind, &kind_buffer) catch |err| return if (err == error.CacheScopeUnavailable) {} else err;
+
+        const count_sql = "SELECT COUNT(*) FROM snapshots WHERE kind=?1;";
+        var count_statement: ?*c.sqlite3_stmt = null;
+        const count_z = try self.allocator.dupeZ(u8, count_sql);
+        defer self.allocator.free(count_z);
+        if (c.sqlite3_prepare_v2(self.db, count_z.ptr, -1, &count_statement, null) != c.SQLITE_OK) return error.QueryFailed;
+        defer _ = c.sqlite3_finalize(count_statement);
+        try bindText(count_statement.?, 1, scoped_kind);
+        if (c.sqlite3_step(count_statement.?) != c.SQLITE_ROW) return error.QueryFailed;
+        const total = c.sqlite3_column_int64(count_statement.?, 0);
+        const excess = total - max_rows;
+        if (excess <= 0) return;
+
+        const delete_sql = "DELETE FROM snapshots WHERE kind=?1 AND rowid IN (SELECT rowid FROM snapshots WHERE kind=?1 ORDER BY updated_at ASC LIMIT ?2);";
+        var delete_statement: ?*c.sqlite3_stmt = null;
+        const delete_z = try self.allocator.dupeZ(u8, delete_sql);
+        defer self.allocator.free(delete_z);
+        if (c.sqlite3_prepare_v2(self.db, delete_z.ptr, -1, &delete_statement, null) != c.SQLITE_OK) return error.QueryFailed;
+        defer _ = c.sqlite3_finalize(delete_statement);
+        try bindText(delete_statement.?, 1, scoped_kind);
+        if (c.sqlite3_bind_int64(delete_statement.?, 2, excess) != c.SQLITE_OK) return error.QueryFailed;
+        if (c.sqlite3_step(delete_statement.?) != c.SQLITE_DONE) return error.QueryFailed;
+    }
+
     /// 一个 kind 下的一条快照。`key` / `value` 都是调用方负责释放的副本。
     pub const Entry = struct {
         key: []u8,
@@ -213,4 +250,33 @@ test "玩家缓存按账号和大区隔离且旧无归属缓存不混用" {
     const config = (try store.get("config", "current")).?;
     defer std.testing.allocator.free(config);
     try std.testing.expectEqualStrings("公共配置", config);
+}
+
+test "prune 只删最旧的、且不超限时不动数据" {
+    var store = try Store.open(std.testing.allocator, std.testing.io, ":memory:");
+    defer store.deinit();
+    // 未超限：一条都不该删。
+    try store.put("cache", "icon:1", "甲");
+    try store.put("cache", "icon:2", "乙");
+    try store.prune("cache", 5);
+    const first = (try store.get("cache", "icon:1")).?;
+    defer std.testing.allocator.free(first);
+    const second = (try store.get("cache", "icon:2")).?;
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings("甲", first);
+    try std.testing.expectEqualStrings("乙", second);
+
+    // 写 6 条、上限 3：必须只剩最新的 3 条。
+    // `updated_at` 用 `unixepoch()`（秒），同一秒内写入会并列，所以这里靠
+    // 插入顺序 + rowid 兜底：SQL 的 ORDER BY 在并列时按 rowid 升序，
+    // 也就是先插入的先删——这正是「最旧先删」的语义。
+    inline for (.{ "3", "4", "5", "6" }) |id| {
+        var key_buffer: [32]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buffer, "icon:{s}", .{id}) catch unreachable;
+        try store.put("cache", key, "值");
+    }
+    try store.prune("cache", 3);
+    const rows = try store.list(std.testing.allocator, "cache");
+    defer Store.freeEntries(std.testing.allocator, rows);
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
 }
