@@ -230,7 +230,7 @@ const lobby_version_mask: u64 = (1 << 53) - 1;
 const LivePersistSource = enum { lobby, champ_select };
 /// 整批成功后的复查间隔。原先是 60s 一刀切，同局重连或中途加入的玩家
 /// 在这段时间里不会被补上；现在只用它控制「多久检查一次」，是否真的重跑
-/// 由 `livePlayerProfileFresh` 按每位玩家的缓存 TTL 决定。
+/// 由每位玩家的 `LivePlayerTask` 状态决定。
 const live_recheck_interval_ms: i64 = 5_000;
 /// 单名玩家在同一瞬间最多会挂几个**本地**（LCU）请求：段位 + 等级 + 战绩。
 ///
@@ -247,6 +247,34 @@ const live_profile_local_requests_per_player = 3;
 /// （见 `runLiveLoadBatchInner` 里换 `profiles` 配额那段），而不是把这里改小——
 /// 改小只会把失败重试变成空转。
 const live_failure_retry_ms: i64 = 10_000;
+const live_player_task_capacity: usize = 20;
+const live_task_error_capacity: usize = 96;
+
+const LiveTaskStatus = enum(u8) {
+    pending,
+    loaded,
+    failed,
+};
+
+/// 一局中一个玩家的一类资料任务状态。
+///
+/// 这个状态故意放在 Runtime，而不是只放在 LiveLoadBatch 里：批次结束后，下一轮
+/// 必须知道哪些玩家已经成功，不能再用「整批失败」决定所有人一起重跑。
+const LivePlayerTask = struct {
+    session_key: u64 = 0,
+    side: [8]u8 = undefined,
+    side_len: usize = 0,
+    index: usize = 0,
+    roster_key: [128]u8 = undefined,
+    roster_key_len: usize = 0,
+    puuid: [128]u8 = undefined,
+    puuid_len: usize = 0,
+    status: LiveTaskStatus = .pending,
+    retry_at_ms: i64 = 0,
+    attempts: u32 = 0,
+    error_name: [live_task_error_capacity]u8 = undefined,
+    error_name_len: usize = 0,
+};
 
 /// 快照落盘按时间节流。内存副本始终是最新的，SQLite 只用于冷启动恢复，
 /// 所以中间那些跳过的写入没有正确性代价；批次结束时由 `flushLiveLobbyPersist`
@@ -278,6 +306,92 @@ fn flushLiveLobbyPersist(self: *Runtime) void {
     store.put("liveLobby", "current", value) catch return;
     self.live_lobby_persisted_ms = runtimeMonotonicMillis(self);
     self.live_lobby_persist_pending = false;
+}
+
+fn copyTaskText(destination: []u8, length: *usize, value: []const u8) void {
+    const copied = @min(destination.len, value.len);
+    @memcpy(destination[0..copied], value[0..copied]);
+    length.* = copied;
+}
+
+fn liveTaskMatches(task: *const LivePlayerTask, session_key: u64, player: std.json.Value, side: []const u8, index: usize) bool {
+    if (task.session_key != session_key or task.side_len != side.len or
+        !std.mem.eql(u8, task.side[0..task.side_len], side)) return false;
+    const roster_key = jsonField(player, "rosterKey");
+    const puuid = jsonField(player, "puuid");
+    if (task.roster_key_len > 0 or roster_key.len > 0) {
+        if (task.roster_key_len != roster_key.len or !std.mem.eql(u8, task.roster_key[0..task.roster_key_len], roster_key)) return false;
+    }
+    // 身份从数字槽位解析成真实 PUUID 时，必须建立一个新任务；否则会把「尚未
+    // 取到身份」的完成状态错误地沿用到真实玩家身上。
+    if (task.puuid_len != puuid.len or !std.mem.eql(u8, task.puuid[0..task.puuid_len], puuid)) return false;
+    // 有稳定身份时按身份去重，阵容列表重排不应让同一个玩家重复加载；双方都
+    // 没有身份时只能退回槽位索引，避免五个占位玩家互相覆盖。
+    return task.roster_key_len > 0 or roster_key.len > 0 or task.puuid_len > 0 or puuid.len > 0 or task.index == index;
+}
+
+fn findLiveTask(self: *Runtime, session_key: u64, player: std.json.Value, side: []const u8, index: usize) ?*LivePlayerTask {
+    for (&self.live_player_tasks) |*task| {
+        if (task.session_key == 0) continue;
+        if (liveTaskMatches(task, session_key, player, side, index)) return task;
+    }
+    return null;
+}
+
+fn ensureLiveTask(self: *Runtime, session_key: u64, player: std.json.Value, side: []const u8, index: usize) ?*LivePlayerTask {
+    if (findLiveTask(self, session_key, player, side, index)) |task| return task;
+    for (&self.live_player_tasks) |*task| {
+        if (task.session_key != 0) continue;
+        task.* = .{};
+        task.session_key = session_key;
+        copyTaskText(&task.side, &task.side_len, side);
+        task.index = index;
+        copyTaskText(&task.roster_key, &task.roster_key_len, jsonField(player, "rosterKey"));
+        copyTaskText(&task.puuid, &task.puuid_len, jsonField(player, "puuid"));
+        return task;
+    }
+    return null;
+}
+
+fn liveTaskShouldLoad(self: *Runtime, session_key: u64, player: std.json.Value, side: []const u8, index: usize, force: bool) bool {
+    const task = ensureLiveTask(self, session_key, player, side, index) orelse return true;
+    if (force) return true;
+    if (task.status == .loaded) return false;
+    const now = runtimeMonotonicMillis(self);
+    if (task.status == .failed and now != 0 and now < task.retry_at_ms) return false;
+    return true;
+}
+
+fn markLiveTask(self: *Runtime, session_key: u64, player: std.json.Value, side: []const u8, index: usize, status: LiveTaskStatus, failure: ?anyerror) void {
+    const task = ensureLiveTask(self, session_key, player, side, index) orelse return;
+    task.status = status;
+    task.attempts +%= 1;
+    task.retry_at_ms = if (status == .failed) runtimeMonotonicMillis(self) + live_failure_retry_ms else 0;
+    task.error_name_len = 0;
+    if (failure) |err| {
+        copyTaskText(&task.error_name, &task.error_name_len, @errorName(err));
+        std.log.warn("实时玩家资料任务失败 session={d} side={s} index={d} puuid={s} attempt={d} error={s}", .{
+            session_key,
+            side,
+            index,
+            jsonField(player, "puuid"),
+            task.attempts,
+            @errorName(err),
+        });
+    }
+}
+
+/// 资料任务的会话键不包含 ChampSelect/InProgress 阶段和阵容人数，避免同一局交接
+/// 或敌方逐步出现时把已经成功的玩家重新拉一遍。游戏 ID 或无局号时的资料周期
+/// 变化才会创建新资料会话；新出现的玩家由独立任务状态自然入队。
+fn liveProfileSessionHash(self: *Runtime, root: std.json.Value) u64 {
+    var hash = std.hash.Wyhash.init(0x6c697665_70726f66);
+    hash.update(self.live_owner_puuid[0..self.live_owner_puuid_len]);
+    hash.update(self.cache_platform[0..self.cache_platform_len]);
+    hash.update(std.mem.asBytes(&self.live_profile_epoch));
+    const game_id = lobbyGameIdValue(root);
+    hash.update(std.mem.asBytes(&game_id));
+    return @max(hash.final(), 1);
 }
 
 /// 命令表是命令面唯一的真相来源：命令名和它所属的并发通道写在同一行。
@@ -463,6 +577,11 @@ pub const Runtime = struct {
     live_load: ?*LiveLoadBatch = null,
     live_generation: u64 = 0,
     live_session_key: u64 = 0,
+    /// 资料任务的会话键不包含 ChampSelect/InProgress 阶段，避免交接时把同一局重复拉两遍。
+    /// 游戏 ID 或阵容身份变化时才建立新的资料会话。
+    live_profile_session_key: u64 = 0,
+    live_profile_epoch: u64 = 0,
+    live_player_tasks: [live_player_task_capacity]LivePlayerTask = [_]LivePlayerTask{.{}} ** live_player_task_capacity,
     live_roster_checked_ms: i64 = 0,
     live_next_load_ms: i64 = 0,
     force_profile_refresh: bool = false,
@@ -826,7 +945,7 @@ fn querySnapshot(self: *Runtime) !*Runtime {
     const snapshot = try std.heap.page_allocator.create(Runtime);
     snapshot.* = Runtime.init();
     // 数据缓冲区独占，数据库连接由父运行时保管，所有工作线程退出后才能关闭。
-    inline for (.{ "mode", "app_version", "config", "config_len", "io", "env_map", "storage", "connection", "connection_len", "live_lobby", "live_lobby_len", "champ_select_lobby", "champ_select_lobby_len", "champ_select_game_id", "last_live_phase", "last_live_phase_len", "champ_select_handoff_active", "live_roster_hash", "live_lobby_enriched", "live_owner_puuid", "live_owner_puuid_len", "event_state", "request_generation", "data_dir_path", "data_dir_path_len", "config_path_buffer", "config_path_len", "database_path_buffer", "database_path_len", "bp_history_path_buffer", "bp_history_path_len", "force_profile_refresh", "bp_snapshot_fingerprint" }) |field| {
+    inline for (.{ "mode", "app_version", "config", "config_len", "io", "env_map", "storage", "connection", "connection_len", "live_lobby", "live_lobby_len", "champ_select_lobby", "champ_select_lobby_len", "champ_select_game_id", "last_live_phase", "last_live_phase_len", "champ_select_handoff_active", "live_roster_hash", "live_lobby_enriched", "live_owner_puuid", "live_owner_puuid_len", "event_state", "request_generation", "data_dir_path", "data_dir_path_len", "config_path_buffer", "config_path_len", "database_path_buffer", "database_path_len", "bp_history_path_buffer", "bp_history_path_len", "force_profile_refresh", "live_profile_session_key", "live_profile_epoch", "live_player_tasks", "bp_snapshot_fingerprint" }) |field| {
         @field(snapshot, field) = @field(self, field);
     }
     snapshot.is_snapshot = true;
@@ -1275,6 +1394,7 @@ fn setDataMode(context: *anyopaque, invocation: native_sdk.bridge.Invocation, ou
         self.request_generation +%= 1;
         self.live_generation +%= 1;
         self.live_session_key = 0;
+        resetLivePlayerTasks(self);
         self.live_roster_checked_ms = 0;
         self.live_next_load_ms = 0;
         self.force_profile_refresh = true;
@@ -1375,8 +1495,8 @@ fn getLiveLobby(context: *anyopaque, invocation: native_sdk.bridge.Invocation, o
     if (self.mode != .live) return getLiveLobbyInternal(context, invocation, output, false);
     if (self.live_lobby_len == 0) return error.LobbyLoading;
     if (!self.is_snapshot) try startLiveLoading(self);
-    // 加载期间前端按短间隔问进度。发布改成「整批一次」之后，一批没落地之前
-    // 快照内容不会变，只回版本号 + 进度就够了，省掉反复传输并重建整份 244KB 阵容。
+    // 加载期间前端按短间隔问进度。玩家完成后会逐人发布；未发生新发布时只回
+    // 版本号 + 进度，省掉反复传输并重建整份 244KB 阵容。
     if (!payload.force and payload.sinceVersion != 0 and payload.sinceVersion == self.live_lobby_version) {
         return liveProgressResponse(self, output);
     }
@@ -1389,9 +1509,10 @@ const LiveLoadBatch = struct {
     // 关闭数据库之前，主运行时必须等待本批次退出。
     snapshot: *Runtime,
     generation: u64,
+    profile_session_key: u64 = 0,
     queue: live_loading.Queue,
-    // 结算交接等场景要求忽略本地缓存重新拉取；快照里的 `force_profile_refresh`
-    // 会在批次启动后被清掉，所以显式记在批次上。
+    // 新资料会话首次加载时忽略本地 TTL；快照里的标志会在批次启动后被清掉，
+    // 所以显式记在批次上。
     force: bool = false,
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
@@ -1399,6 +1520,7 @@ const LiveLoadBatch = struct {
     completed: usize = 0,
     failed: usize = 0,
     total: usize = 0,
+    queued: usize = 0,
     /// 整批早退时的错误名（`@errorName`）。以前这种情况只会表现成
     /// 「0/10 人 · N 人待重试」，用户和我们都看不出到底哪一步挂了。
     error_name: []const u8 = "",
@@ -1434,6 +1556,13 @@ fn refreshLiveGeneration(self: *Runtime) void {
         };
     }
     const phase = jsonField(root, "phase");
+    const profile_key = liveProfileSessionHash(self, root);
+    if (profile_key != self.live_profile_session_key) {
+        clearLivePlayerTaskStates(self);
+        self.live_profile_session_key = profile_key;
+        self.force_profile_refresh = true;
+        self.live_next_load_ms = 0;
+    }
     // `EndOfGame` / `PreEndOfGame` 必须单独成档。它们和对局中的名单完全一样，
     // 只按「是不是 active」分档的话，进结算根本不改变 key，下面那句「进入结算时
     // 重新读取战绩」就会被上面的提前 return 吞掉——这条分支因此长期是死代码，
@@ -1445,8 +1574,6 @@ fn refreshLiveGeneration(self: *Runtime) void {
     self.live_session_key = key;
     self.live_generation +%= 1;
     self.live_next_load_ms = 0;
-    // 进入结算时重新读取战绩，普通开局交接继续复用未过期缓存。
-    if (isSettledLivePhase(phase)) self.force_profile_refresh = true;
     if (self.live_load) |batch| batch.queue.cancelled.store(true, .release);
 }
 
@@ -1465,9 +1592,9 @@ fn startLiveLoading(self: *Runtime) !void {
     const lobby = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.live_lobby[0..self.live_lobby_len], .{});
     const phase = jsonField(lobby, "phase");
     if (!isChampSelectPhase(phase) and !isActiveLivePhase(phase) and !isLobbyPhase(phase) and !std.mem.eql(u8, phase, "EndOfGame")) return;
-    // 全部玩家都还在缓存有效期内时不要启动批次：否则每次复查都要白白
-    // 发现一次客户端、读一次召唤师、起五个线程。
-    if (!self.force_profile_refresh and !liveRosterNeedsReload(self, lobby)) {
+    // 同一资料会话内只调度 pending/到期失败的玩家。新会话的 force 只生效一次，
+    // 不再用 SQLite TTL 决定当前对局是否应该刷新。
+    if (!liveRosterNeedsReload(self, lobby, self.live_profile_session_key, self.force_profile_refresh)) {
         self.live_next_load_ms = runtimeMonotonicMillis(self) + live_recheck_interval_ms;
         return;
     }
@@ -1481,6 +1608,7 @@ fn startLiveLoading(self: *Runtime) !void {
         .parent = self,
         .snapshot = snapshot,
         .generation = self.live_generation,
+        .profile_session_key = self.live_profile_session_key,
         .force = force,
         .queue = .{ .count = 0, .context = batch, .execute = loadLivePlayer },
         .started_ms = runtimeMonotonicMillis(self),
@@ -1495,7 +1623,18 @@ fn startLiveLoading(self: *Runtime) !void {
 fn runLiveLoadBatch(batch: *LiveLoadBatch) void {
     runLiveLoadBatchInner(batch) catch |err| {
         lockBackendMutex(&batch.parent.command_mutex);
-        batch.failed = @max(batch.failed, batch.total - batch.completed);
+        batch.failed = @max(batch.failed, batch.queued -| batch.completed);
+        // 旧局在交接时可能被取消；它的失败结果不能回写到新局的任务表，
+        // 否则刚清空的会话会被旧 worker 重新塞回待重试项。
+        if (batch.generation == batch.parent.live_generation and batch.profile_session_key == batch.parent.live_profile_session_key) {
+            for (batch.jobs) |job| {
+                const already_loaded = if (findLiveTask(batch.parent, batch.profile_session_key, job.player, job.side, job.index)) |task|
+                    task.status == .loaded
+                else
+                    false;
+                if (!already_loaded) markLiveTask(batch.parent, batch.profile_session_key, job.player, job.side, job.index, .failed, err);
+            }
+        }
         // 记下具体原因，随进度一起回报给界面——「10 人待重试」本身没有任何
         // 诊断价值，是找客户端失败、账号换了还是平台校验没过，必须看得见。
         batch.error_name = @errorName(err);
@@ -1575,19 +1714,22 @@ fn runLiveLoadJobs(batch: *LiveLoadBatch, client: lcu.Client, current: std.json.
     var jobs: std.array_list.Managed(LiveProfileJob) = .init(allocator);
     // **我方先入队**：单人资料要花好几次串行往返，队列按下标递增取活，
     // 所以把 5 个我方 job 排在最前面，四个 worker 一起手就先抓我方。
-    // 十人仍然在**同一次 `queue.run()`** 里跑完、只发布一次（见下面的说明）。
+    // 十人仍然在**同一次 `queue.run()`** 里并发执行；每个玩家完成后独立发布。
     for ([_][]const u8{ "ally", "enemy" }) |side| {
         const players = if (lobby == .object) lobby.object.get(side) else null;
         if (players == null or players.? != .array) continue;
         const array = players.?;
         for (0..array.array.items.len) |index| {
             const player = array.array.items[index];
-            // 资料已完整且缓存未过期的玩家不入队，避免复查时十个人全部重跑。
-            if (!batch.force and livePlayerProfileFresh(self, player)) continue;
+            // 任务状态是当前对局的唯一去重依据：新局第一次全部入队，同局只入队
+            // 尚未成功或已经到重试时间的玩家。SQLite 缓存只做冷启动数据源，不再
+            // 以 TTL 把上一局的战绩直接冒充当前局结果。
+            if (!liveTaskShouldLoad(self, batch.profile_session_key, player, side, index, batch.force)) continue;
             var job = liveProfileJob(self, client, null, player, side, index, current, catalog, null);
             // 第一遍只走**本地**（LCU + 本地 2999）：SGP 战绩回落与「好抓 / 难抓」
             // 的对局详情都是公网请求（全局并发只有 2），统一留到最后一遍。
             job.remote = false;
+            job.force_refresh = batch.force or (if (ensureLiveTask(self, batch.profile_session_key, player, side, index)) |task| task.status == .failed else false);
             job.shared_sgp = &shared_sgp;
             job.shared_encounter = if (shared_encounter) |*value| value else null;
             job.output = try allocator.alloc(u8, live_profile_output_capacity);
@@ -1595,11 +1737,12 @@ fn runLiveLoadJobs(batch: *LiveLoadBatch, client: lcu.Client, current: std.json.
         }
     }
     batch.jobs = jobs.items;
-    // 进度按实际入队人数汇报，跳过的不计入分母。
+    // total 保留当前阵容总人数，queued 单独表示本轮实际任务数，避免「1/1」被误解
+    // 成整局只有一个玩家。
     lockBackendMutex(&batch.parent.command_mutex);
-    batch.total = jobs.items.len;
+    batch.queued = jobs.items.len;
     batch.parent.command_mutex.unlock();
-    // **一遍跑完十人（纯本地数据），跑完立刻整批发布。**
+    // **一遍跑完十人（纯本地数据），每个玩家完成后立刻发布。**
     //
     // 原先是「我方 5 人一轮 → 发布 → 敌方 5 人一轮 → 再发布」。两轮之间隔着一次
     // `queue.run()` 的 join，那是一道硬栅栏：敌方第一个请求要等我方**最慢**的
@@ -1634,7 +1777,7 @@ fn runLiveLoadJobs(batch: *LiveLoadBatch, client: lcu.Client, current: std.json.
     batch.parent.command_mutex.unlock();
     // 最后一遍（公网遍）：SGP 战绩回落 +「好抓 / 难抓」的对局详情（每人最多 5 场）。
     // 这是十人加载里唯一会把公网请求堆到几十个的地方，而公网并发全局只有 2——
-    // 所以放到核心数据**发布之后**再跑，结果作为最后一次发布补上。用户明确说过
+    // 所以放到核心数据**逐人发布之后**再跑，结果作为附加发布补上。用户明确说过
     // 这部分可以后到，不参与「瞬发」。这一遍全程命中刚写下的缓存
     // （段位 / 等级 / 战绩都还新鲜），只有真正需要公网的请求才是真的。
     if (jobs.items.len > 0) {
@@ -1643,6 +1786,7 @@ fn runLiveLoadJobs(batch: *LiveLoadBatch, client: lcu.Client, current: std.json.
         batch.snapshot.force_profile_refresh = false;
         for (jobs.items) |*job| {
             job.remote = true;
+            job.force_refresh = false;
             job.failure = null;
             job.output_len = 0;
         }
@@ -1688,13 +1832,24 @@ fn loadLivePlayer(context: *anyopaque, index: usize) void {
     if (batch.first_player_ms == null) batch.first_player_ms = runtimeMonotonicMillis(batch.snapshot) - batch.started_ms;
     if (profile == null) {
         batch.failed += 1;
+        markLiveTask(batch.parent, batch.profile_session_key, job.player, job.side, job.index, .failed, job.failure orelse error.InvalidData);
         return;
     }
     var publication = profile.?;
     const key = jsonField(job.player, "rosterKey");
     publication.object.put(allocator, "rosterKey", .{ .string = if (key.len > 0) key else jsonField(job.player, "puuid") }) catch return;
     const one = [_]LiveProfilePublication{.{ .original = job.player, .profile = publication, .side = job.side, .index = job.index }};
-    publishLiveProfiles(batch.parent, one[0..]) catch {};
+    publishLiveProfiles(batch.parent, one[0..]) catch |err| {
+        batch.failed += 1;
+        markLiveTask(batch.parent, batch.profile_session_key, job.player, job.side, job.index, .failed, err);
+        return;
+    };
+    if (liveProfileNeedsRetry(profile.?)) {
+        batch.failed += 1;
+        markLiveTask(batch.parent, batch.profile_session_key, job.player, job.side, job.index, .failed, error.LiveProfilePartial);
+    } else {
+        markLiveTask(batch.parent, batch.profile_session_key, job.player, job.side, job.index, .loaded, null);
+    }
 }
 
 /// `queue.run()` 返回后统一发布。**现在只给「公网遍」用**（本地遍已改成在
@@ -1736,7 +1891,7 @@ test "资料富化批次的配额要盖过它自己的峰值并发" {
     // 为什么这条断言不是形式主义：`http_windows.request()` 的 deadline 是在
     // **取名额之前**就定下的，排队等待的时间直接从请求自己的 `timeout_ms` 里扣。
     // 配额一旦小于峰值，排在队尾的请求还没发出去就先判 `RequestTimedOut`，
-    // 玩家被记成失败、整批推迟 `live_failure_retry_ms`（10 秒）重跑——选人阶段
+    // 玩家被记成失败，下一轮只会重试这些失败玩家——选人阶段
     // 那个「查完要等十秒」的成因就在这里，而不是数据源慢。
     const peak = live_loading.Queue.max_concurrency * live_profile_local_requests_per_player;
     try std.testing.expect(lcu.transport.budgetLimit(.profiles) >= peak);
@@ -1831,6 +1986,7 @@ test "本地那遍十人只跑一轮，且每人跑完立刻单独发布" {
 
     try std.testing.expectEqual(@as(usize, 10), probe.local_runs.load(.acquire));
     try std.testing.expectEqual(@as(usize, 10), batch.completed);
+    try std.testing.expect(probe.published_midway.load(.acquire) > 0);
     // 逐人发布：整轮跑完时十个人都已经落地（每个 worker 自己发的）。
     try std.testing.expect(batch.cores_done);
     // 十个人的资料都真的进了快照。以我方第一名为例，它的 puuid 必须能在快照里找到。
@@ -1903,14 +2059,10 @@ const LiveProfilePublication = struct {
     index: usize,
 };
 
-/// 把一批玩家资料**一次性**写进快照。
+/// 把一名或多名玩家资料写进快照。
 ///
-/// 为什么必须是批量的：`cacheLiveLobby` 每次都会自增 `live_lobby_version`，而前端只能靠
-/// 版本号轮询发现新数据。逐人发布（每位 worker 一完成就写一次）会把一次加载切成 N 次
-/// 版本跳变，界面看到的就是「一个人一个人冒出来」——这正是用户报的现象。
-/// 这里解析一次、应用全部、序列化一次、缓存一次，版本号只跳一次，界面一次拿到全部人。
-/// 顺带把原本 N 次 244KB 的解析 + 序列化（而且全程压在 command_mutex 上、会堵住轮询）
-/// 压成 1 次。
+/// 本地核心资料由 `loadLivePlayer` 逐人调用，谁先完成谁先发布；公网补充资料在
+/// `publishLoadedProfiles` 中批量调用，减少已经完成核心加载后的版本抖动。
 fn publishLiveProfiles(self: *Runtime, entries: []const LiveProfilePublication) !void {
     if (entries.len == 0) return;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -2035,6 +2187,7 @@ fn writeLiveProgress(self: *Runtime, writer: *std.Io.Writer) !bool {
         .active = !(batch.done.load(.acquire) or cores_ready) or !current_batch,
         .completed = if (current_batch) batch.completed else 0,
         .total = if (current_batch) batch.total else lobbyRosterCount(self.live_lobby[0..self.live_lobby_len]),
+        .queued = if (current_batch) batch.queued else 0,
         .failed = if (current_batch) batch.failed else 0,
         .elapsedMs = if (current_batch) ((batch.cores_ms orelse batch.finished_ms orelse runtimeMonotonicMillis(self)) - batch.started_ms) else 0,
         .firstPlayerMs = if (current_batch) batch.first_player_ms else null,
@@ -2314,6 +2467,16 @@ fn clearChampSelectLobby(self: *Runtime) void {
     self.champ_select_handoff_active = false;
 }
 
+fn clearLivePlayerTaskStates(self: *Runtime) void {
+    self.live_player_tasks = [_]LivePlayerTask{.{}} ** live_player_task_capacity;
+}
+
+fn resetLivePlayerTasks(self: *Runtime) void {
+    self.live_profile_session_key = 0;
+    self.live_profile_epoch +%= 1;
+    clearLivePlayerTaskStates(self);
+}
+
 fn clearLiveLobby(self: *Runtime) void {
     self.live_generation +%= 1;
     self.live_next_load_ms = 0;
@@ -2321,6 +2484,7 @@ fn clearLiveLobby(self: *Runtime) void {
     self.live_lobby_len = 0;
     self.live_roster_hash = 0;
     self.live_lobby_enriched = false;
+    resetLivePlayerTasks(self);
 }
 
 fn invalidateMismatchedLobbyCaches(self: *Runtime, session_game_id: i64) void {
@@ -2772,6 +2936,36 @@ fn cacheLiveLobby(self: *Runtime, value: []const u8) void {
         const previous_id = lobbyGameId(self.live_lobby[0..self.live_lobby_len]);
         const next_id = lobbyGameId(value);
         if (previous_id == 0 or next_id == 0 or previous_id == next_id) return;
+    }
+    // 没有局号的客户端快照也必须能识别「上一局结束后重新开始」。阶段从结算/房间
+    // 回到选人或重新进入游戏时推进资料周期，避免同一批 PUUID 永远命中上一局状态。
+    if (self.live_lobby_len > 0) {
+        const previous_settled_or_lobby = blk: {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.live_lobby[0..self.live_lobby_len], .{}) catch break :blk false;
+            const phase = if (parsed == .object) jsonField(parsed, "phase") else "";
+            break :blk isSettledLivePhase(phase) or isLobbyPhase(phase);
+        };
+        const previous_active = blk: {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), self.live_lobby[0..self.live_lobby_len], .{}) catch break :blk false;
+            break :blk parsed == .object and isActiveLivePhase(jsonField(parsed, "phase"));
+        };
+        const starts_new_game = blk: {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), value, .{}) catch break :blk false;
+            break :blk parsed == .object and (isChampSelectPhase(jsonField(parsed, "phase")) or isActiveLivePhase(jsonField(parsed, "phase")));
+        };
+        const new_selection = blk: {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), value, .{}) catch break :blk false;
+            break :blk parsed == .object and isChampSelectPhase(jsonField(parsed, "phase"));
+        };
+        if ((previous_settled_or_lobby and starts_new_game) or (previous_active and new_selection)) self.live_profile_epoch +%= 1;
     }
     @memcpy(self.live_lobby[0..value.len], value);
     self.live_lobby_len = value.len;
@@ -7029,7 +7223,7 @@ fn writeLiveClientProfiles(self: *Runtime, client: lcu.Client, sgp_context: ?Jun
         if (same_team != ally) continue;
         if (!first) try writer.writeByte(',');
         first = false;
-        try writeLiveClientProfile(self, client, sgp_context, writer, player, if (ally) "ally" else "enemy", side_index, current, catalog, enrich, enrich, players, null, null);
+        try writeLiveClientProfile(self, client, sgp_context, writer, player, if (ally) "ally" else "enemy", side_index, current, catalog, enrich, enrich, self.force_profile_refresh, players, null, null);
         side_index += 1;
     }
     try writer.writeByte(']');
@@ -7126,6 +7320,7 @@ const LiveProfileJob = struct {
     /// 默认 `true`：选人 / 房间 / 平滑选人这几条路径人数少、本来就要标签，
     /// 行为保持不变。**只有** `runLiveLoadJobs` 的第一遍会显式关掉它。
     remote: bool = true,
+    force_refresh: bool = false,
 };
 
 const PlayerRankRequestJob = struct {
@@ -7195,11 +7390,17 @@ fn liveProfileJob(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpCon
 
 fn runLiveProfileJob(job: *LiveProfileJob) void {
     var writer = std.Io.Writer.fixed(job.output.?);
-    writeLiveClientProfile(job.runtime_value, job.client, job.sgp_context, &writer, job.player, job.side, job.index, job.current, job.catalog, true, job.remote, job.group_members, job.shared_sgp, job.shared_encounter) catch |err| {
+    writeLiveClientProfile(job.runtime_value, job.client, job.sgp_context, &writer, job.player, job.side, job.index, job.current, job.catalog, true, job.remote, job.force_refresh, job.group_members, job.shared_sgp, job.shared_encounter) catch |err| {
         job.failure = err;
         return;
     };
     job.output_len = writer.buffered().len;
+}
+
+fn liveProfileNeedsRetry(profile: std.json.Value) bool {
+    const status = nestedObject(profile, "dataStatus") orelse return false;
+    const error_text = jsonField(status, "error");
+    return error_text.len > 0;
 }
 
 fn writeLiveProfileJobs(writer: *std.Io.Writer, jobs: []LiveProfileJob) !void {
@@ -7228,7 +7429,7 @@ fn writeLiveProfileJobs(writer: *std.Io.Writer, jobs: []LiveProfileJob) !void {
     try writer.writeByte(']');
 }
 
-fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, writer: *std.Io.Writer, player: std.json.Value, side: []const u8, index: usize, current: std.json.Value, catalog: std.json.Value, enrich: bool, remote: bool, group_members: ?std.json.Value, shared_sgp: ?*SharedLiveSgpContext, shared_encounter: ?*LiveEncounterIndex) !void {
+fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?JungleSgpContext, writer: *std.Io.Writer, player: std.json.Value, side: []const u8, index: usize, current: std.json.Value, catalog: std.json.Value, enrich: bool, remote: bool, force_refresh: bool, group_members: ?std.json.Value, shared_sgp: ?*SharedLiveSgpContext, shared_encounter: ?*LiveEncounterIndex) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -7291,7 +7492,7 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     if (puuid.len > 0 and resolved_name.len > 0 and resolved_tag.len > 0) if (self.storage) |*store| {
         var riot_id_buffer: [512]u8 = undefined;
         if (std.fmt.bufPrint(&riot_id_buffer, "{s}#{s}", .{ resolved_name, resolved_tag })) |riot_id| {
-            store.put("historySubject", riot_id, puuid) catch {};
+            store.put("historySubject", riot_id, puuid) catch |err| std.log.warn("实时资料缓存写入失败 kind=historySubject error={s}", .{@errorName(err)});
         } else |_| {}
     };
     const profile_icon_id = if (identity != .null and jsonInt(identity, "profileIconId") > 0) jsonInt(identity, "profileIconId") else if (jsonInt(player, "profileIconId") > 0) jsonInt(player, "profileIconId") else jsonInt(summoner, "profileIconId");
@@ -7305,7 +7506,7 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     var summoner_level: ?i64 = summonerLevelFromJson(identity);
     if (summoner_level == null) summoner_level = summonerLevelFromJson(player);
     if (summoner_level == null) summoner_level = summonerLevelFromJson(summoner);
-    if (summoner_level == null and puuid.len > 0 and !is_bot and !self.force_profile_refresh) {
+    if (summoner_level == null and puuid.len > 0 and !is_bot and !force_refresh) {
         const level_owned = cachedSnapshot(self, "playerLevel", puuid, player_level_cache_ttl_seconds);
         defer if (level_owned) |value| std.heap.page_allocator.free(value);
         if (level_owned) |value| {
@@ -7316,9 +7517,9 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     // 配置每个玩家都要读一次，解析一次即可，后续过滤复用同一个判定。
     const ranked_only = runtimeRankedOnly(self);
 
-    var rank_owned = if (enrich and !self.force_profile_refresh and !is_bot and puuid.len > 0) cachedSnapshot(self, "playerRank", puuid, player_profile_cache_ttl_seconds) else null;
+    var rank_owned = if (enrich and !force_refresh and !is_bot and puuid.len > 0) cachedSnapshot(self, "playerRank", puuid, player_profile_cache_ttl_seconds) else null;
     defer if (rank_owned) |value| std.heap.page_allocator.free(value);
-    var history_owned = if (enrich and !self.force_profile_refresh and !is_bot and puuid.len > 0) cachedPlayerHistory(self, puuid, is_current) else null;
+    var history_owned = if (enrich and !force_refresh and !is_bot and puuid.len > 0) cachedPlayerHistory(self, puuid, is_current) else null;
     defer if (history_owned) |value| std.heap.page_allocator.free(value);
     const history_cached = history_owned != null;
     var history_source: []const u8 = if (history_cached) "sqlite-fresh" else "lcu";
@@ -7342,12 +7543,12 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
             runPlayerLcuHistoryRequest(&job);
             history_owned = job.result;
             // 即使这一份里一局都没有也要落盘：空列表同样是「读过了」的结果。
-            // 不落盘的话 `livePlayerProfileFresh` 永远判它不新鲜，5 秒一次的复查会
-            // 一直重跑这位玩家——新号 / 战绩不可见的玩家会让整个面板反复转圈。
+            // 空结果也会在当前资料会话标记为成功；SQLite 落盘失败不能让整局任务
+            // 重新进入队列，磁盘缓存只用于冷启动，不能决定当前对局是否完成。
             // 已排他的读取方（战绩分页、相遇索引、单局详情）都只是在里面找某一局，
             // 拿到空数组等价于「没找到」，行为不变。
             if (self.storage) |*store| if (history_owned) |value| {
-                store.put("playerHistory", puuid, value) catch {};
+                store.put("playerHistory", puuid, value) catch |err| std.log.warn("实时资料缓存写入失败 kind=playerHistory error={s}", .{@errorName(err)});
             };
         }
         // 备选源（SGP）只在**允许走公网的那一遍**查。它是公网请求、实测单次能慢到
@@ -7362,7 +7563,7 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
             if (sgp_history_owned) |value| {
                 if (historyHasGames(value)) {
                     history_source = "sgp";
-                    if (self.storage) |*store| store.put("playerHistory", puuid, value) catch {};
+                    if (self.storage) |*store| store.put("playerHistory", puuid, value) catch |err| std.log.warn("实时资料缓存写入失败 kind=playerHistory source=sgp error={s}", .{@errorName(err)});
                 } else {
                     std.heap.page_allocator.free(value);
                     sgp_history_owned = null;
@@ -7373,11 +7574,11 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
         if (level_thread) |thread| thread.join();
         if (rank_owned == null) {
             rank_owned = rank_job.result;
-            if (self.storage) |*store| if (rank_owned) |value| store.put("playerRank", puuid, value) catch {};
+            if (self.storage) |*store| if (rank_owned) |value| store.put("playerRank", puuid, value) catch |err| std.log.warn("实时资料缓存写入失败 kind=playerRank error={s}", .{@errorName(err)});
         }
         if (summoner_level == null) if (level_job.result) |value| {
             level_owned = value;
-            if (self.storage) |*store| store.put("playerLevel", puuid, value) catch {};
+            if (self.storage) |*store| store.put("playerLevel", puuid, value) catch |err| std.log.warn("实时资料缓存写入失败 kind=playerLevel error={s}", .{@errorName(err)});
             const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, value, .{}) catch std.json.Value{ .null = {} };
             summoner_level = summonerLevelFromJson(firstJsonValue(parsed));
         };
@@ -7389,7 +7590,7 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     // - `history_read`：这次**读到过**战绩（空列表也算读到——可能是新号，或战绩不可见）；
     // - `history_has_games`：读到的东西里**真有对局**，只用来决定界面显示还是显「—」。
     // 以前两者共用「有对局」，于是新号 / 战绩不可见的玩家每个批次都被记成 failed，
-    // 整批每 10 秒重跑一次、永远不收敛——用户看到的「N 人待重试」就是它。
+    // 任务每 10 秒重试且永远不收敛——现在空列表是一次成功读取，不进入失败队列。
     var history_read = false;
     var history_has_games = false;
     if (preferred_history) |value| {
@@ -7498,10 +7699,10 @@ fn writeLiveClientProfile(self: *Runtime, client: lcu.Client, sgp_context: ?Jung
     //
     // - 快路（`enrich=false`）只发骨架，一律标未完成，让前端知道后面还有富化在跑；
     // - 连身份都没有的玩家（选人阶段被隐藏的敌方）也不算「失败」：重试不会变好，
-    //   它的身份只会随阶段推进（进入游戏）才出现，那时 `refreshLiveGeneration`
-    //   会换 key 整批重来。把它记成失败只会换来每 10 秒一轮的无意义请求。
+    //   它的身份只会随阶段推进（进入游戏）才出现，那时任务键会变化并只重新入队
+    //   这个槽位。把它记成失败只会换来每 10 秒一轮的无意义请求。
     const identity_known = puuid.len > 0 or numeric_identity > 0;
-    const complete = if (!enrich) false else is_bot or !identity_known or history_read or rank_owned != null;
+    const complete = if (!enrich) false else is_bot or !identity_known or history_read;
     try writer.writeAll(if (complete) "true" else "false");
     try writer.writeAll(",\"unavailableSources\":[");
     var missing = false;
@@ -7554,24 +7755,14 @@ fn cacheEntryFresh(self: *Runtime, kind: []const u8, key: []const u8, ttl_second
     return @divTrunc(now_ms, std.time.ms_per_s) - updated_at < ttl_seconds;
 }
 
-/// 该玩家的资料已经加载完整，且战绩缓存还没过期。
-/// 整批节流改成按玩家判断后，靠这个避免每次复查都把十个人重跑一遍。
-/// 只以战绩（60s）为准：段位缓存只有 20s，若按它判断整局会三倍频繁地重跑。
-fn livePlayerProfileFresh(self: *Runtime, player: std.json.Value) bool {
-    const puuid = jsonField(player, "puuid");
-    if (puuid.len == 0) return false;
-    if (!jsonBool(player, "dataComplete")) return false;
-    if (jsonBool(player, "isBot")) return true;
-    return cacheEntryFresh(self, "playerHistory", puuid, player_history_cache_ttl_seconds);
-}
-
-/// 只要还有一位玩家缺资料或缓存已过期，本批就值得跑。
-fn liveRosterNeedsReload(self: *Runtime, lobby: std.json.Value) bool {
+/// 只要还有一位玩家尚未成功，或失败任务已经到重试时间，本批就值得跑。
+/// 成功状态按资料会话保存，因此 SQLite 写入失败也不会让已经展示成功的玩家无限重跑。
+fn liveRosterNeedsReload(self: *Runtime, lobby: std.json.Value, session_key: u64, force: bool) bool {
     if (lobby != .object) return true;
     for ([_][]const u8{ "ally", "enemy" }) |side| {
         const players = lobby.object.get(side) orelse continue;
         if (players != .array) continue;
-        for (players.array.items) |player| if (!livePlayerProfileFresh(self, player)) return true;
+        for (players.array.items, 0..) |player, index| if (liveTaskShouldLoad(self, session_key, player, side, index, force)) return true;
     }
     return false;
 }
@@ -8948,12 +9139,10 @@ test "资料发布更新双方视图和队伍摘要并保留当前英雄" {
     try std.testing.expectEqual(@as(i64, 75), jsonInt(team.object.get("summary").?, "score"));
 }
 
-// 「整批一次发布」是这一版的核心不变量：逐人发布会把一次加载切成 N 次
-// cacheLiveLobby + N 次版本变化，前端按版本号轮询就会「一个人一个人冒出来」。
-// 原子性本身由「只有一个调用点、且在 queue.run() 之后」保证（这个测试测不了并发），
-// 这里钉住的是另外两件能测的事：一次调用写完整批，以及空批次是彻底的空操作
-// —— 一次没有内容的「发布」不该让前端以为有新数据到了。
-test "整批发布一次写完整批玩家，空批次不产生版本变化" {
+// 批量发布辅助函数仍需保证一次调用原子地写完所有传入玩家，空批次是彻底的空操作。
+// 本地实时任务的逐人行为由上面的 `loadLivePlayer` 调度；这里专门钉住多玩家补充
+// 发布的完整性，避免队伍摘要停在半批状态。
+test "批量发布一次写完整玩家，空批次不产生版本变化" {
     var state = Runtime.init();
     // 占位身份用**纯数字**（身份质量低），真实资料用中文 puuid（质量高）——
     // `updateLiveProfileArray` 只在「新身份质量更高」时才改写 puuid，
@@ -9245,6 +9434,38 @@ test "身份补全不会换批次而换局会取消旧任务" {
     refreshLiveGeneration(&state);
     try std.testing.expect(state.live_generation > generation);
     try std.testing.expect(batch.queue.cancelled.load(.acquire));
+}
+
+test "资料任务按玩家独立完成且新资料会话全部重新入队" {
+    var state = Runtime.init();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const session: u64 = 42;
+    const loaded_json = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"puuid\":\"loaded\",\"rosterKey\":\"slot-1\"}", .{});
+    const failed_json = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"puuid\":\"failed\",\"rosterKey\":\"slot-2\"}", .{});
+    const loaded = ensureLiveTask(&state, session, loaded_json, "ally", 0).?;
+    loaded.status = .loaded;
+    const failed = ensureLiveTask(&state, session, failed_json, "ally", 1).?;
+    failed.status = .failed;
+    failed.retry_at_ms = 0;
+    try std.testing.expect(!liveTaskShouldLoad(&state, session, loaded_json, "ally", 0, false));
+    // 阵容列表重排时仍按稳定身份去重，不能因为槽位索引变化而重复抓取。
+    try std.testing.expect(!liveTaskShouldLoad(&state, session, loaded_json, "ally", 4, false));
+    try std.testing.expect(liveTaskShouldLoad(&state, session, failed_json, "ally", 1, false));
+    // 换局后 session key 变化，旧局的 loaded 状态不能阻止新局第一次刷新。
+    try std.testing.expect(liveTaskShouldLoad(&state, session + 1, loaded_json, "ally", 0, false));
+    try std.testing.expect(liveTaskShouldLoad(&state, session + 1, failed_json, "ally", 1, false));
+}
+
+test "资料会话键不因选人到游戏中交接而变化" {
+    var state = Runtime.init();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    state.cache_platform_len = 3;
+    @memcpy(state.cache_platform[0..3], "HN1");
+    const selection = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"id\":\"123\",\"phase\":\"ChampSelect\",\"ally\":[{\"puuid\":\"a\",\"rosterKey\":\"a\"}],\"enemy\":[{\"puuid\":\"b\",\"rosterKey\":\"b\"}]}", .{});
+    const active = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"id\":\"123\",\"phase\":\"InProgress\",\"ally\":[{\"puuid\":\"a\",\"rosterKey\":\"a\"}],\"enemy\":[{\"puuid\":\"b\",\"rosterKey\":\"b\"}]}", .{});
+    try std.testing.expectEqual(liveProfileSessionHash(&state, selection), liveProfileSessionHash(&state, active));
 }
 
 test "maps LCU match history into frontend summaries" {

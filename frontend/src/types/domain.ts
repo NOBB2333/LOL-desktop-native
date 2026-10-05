@@ -518,7 +518,7 @@ export interface TeamSummary {
 }
 
 export interface LiveLobby {
-  loading?: { active: boolean; completed: number; total: number; failed: number; elapsedMs: number; firstPlayerMs: number | null; errorName?: string | null };
+  loading?: { active: boolean; completed: number; total: number; queued: number; failed: number; elapsedMs: number; firstPlayerMs: number | null; errorName?: string | null };
   id: string;
   queueId: number;
   gameMode: string;

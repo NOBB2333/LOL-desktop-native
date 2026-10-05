@@ -4,7 +4,7 @@
   "name": "lol-desktop-native",
   "display_name": "桌上英雄联盟",
   "description": "League Client LCU desktop companion",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "icons": [
     "assets/icon.png",
     "assets/icon.ico",
